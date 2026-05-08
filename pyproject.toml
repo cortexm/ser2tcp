@@ -29,6 +29,7 @@ Homepage = "https://github.com/cortexm/ser2tcp"
 
 [project.scripts]
 ser2tcp = "ser2tcp.main:main"
+ser2tcp-install = "ser2tcp.install:main"
 
 [tool.setuptools.packages.find]
 include = ["ser2tcp*"]
