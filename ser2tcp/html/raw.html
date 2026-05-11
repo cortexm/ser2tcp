@@ -11,7 +11,15 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
 .toolbar { display: flex; align-items: center; gap: 0.8em;
   padding: 0.4em 0.8em; background: #2d2d2d; border-bottom: 1px solid #444;
   flex-shrink: 0; }
-.toolbar .endpoint { color: #4a9eff; font-family: monospace; font-size: 0.95em; }
+.toolbar .endpoint {
+  font-family: monospace; font-size: 0.95em;
+  color: #888;
+  font-weight: 600;
+  transition: color 0.15s;
+}
+.toolbar .endpoint.endpoint-online  { color: #4c4; }
+.toolbar .endpoint.endpoint-offline { color: #888; }
+.toolbar .endpoint.endpoint-error   { color: #e55; }
 .toolbar button { padding: 0.3em 0.8em; border: 1px solid #555;
   border-radius: 4px; cursor: pointer; font-size: 0.85em;
   background: #383838; color: #ccc; }
@@ -21,15 +29,11 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
 .toolbar .btn-disconnect { background: #e55; color: #fff; border-color: #e55; }
 .toolbar .btn-disconnect:hover { background: #d44; }
 .toolbar .spacer { flex: 1; }
-.toolbar .status { font-size: 0.85em; }
-.toolbar .status .dot { font-size: 1.2em; vertical-align: middle; }
-.toolbar .status .dot-on { color: #4c4; }
-.toolbar .status .dot-off { color: #666; }
+.toolbar .status { font-size: 0.85em; color: #aaa; }
 .toolbar a { color: #4a9eff; text-decoration: none; font-size: 0.85em; }
 .toolbar a:hover { text-decoration: underline; }
 
-.signal-bar { display: flex; align-items: center; gap: 0.4em;
-  padding: 0.3em 0.8em; background: #252525; border-bottom: 1px solid #333;
+.signal-bar { display: inline-flex; align-items: center; gap: 0.3em;
   flex-shrink: 0; }
 .signal-bar.hidden { display: none; }
 .signal-badge { display: inline-block; padding: 0.1em 0.4em; border-radius: 3px;
@@ -61,17 +65,13 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
 <body>
 
 <div class="toolbar">
-  <a href="/">&larr; Ports</a>
   <span class="endpoint" id="endpoint-name"></span>
+  <span class="signal-bar hidden" id="signal-bar"></span>
   <span class="spacer"></span>
-  <span class="status" id="status">
-    <span class="dot dot-off">&#x25cf;</span> Disconnected
-  </span>
+  <span class="status" id="status">Disconnected</span>
   <button id="btn-clear">Clear</button>
   <button id="btn-connect" class="btn-connect">Connect</button>
 </div>
-
-<div class="signal-bar hidden" id="signal-bar"></div>
 
 <div id="output"></div>
 <div id="input-row">
@@ -95,34 +95,47 @@ $('endpoint-name').textContent = '/ws/' + endpoint;
 document.title = 'ser2tcp raw \u2014 ' + endpoint;
 
 let ws = null;
-let signals = {};
 let pingInterval = null;
+// Distinguishes "device unavailable / proxy refused" from "was connected,
+// link dropped" on close — feeds the right-side status text only; the
+// left-side endpoint name color is driven by the authoritative server-
+// reported port state via the filtered status stream.
+let wsEverOpened = false;
 
 function connect() {
   if (ws) return;
+  wsEverOpened = false;
+  setStatus('connecting');
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   let url = scheme + '//' + location.host + '/ws/' + endpoint;
   if (token) url += '?token=' + encodeURIComponent(token);
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
-    updateStatus(true); appendInfo('Connected');
+    wsEverOpened = true;
+    setStatus('online'); appendInfo('Connected');
+    // Server's KEEP_ALIVE_TIMEOUT is 15 s — ping more often than that or
+    // an idle connection gets torn down with "network connection lost".
     pingInterval = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send('');
-    }, 30000);
+    }, 10000);
   };
   ws.onclose = ev => {
     ws = null;
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-    updateStatus(false);
-    appendInfo('Disconnected (code: ' + ev.code + ')');
+    if (wsEverOpened) {
+      setStatus('offline');
+      appendInfo('Disconnected (code: ' + ev.code + ')');
+    } else {
+      setStatus('error');
+      appendInfo('Cannot open connection (device unavailable?)');
+    }
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.signals) { signals = msg.signals; renderSignals(); }
-      } catch {}
+      // Server still sends signal frames over WS (legacy path); we ignore
+      // them in favor of the server-authoritative status stream below,
+      // which works even when this WS is closed.
       return;
     }
     appendData(new Uint8Array(ev.data), 'rx');
@@ -131,42 +144,54 @@ function connect() {
 
 function disconnect() {
   if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-  if (ws) { ws.close(); ws = null; updateStatus(false); }
+  if (ws) { ws.close(); ws = null; setStatus('offline'); }
 }
 
-function updateStatus(connected) {
-  const el = $('status');
-  if (connected) {
-    el.innerHTML = '<span class="dot dot-on">&#x25cf;</span> Connected';
-    $('btn-connect').textContent = 'Disconnect';
-    $('btn-connect').className = 'btn-disconnect';
-    $('btn-connect').onclick = disconnect;
+// setStatus reflects this view's WS subscription only: the right-side
+// status text + Connect/Disconnect button. The colored endpoint name is
+// driven by the server-reported port.state via applyPortState().
+function setStatus(state) {
+  const labels = {
+    connecting: 'Connecting…',
+    online: 'Connected',
+    offline: 'Disconnected',
+    error: 'Unavailable',
+  };
+  $('status').textContent = labels[state] || state;
+  const btn = $('btn-connect');
+  if (state === 'online') {
+    btn.textContent = 'Disconnect';
+    btn.className = 'btn-disconnect';
+    btn.onclick = disconnect;
   } else {
-    el.innerHTML = '<span class="dot dot-off">&#x25cf;</span> Disconnected';
-    $('btn-connect').textContent = 'Connect';
-    $('btn-connect').className = 'btn-connect';
-    $('btn-connect').onclick = connect;
+    btn.textContent = 'Connect';
+    btn.className = 'btn-connect';
+    btn.onclick = connect;
   }
 }
 
+// Server-driven signal bar. Renders from portCache.signals (populated by
+// the filtered status stream below). RTS/DTR remain clickable to toggle —
+// the click goes out via WS as a JSON control frame.
 function renderSignals() {
   const bar = $('signal-bar');
-  const names = Object.keys(signals);
+  const sig = (portCache && portCache.signals) || {};
+  const names = Object.keys(sig);
   if (!names.length) { bar.classList.add('hidden'); return; }
   bar.classList.remove('hidden');
   bar.innerHTML = '';
-  names.forEach(sig => {
-    const on = signals[sig];
-    const clickable = sig === 'rts' || sig === 'dtr';
+  names.forEach(name => {
+    const on = sig[name];
+    const clickable = name === 'rts' || name === 'dtr';
     const badge = document.createElement('span');
-    badge.textContent = sig.toUpperCase();
+    badge.textContent = name.toUpperCase();
     badge.className = 'signal-badge ' + (on ? 'signal-on' : 'signal-off')
       + (clickable ? ' signal-click' : '');
     if (clickable) {
-      badge.title = sig.toUpperCase() + ': click to toggle';
+      badge.title = name.toUpperCase() + ': click to toggle';
       badge.onclick = () => {
         if (ws && ws.readyState === WebSocket.OPEN)
-          ws.send(JSON.stringify({[sig]: !on}));
+          ws.send(JSON.stringify({[name]: !on}));
       };
     }
     bar.appendChild(badge);
@@ -246,6 +271,68 @@ $('btn-clear').onclick = () => { $('output').innerHTML = ''; };
 $('btn-connect').onclick = connect;
 $('input').focus();
 if (endpoint) connect();
+
+// --- Filtered status stream — server-authoritative port state + signals --
+let portCache = null;
+
+function applyPortState() {
+  // Endpoint-name color reflects the actual port on the server, not our
+  // WS subscription. Right-side status text still tracks our WS state.
+  const state = (portCache && portCache.state) || 'offline';
+  const ep = $('endpoint-name');
+  ep.classList.remove('endpoint-online', 'endpoint-offline', 'endpoint-error');
+  ep.classList.add(
+    state === 'online' ? 'endpoint-online'
+      : state === 'error' ? 'endpoint-error'
+      : 'endpoint-offline');
+}
+
+function applyStatusLine(line) {
+  if (Object.keys(line).length === 0) return; // heartbeat
+  if (line.port !== undefined) {
+    portCache = line.port ? Object.assign({}, line.port) : null;
+  } else if (line._removed) {
+    portCache = null;
+  } else if (line._delta && portCache) {
+    for (const [k, v] of Object.entries(line)) {
+      if (k === '_delta') continue;
+      if (v === null) delete portCache[k];
+      else portCache[k] = v;
+    }
+  } else {
+    return;
+  }
+  renderSignals();
+  applyPortState();
+}
+
+function startStatusStream() {
+  const headers = {};
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const url = '/api/status?stream=1&endpoint=' + encodeURIComponent(endpoint);
+  fetch(url, { headers, cache: 'no-store' })
+    .then(async resp => {
+      if (!resp.ok || !resp.body) throw new Error('stream HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (!line.trim()) continue;
+          try { applyStatusLine(JSON.parse(line)); } catch {}
+        }
+      }
+      throw new Error('stream closed');
+    })
+    .catch(() => setTimeout(startStatusStream, 2000));
+}
+startStatusStream();
 </script>
 </body>
 </html>

@@ -61,7 +61,12 @@ class Server():
             sock_path = config['address']
             if _os.path.exists(sock_path):
                 _os.unlink(sock_path)
-            self._socket.bind(sock_path)
+            try:
+                self._socket.bind(sock_path)
+            except OSError as err:
+                raise ConfigError(
+                    f"{self._protocol} {sock_path}: failed to bind: "
+                    f"{err.strerror or err}") from err
         else:
             self._log.info(
                 "  Server: %s %d %s",
@@ -74,7 +79,12 @@ class Server():
                 _socket.AF_INET, _socket.SOCK_STREAM, _socket.IPPROTO_TCP)
             self._socket.setsockopt(
                 _socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-            self._socket.bind((config['address'], config['port']))
+            try:
+                self._socket.bind((config['address'], config['port']))
+            except OSError as err:
+                raise ConfigError(
+                    f"{self._protocol} {config['address']}:{config['port']}: "
+                    f"failed to bind: {err.strerror or err}") from err
         self._socket.listen(1)
 
     def __del__(self):

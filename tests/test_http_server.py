@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock, MagicMock, patch
 
 from ser2tcp.http_auth import hash_password
-from ser2tcp.http_server import HttpServerWrapper
+from ser2tcp.http_server import HttpServerWrapper, _describe_detected
 
 
 class MockClient:
@@ -18,6 +18,10 @@ class MockClient:
         self.data = data
         self.responded = None
         self.respond_status = None
+        # NDJSON streaming state
+        self.ndjson_started = False
+        self.ndjson_lines = []
+        self.ndjson_alive = True  # set False to simulate peer disconnect
 
     def respond(self, data=None, status=200, headers=None, cookies=None):
         self.responded = data
@@ -26,6 +30,19 @@ class MockClient:
     def respond_file(self, file_name, headers=None):
         self.responded = ('file', file_name)
         self.respond_status = 200
+
+    def response_ndjson(self, headers=None, cookies=None):
+        self.ndjson_started = True
+        return True
+
+    def send_ndjson(self, obj):
+        if not self.ndjson_alive:
+            return False
+        self.ndjson_lines.append(obj)
+        return True
+
+    def close(self):
+        self.ndjson_alive = False
 
 
 def make_wrapper(auth_config=None, serial_proxies=None):
@@ -1259,3 +1276,519 @@ class TestMaxConnectionsValidation(unittest.TestCase):
             }]
         })
         self.assertIn('max_connections', result)
+
+
+# ===========================================================================
+# Helpers for the new-feature tests below
+# ===========================================================================
+
+def _proxy(port=None, baudrate=None, match=None, connected=False,
+        servers=None, name='', signals=0):
+    proxy = Mock()
+    cfg = {}
+    if port:
+        cfg['port'] = port
+    if baudrate:
+        cfg['baudrate'] = baudrate
+    proxy.serial_config = cfg
+    proxy.match = match
+    proxy.name = name
+    proxy.is_connected = connected
+    proxy.max_connections = 0
+    proxy.servers = servers or []
+    # get_signals only called when is_connected is True; default to 0 so
+    # tests that flip connected mid-run don't TypeError on bitmask logic.
+    proxy.get_signals.return_value = signals
+    return proxy
+
+
+def _server(protocol='TCP', address='0.0.0.0', port=10001,
+        endpoint=None, connections=None, control=None,
+        max_connections=0, data_enabled=True):
+    s = Mock()
+    s.protocol = protocol
+    cfg = {'address': address, 'port': port}
+    s.config = cfg
+    s.connections = connections or []
+    s.endpoint = endpoint
+    s.control = control
+    s.max_connections = max_connections
+    s.data_enabled = data_enabled
+    return s
+
+
+# ===========================================================================
+# _describe_detected (module-level helper used by USB plug/unplug logging)
+# ===========================================================================
+class TestDescribeDetected(unittest.TestCase):
+    def test_device_only(self):
+        s = _describe_detected({'device': '/dev/ttyUSB0'})
+        self.assertEqual(s, '/dev/ttyUSB0')
+
+    def test_with_vid_pid_and_product(self):
+        s = _describe_detected({
+            'device': '/dev/ttyUSB0', 'vid': '0x303A', 'pid': '0x4001',
+            'product': 'ESP32-C6', 'manufacturer': 'Espressif',
+            'serial_number': 'abc123',
+        })
+        self.assertIn('/dev/ttyUSB0', s)
+        self.assertIn('0x303A:0x4001', s)
+        self.assertIn('ESP32-C6', s)
+        self.assertIn('Espressif', s)
+        self.assertIn('abc123', s)
+
+    def test_pid_alone_omitted(self):
+        # No pid → no vid:pid bracket either (we require both)
+        s = _describe_detected({'device': '/dev/x', 'vid': '0x1234'})
+        self.assertNotIn('0x1234', s)
+
+    def test_skips_empty_attrs(self):
+        s = _describe_detected({
+            'device': '/dev/x', 'product': '', 'serial_number': None,
+        })
+        self.assertEqual(s, '/dev/x')
+
+
+# ===========================================================================
+# _device_matches (USB attribute filter with wildcards)
+# ===========================================================================
+class TestDeviceMatches(unittest.TestCase):
+    def test_exact_match(self):
+        d = {'serial_number': 'abc123', 'product': 'X'}
+        self.assertTrue(HttpServerWrapper._device_matches(
+            d, {'serial_number': 'abc123'}))
+
+    def test_case_insensitive(self):
+        d = {'serial_number': 'AbC'}
+        self.assertTrue(HttpServerWrapper._device_matches(
+            d, {'serial_number': 'abc'}))
+
+    def test_wildcard_prefix(self):
+        d = {'product': 'CP2102N'}
+        self.assertTrue(HttpServerWrapper._device_matches(
+            d, {'product': 'CP210*'}))
+
+    def test_wildcard_no_match(self):
+        d = {'product': 'FT232'}
+        self.assertFalse(HttpServerWrapper._device_matches(
+            d, {'product': 'CP210*'}))
+
+    def test_multi_attr_all_must_match(self):
+        d = {'vid': '0x303A', 'pid': '0x4001'}
+        self.assertTrue(HttpServerWrapper._device_matches(
+            d, {'vid': '0x303A', 'pid': '0x4001'}))
+        self.assertFalse(HttpServerWrapper._device_matches(
+            d, {'vid': '0x303A', 'pid': '0xDEAD'}))
+
+    def test_missing_attr_in_detected(self):
+        # detected has no `serial_number` but match requires it
+        d = {'vid': '0x1234'}
+        self.assertFalse(HttpServerWrapper._device_matches(
+            d, {'serial_number': 'abc'}))
+
+    def test_invalid_regex_falls_back_to_equality(self):
+        # Match value with broken regex chars — should still work via the
+        # `re.error` except branch (compares as equal-string instead).
+        d = {'product': '[unfinished'}
+        self.assertTrue(HttpServerWrapper._device_matches(
+            d, {'product': '[unfinished'}))
+
+
+# ===========================================================================
+# _compute_port_state — drives port card colors (online/offline/error)
+# ===========================================================================
+class TestComputePortState(unittest.TestCase):
+    def setUp(self):
+        self.wrapper = make_wrapper()
+
+    def test_connected_is_online(self):
+        proxy = _proxy(port='/dev/ttyUSB0', connected=True)
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, []), 'online')
+
+    def test_device_present_is_offline(self):
+        proxy = _proxy(port='/dev/ttyUSB0', connected=False)
+        detected = [{'device': '/dev/ttyUSB0'}]
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, detected), 'offline')
+
+    def test_device_missing_is_error(self):
+        proxy = _proxy(port='/dev/ttyUSB0', connected=False)
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, []), 'error')
+
+    def test_match_present_is_offline(self):
+        proxy = _proxy(match={'serial_number': 'abc'}, connected=False)
+        detected = [{'device': '/dev/ttyUSB0', 'serial_number': 'abc'}]
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, detected), 'offline')
+
+    def test_match_missing_is_error(self):
+        proxy = _proxy(match={'serial_number': 'abc'}, connected=False)
+        detected = [{'device': '/dev/ttyUSB0', 'serial_number': 'xyz'}]
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, detected), 'error')
+
+    def test_no_specific_device_is_offline(self):
+        # Proxy with neither port nor match — can't say it's missing.
+        proxy = _proxy(port=None, match=None, connected=False)
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, []), 'offline')
+
+
+# ===========================================================================
+# `state` field in /api/status payload
+# ===========================================================================
+class TestStateInPayload(unittest.TestCase):
+    def test_state_present_in_each_port(self):
+        p1 = _proxy(port='/dev/ttyUSB0', connected=True)
+        p2 = _proxy(port='/dev/ttyMISSING', connected=False)
+        wrapper = make_wrapper(serial_proxies=[p1, p2])
+        wrapper._detect_cache = [{'device': '/dev/ttyUSB0'}]
+        wrapper._detect_cache_at = float("inf")  # block re-enum
+        client = MockClient(path='/api/status')
+        wrapper._handle_request(client)
+        states = [p['state'] for p in client.responded['ports']]
+        self.assertEqual(states, ['online', 'error'])
+
+
+# ===========================================================================
+# _find_port_by_filter
+# ===========================================================================
+class TestFindPortByFilter(unittest.TestCase):
+    def setUp(self):
+        self.ports = [
+            {'name': 'rpi', 'servers': [
+                {'protocol': 'TCP', 'port': 10001},
+                {'protocol': 'WEBSOCKET', 'endpoint': 'rpi'}]},
+            {'name': 'esp', 'servers': [
+                {'protocol': 'WEBSOCKET', 'endpoint': 'esp32c6'}]},
+        ]
+
+    def test_match_by_name(self):
+        port, idx = HttpServerWrapper._find_port_by_filter(
+            self.ports, port_name='esp')
+        self.assertEqual(idx, 1)
+        self.assertEqual(port['name'], 'esp')
+
+    def test_match_by_endpoint(self):
+        port, idx = HttpServerWrapper._find_port_by_filter(
+            self.ports, endpoint='esp32c6')
+        self.assertEqual(idx, 1)
+
+    def test_no_match(self):
+        port, idx = HttpServerWrapper._find_port_by_filter(
+            self.ports, port_name='nope')
+        self.assertIsNone(port)
+        self.assertIsNone(idx)
+
+    def test_endpoint_only_matches_websocket(self):
+        # TCP server with the same name as an endpoint shouldn't match
+        ports = [{'name': 'a', 'servers': [
+            {'protocol': 'TCP', 'port': 1234},
+            {'protocol': 'WEBSOCKET', 'endpoint': 'b'}]}]
+        port, _ = HttpServerWrapper._find_port_by_filter(
+            ports, endpoint='1234')
+        self.assertIsNone(port)
+
+
+# ===========================================================================
+# /api/status query-param routing (one-shot mode)
+# ===========================================================================
+class TestStatusFilters(unittest.TestCase):
+    def _wrapper(self):
+        proxy = _proxy(name='rpi', port='/dev/ttyUSB0',
+            servers=[_server(protocol='WEBSOCKET', endpoint='rpi-ep')])
+        wrapper = make_wrapper(serial_proxies=[proxy])
+        wrapper._detect_cache = [{'device': '/dev/ttyUSB0'}]
+        wrapper._detect_cache_at = float("inf")
+        return wrapper
+
+    def test_filter_by_port_name(self):
+        wrapper = self._wrapper()
+        client = MockClient(path='/api/status', query={'port': 'rpi'})
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 200)
+        self.assertIn('port', client.responded)
+        self.assertNotIn('ports', client.responded)
+        self.assertEqual(client.responded['port']['name'], 'rpi')
+
+    def test_filter_by_endpoint(self):
+        wrapper = self._wrapper()
+        client = MockClient(path='/api/status', query={'endpoint': 'rpi-ep'})
+        wrapper._handle_request(client)
+        self.assertEqual(client.responded['port']['name'], 'rpi')
+
+    def test_filter_unknown_returns_404(self):
+        wrapper = self._wrapper()
+        client = MockClient(path='/api/status', query={'port': 'nope'})
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 404)
+
+    def test_no_filter_returns_all(self):
+        wrapper = self._wrapper()
+        client = MockClient(path='/api/status')
+        wrapper._handle_request(client)
+        self.assertIn('ports', client.responded)
+
+
+# ===========================================================================
+# /api/status?stream=1 — initial NDJSON snapshot + client registration
+# ===========================================================================
+class TestStreamSnapshot(unittest.TestCase):
+    def _wrapper(self):
+        proxy = _proxy(name='rpi', port='/dev/ttyUSB0',
+            servers=[_server(protocol='WEBSOCKET', endpoint='rpi-ep')])
+        w = make_wrapper(serial_proxies=[proxy])
+        w._detect_cache = [{'device': '/dev/ttyUSB0'}]
+        w._detect_cache_at = float("inf")
+        return w
+
+    def test_all_ports_stream_initial_snapshot(self):
+        wrapper = self._wrapper()
+        client = MockClient(path='/api/status', query={'stream': '1'})
+        wrapper._handle_request(client)
+        self.assertTrue(client.ndjson_started)
+        self.assertEqual(len(client.ndjson_lines), 1)
+        snap = client.ndjson_lines[0]
+        self.assertIn('ports', snap)
+        self.assertIn('detected', snap)
+        self.assertIn('admin', snap)
+        # Client got registered for future broadcasts.
+        self.assertEqual(len(wrapper._stream_clients), 1)
+        self.assertEqual(wrapper._stream_clients[0]['mode'], 'all')
+
+    def test_filtered_stream_initial_snapshot_uses_port_key(self):
+        wrapper = self._wrapper()
+        client = MockClient(
+            path='/api/status', query={'stream': '1', 'port': 'rpi'})
+        wrapper._handle_request(client)
+        self.assertEqual(len(client.ndjson_lines), 1)
+        snap = client.ndjson_lines[0]
+        self.assertIn('port', snap)
+        self.assertEqual(snap['port']['name'], 'rpi')
+        self.assertEqual(wrapper._stream_clients[0]['mode'], 'filter')
+        self.assertEqual(wrapper._stream_clients[0]['port_name'], 'rpi')
+
+    def test_filtered_stream_unknown_port_sends_null(self):
+        # A filter that doesn't match any current port still opens the
+        # stream — the entry can pick the port up if it appears later.
+        wrapper = self._wrapper()
+        client = MockClient(
+            path='/api/status', query={'stream': '1', 'port': 'ghost'})
+        wrapper._handle_request(client)
+        self.assertEqual(client.ndjson_lines[0]['port'], None)
+        self.assertEqual(len(wrapper._stream_clients), 1)
+
+
+# ===========================================================================
+# _broadcast_status — delta computation (the heart of the live UI)
+# ===========================================================================
+class TestBroadcastDeltas(unittest.TestCase):
+    def _wrapper_with_client(self, mode='all', port_name=None,
+            endpoint=None):
+        proxy = _proxy(name='rpi', port='/dev/ttyUSB0',
+            servers=[_server(protocol='WEBSOCKET', endpoint='rpi-ep')])
+        wrapper = make_wrapper(serial_proxies=[proxy])
+        wrapper._detect_cache = [{'device': '/dev/ttyUSB0'}]
+        wrapper._detect_cache_at = float("inf")
+        # Subscribe a client by going through the real handler so the
+        # entry gets the same shape the broadcast loop expects.
+        client = MockClient(path='/api/status',
+            query={'stream': '1', **({'port': port_name} if port_name else {}),
+                   **({'endpoint': endpoint} if endpoint else {})})
+        wrapper._handle_request(client)
+        client.ndjson_lines.clear()  # discard initial snapshot
+        return wrapper, client, proxy
+
+    def test_no_change_no_send(self):
+        wrapper, client, _ = self._wrapper_with_client()
+        wrapper._broadcast_status()
+        self.assertEqual(client.ndjson_lines, [])
+
+    def test_signal_change_emits_delta(self):
+        wrapper, client, proxy = self._wrapper_with_client()
+        # Flip the proxy state so payload differs from last snapshot.
+        proxy.is_connected = True
+        proxy.get_signals.return_value = 0  # all off
+        wrapper._broadcast_status()
+        # A per-port delta with the changed fields (state went online,
+        # signals appeared, serial.connected=True).
+        self.assertEqual(len(client.ndjson_lines), 1)
+        delta = client.ndjson_lines[0]
+        self.assertEqual(delta['port_index'], 0)
+        self.assertTrue(delta['_delta'])
+
+    def test_port_count_change_sends_full_snapshot(self):
+        wrapper, client, _ = self._wrapper_with_client()
+        # Add a second proxy → length differs → full snapshot.
+        wrapper._serial_proxies.append(
+            _proxy(name='extra', port='/dev/x'))
+        wrapper._broadcast_status()
+        self.assertEqual(len(client.ndjson_lines), 1)
+        line = client.ndjson_lines[0]
+        self.assertIn('ports', line)
+        self.assertEqual(len(line['ports']), 2)
+
+    def test_detected_change_emits_detected_line(self):
+        wrapper, client, _ = self._wrapper_with_client()
+        wrapper._detect_cache = [
+            {'device': '/dev/ttyUSB0'},
+            {'device': '/dev/ttyNEW'},
+        ]
+        wrapper._broadcast_status()
+        self.assertEqual(len(client.ndjson_lines), 1)
+        line = client.ndjson_lines[0]
+        self.assertIn('detected', line)
+        self.assertNotIn('ports', line)
+
+    def test_filter_mode_emits_sparse_delta(self):
+        wrapper, client, proxy = self._wrapper_with_client(
+            mode='filter', port_name='rpi')
+        proxy.is_connected = True
+        proxy.get_signals.return_value = 0
+        wrapper._broadcast_status()
+        self.assertEqual(len(client.ndjson_lines), 1)
+        delta = client.ndjson_lines[0]
+        self.assertTrue(delta['_delta'])
+        # Filter mode delta has no port_index — single-port view.
+        self.assertNotIn('port_index', delta)
+        self.assertNotIn('ports', delta)
+
+    def test_filter_mode_port_disappears_emits_removed(self):
+        wrapper, client, _ = self._wrapper_with_client(
+            mode='filter', port_name='rpi')
+        # Drop the proxy → next tick sees no match.
+        wrapper._serial_proxies.clear()
+        wrapper._broadcast_status()
+        self.assertEqual(client.ndjson_lines, [{'_removed': True}])
+
+    def test_filter_mode_port_reappears_sends_snapshot(self):
+        wrapper, client, _ = self._wrapper_with_client(
+            mode='filter', port_name='rpi')
+        # Pretend the port was missing at subscribe time.
+        wrapper._stream_clients[0]['last_port'] = None
+        wrapper._broadcast_status()
+        self.assertEqual(len(client.ndjson_lines), 1)
+        line = client.ndjson_lines[0]
+        self.assertIn('port', line)
+        self.assertEqual(line['port']['name'], 'rpi')
+
+    def test_dead_client_dropped(self):
+        wrapper, client, proxy = self._wrapper_with_client()
+        client.ndjson_alive = False  # simulate peer disconnect
+        proxy.is_connected = True
+        proxy.get_signals.return_value = 0
+        wrapper._broadcast_status()
+        # Entry removed from registry; nothing crashes.
+        self.assertEqual(wrapper._stream_clients, [])
+
+    def test_heartbeat_after_30s_silence(self):
+        wrapper, client, _ = self._wrapper_with_client()
+        # Backdate last_send to >30s ago.
+        wrapper._stream_clients[0]['last_send'] -= 31
+        wrapper._broadcast_status()
+        self.assertEqual(client.ndjson_lines, [{}])
+
+
+# ===========================================================================
+# _build_detected_payload — caching + plug/unplug logging
+# ===========================================================================
+class TestDetectedPayload(unittest.TestCase):
+    def _fake_port(self, **attrs):
+        p = MagicMock()
+        p.device = attrs.get('device', '/dev/x')
+        p.description = attrs.get('description', 'desc')
+        p.hwid = attrs.get('hwid', 'X')
+        p.vid = attrs.get('vid')
+        p.pid = attrs.get('pid')
+        p.serial_number = attrs.get('serial_number')
+        p.manufacturer = attrs.get('manufacturer')
+        p.product = attrs.get('product')
+        p.location = attrs.get('location')
+        return p
+
+    def test_cache_returns_same_within_ttl(self):
+        wrapper = make_wrapper()
+        with patch('ser2tcp.http_server._list_ports.comports',
+                return_value=[self._fake_port(device='/dev/a')]):
+            first = wrapper._build_detected_payload(force=True)
+        # Bump cache_at so the next call hits cache instead of re-enum.
+        with patch('ser2tcp.http_server._list_ports.comports') as m:
+            second = wrapper._build_detected_payload()
+            m.assert_not_called()
+        self.assertEqual(first, second)
+
+    def test_force_bypasses_cache(self):
+        wrapper = make_wrapper()
+        wrapper._detect_cache = [{'device': '/dev/cached'}]
+        wrapper._detect_cache_at = float("inf")  # cache valid forever
+        with patch('ser2tcp.http_server._list_ports.comports',
+                return_value=[self._fake_port(device='/dev/fresh')]):
+            fresh = wrapper._build_detected_payload(force=True)
+        self.assertEqual(fresh[0]['device'], '/dev/fresh')
+
+    def test_first_build_silent_no_log(self):
+        # _detect_cache_at == 0.0 → first build, no plug/unplug log spam
+        wrapper = make_wrapper()
+        log = wrapper._log
+        with patch('ser2tcp.http_server._list_ports.comports',
+                return_value=[self._fake_port(device='/dev/a')]):
+            wrapper._build_detected_payload(force=True)
+        for call in log.info.call_args_list:
+            self.assertNotIn('plugged', str(call))
+            self.assertNotIn('unplugged', str(call))
+
+    def test_plug_and_unplug_logged_on_diff(self):
+        wrapper = make_wrapper()
+        log = wrapper._log
+        with patch('ser2tcp.http_server._list_ports.comports',
+                return_value=[self._fake_port(device='/dev/a')]):
+            wrapper._build_detected_payload(force=True)
+        # second run: /dev/a unplugged, /dev/b plugged
+        with patch('ser2tcp.http_server._list_ports.comports',
+                return_value=[self._fake_port(device='/dev/b')]):
+            wrapper._build_detected_payload(force=True)
+        msgs = [call.args[0] % call.args[1:] for call in log.info.call_args_list
+                if 'plugged' in str(call) or 'unplugged' in str(call)]
+        joined = ' '.join(msgs)
+        self.assertIn('plugged', joined)
+        self.assertIn('/dev/b', joined)
+        self.assertIn('unplugged', joined)
+        self.assertIn('/dev/a', joined)
+
+
+# ===========================================================================
+# HTTP bind error handling — used to traceback on Address-already-in-use
+# ===========================================================================
+class TestHttpBindError(unittest.TestCase):
+    def test_create_http_server_raises_value_error(self):
+        wrapper = make_wrapper()
+        with patch('ser2tcp.http_server._uhttp_server.HttpServer',
+                side_effect=OSError(48, 'Address already in use')):
+            with self.assertRaises(ValueError) as ctx:
+                wrapper._create_http_server({
+                    'address': '127.0.0.1', 'port': 20080,
+                })
+            self.assertIn('failed to bind', str(ctx.exception))
+            self.assertIn('20080', str(ctx.exception))
+
+    def test_init_skips_failed_binds_no_traceback(self):
+        # Two HTTP server configs — one fails to bind, the other succeeds.
+        # The wrapper should log + skip the failed one, not raise.
+        configs = [
+            {'address': '127.0.0.1', 'port': 20080},
+            {'address': '127.0.0.1', 'port': 20081},
+        ]
+        configuration = {'http': configs}
+        good = MagicMock()
+        with patch('ser2tcp.http_server._uhttp_server.HttpServer',
+                side_effect=[OSError(48, 'EADDRINUSE'), good]):
+            wrapper = HttpServerWrapper(
+                configs, [], log=Mock(), configuration=configuration)
+        # Only the second server got created.
+        self.assertEqual(len(wrapper._servers), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

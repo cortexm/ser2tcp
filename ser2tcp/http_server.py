@@ -4,7 +4,9 @@ import json as _json
 import logging as _logging
 import os as _os
 import pathlib as _pathlib
+import re as _re
 import ssl as _ssl
+import time as _time
 
 import serial.tools.list_ports as _list_ports
 
@@ -18,6 +20,21 @@ import ser2tcp.server as _server
 import ser2tcp.server_monitor as _server_monitor
 
 HTML_DIR = _pathlib.Path(__file__).parent / 'html'
+
+
+def _describe_detected(info):
+    """Format a detected USB device for log output: device path + the
+    most identifying attributes if present (vid/pid + product / serial)."""
+    parts = [info['device']]
+    extras = []
+    if 'vid' in info and 'pid' in info:
+        extras.append(f"{info['vid']}:{info['pid']}")
+    for key in ('product', 'manufacturer', 'serial_number'):
+        if info.get(key):
+            extras.append(info[key])
+    if extras:
+        parts.append('(' + ' '.join(extras) + ')')
+    return ' '.join(parts)
 
 
 class HttpServerWrapper():
@@ -53,6 +70,15 @@ class HttpServerWrapper():
         self._monitor_servers = {}  # port name -> ServerMonitor
         self._servers = []  # list of (HttpServer, IpFilter or None)
         self._pending_reload = False
+        # NDJSON status streaming clients.
+        # Each entry: {client, last_ports, admin, last_send}
+        # `last_ports` mirrors what we last delivered so we can compute deltas.
+        self._stream_clients = []
+        # Cache for /api/detect — USB enumeration via pyserial isn't free;
+        # throttle to ~1 s so the stream can include detected devices
+        # without hitting the kernel on every 100 ms select tick.
+        self._detect_cache = []
+        self._detect_cache_at = 0.0
         for config in configs:
             address = config.get('address', '0.0.0.0')
             port = config.get('port', 8080)
@@ -84,9 +110,16 @@ class HttpServerWrapper():
                 self._log.info(
                     "HTTP server: %s:%d", address, port)
             ip_flt = _ip_filter.create_filter(config, log=self._log)
-            self._servers.append((_uhttp_server.HttpServer(
-                address=address, port=port, ssl_context=ssl_context,
-                event_mode=True), ip_flt))
+            try:
+                server = _uhttp_server.HttpServer(
+                    address=address, port=port, ssl_context=ssl_context,
+                    event_mode=True)
+            except OSError as err:
+                self._log.error(
+                    "HTTP server %s:%d: failed to bind: %s, skipping",
+                    address, port, err.strerror or err)
+                continue
+            self._servers.append((server, ip_flt))
 
     def _create_http_server(self, config):
         """Create a single HTTP server from config, return (server, ip_flt) or None"""
@@ -109,9 +142,14 @@ class HttpServerWrapper():
         else:
             self._log.info("HTTP server: %s:%d", address, port)
         ip_flt = _ip_filter.create_filter(config, log=self._log)
-        server = _uhttp_server.HttpServer(
-            address=address, port=port, ssl_context=ssl_context,
-            event_mode=True)
+        try:
+            server = _uhttp_server.HttpServer(
+                address=address, port=port, ssl_context=ssl_context,
+                event_mode=True)
+        except OSError as err:
+            raise ValueError(
+                f"HTTP {address}:{port}: failed to bind: "
+                f"{err.strerror or err}") from err
         return (server, ip_flt)
 
     def add_http_server(self, config):
@@ -219,6 +257,7 @@ class HttpServerWrapper():
         if self._pending_reload:
             self._pending_reload = False
             self.reload_http_servers()
+        self._broadcast_status()
 
     def close(self):
         """Close all HTTP servers"""
@@ -461,8 +500,53 @@ class HttpServerWrapper():
             return
         client.respond_file(str(file_path))
 
-    def _handle_api_status(self, client, user):
-        """Return runtime status with connections"""
+    @staticmethod
+    def _device_matches(detected, match):
+        """True if a detected device matches every key in `match` (case-
+        insensitive, `*` is a wildcard)."""
+        for k, v in match.items():
+            pv = (detected.get(k) or '').upper()
+            mv = str(v).upper().replace('*', '.*')
+            try:
+                if not _re.match('^' + mv + '$', pv):
+                    return False
+            except _re.error:
+                if pv != mv:
+                    return False
+        return True
+
+    def _compute_port_state(self, proxy, detected):
+        """High-level port state used by the UI for color coding:
+          'online'  — serial proxy is open and data is flowing
+          'offline' — device is present on the system, just no active link
+          'error'   — configured device is missing (USB unplugged?)
+        """
+        if proxy.is_connected:
+            return 'online'
+        match = proxy.match
+        device = proxy.serial_config.get('port')
+        if match:
+            for d in detected:
+                if self._device_matches(d, match):
+                    return 'offline'
+            return 'error'
+        if device:
+            for d in detected:
+                if d.get('device') == device:
+                    return 'offline'
+            return 'error'
+        # No specific device configured — can't say it's missing.
+        return 'offline'
+
+    def _build_ports_payload(self, detected=None):
+        """Build per-port status payloads (used for /api/status and stream).
+
+        `detected` is the current USB list — used only to compute the
+        `state` field. Defaults to the cached value so callers in the
+        broadcast tick don't re-enumerate USB just for state.
+        """
+        if detected is None:
+            detected = self._detect_cache
         ports = []
         for proxy in self._serial_proxies:
             serial_cfg = proxy.serial_config
@@ -528,12 +612,249 @@ class HttpServerWrapper():
                     bit = _control.SIGNAL_BITS[name]
                     signals[name] = bool(bitmask & (1 << bit))
                 port_info['signals'] = signals
+            port_info['state'] = self._compute_port_state(proxy, detected)
             ports.append(port_info)
-        is_admin = user.get('admin', False) if user else False
-        client.respond({'ports': ports, 'admin': is_admin})
+        return ports
 
-    def _handle_api_detect(self, client):
-        """Return list of available serial ports"""
+    @staticmethod
+    def _find_port_by_filter(ports, port_name=None, endpoint=None):
+        """Find a single port matching a name or WS endpoint. Returns
+        (payload, index) or (None, None)."""
+        for i, p in enumerate(ports):
+            if port_name and p.get('name') == port_name:
+                return p, i
+            if endpoint:
+                for s in p.get('servers', []):
+                    if s.get('protocol') == 'WEBSOCKET' \
+                            and s.get('endpoint') == endpoint:
+                        return p, i
+        return None, None
+
+    def _handle_api_status(self, client, user):
+        """Runtime status with optional NDJSON streaming and filtering.
+
+        Query parameters:
+          stream=1        upgrade response to NDJSON live stream
+          port=<name>     restrict output to a single port (matched by
+                          `name`); wire format becomes {port: <payload>}
+                          instead of {ports: [...]}
+          endpoint=<ep>   like `port` but matches by WebSocket endpoint
+                          (used by /xterm/<ep> and /raw/<ep> pages which
+                          know their endpoint, not the port name)
+
+        One-shot wire format (no `stream`):
+          {ports: [...], admin: bool}              all ports
+          {port: <payload>, admin: bool}           filtered (single port)
+
+        Streaming wire format (`stream=1`):
+          all-ports mode:
+            {ports: [...], detected: [...], admin: bool}   full snapshot
+            {port_index: i, _delta: true, ...changed}      per-port delta
+            {detected: [...]}                              USB plug/unplug
+            {}                                             heartbeat
+          filtered mode (`port=` or `endpoint=`):
+            {port: <payload>, admin: bool}                 full snapshot
+            {_delta: true, ...changed_top_level}           sparse delta
+            {_removed: true}                               port disappeared
+            {}                                             heartbeat
+        """
+        q = client.query or {}
+        is_stream = bool(q.get('stream'))
+        port_name = q.get('port')
+        endpoint = q.get('endpoint')
+        is_admin = user.get('admin', False) if user else False
+
+        detected = self._build_detected_payload()
+        ports = self._build_ports_payload(detected=detected)
+
+        if port_name or endpoint:
+            match, _idx = self._find_port_by_filter(
+                ports, port_name=port_name, endpoint=endpoint)
+            if not is_stream:
+                if not match:
+                    self._error(client, 'Port not found', 404)
+                    return
+                client.respond({'port': match, 'admin': is_admin})
+                return
+            # Filtered streaming mode below.
+            if not client.response_ndjson(headers={
+                    'X-Content-Type-Options': 'nosniff',
+                    'X-Accel-Buffering': 'no'}):
+                return
+            if not client.send_ndjson({'port': match, 'admin': is_admin}):
+                return
+            self._stream_clients.append({
+                'client': client,
+                'mode': 'filter',
+                'port_name': port_name,
+                'endpoint': endpoint,
+                'last_port': dict(match) if match else None,
+                'admin': is_admin,
+                'last_send': _time.time(),
+            })
+            self._log.debug(
+                "filtered status stream client registered (%d total)",
+                len(self._stream_clients))
+            return
+
+        # All-ports mode.
+        if not is_stream:
+            client.respond({'ports': ports, 'admin': is_admin})
+            return
+        if not client.response_ndjson(headers={
+                'X-Content-Type-Options': 'nosniff',
+                'X-Accel-Buffering': 'no'}):
+            return
+        if not client.send_ndjson(
+                {'ports': ports, 'detected': detected, 'admin': is_admin}):
+            return
+        self._stream_clients.append({
+            'client': client,
+            'mode': 'all',
+            'last_ports': [dict(p) for p in ports],
+            'last_detected': [dict(d) for d in detected],
+            'admin': is_admin,
+            'last_send': _time.time(),
+        })
+        self._log.debug(
+            "status stream client registered (%d total)",
+            len(self._stream_clients))
+
+    def _broadcast_status(self):
+        """Push pending status updates to NDJSON streaming clients.
+
+        - Computes the current per-port payload once, then diffs against
+          each client's last-sent state.
+        - Falls back to a full snapshot when port count or order changed
+          (config edits) — simpler than tracking insertion / deletion.
+        - Drops clients whose `send_ndjson()` returns False (socket gone).
+        """
+        if not self._stream_clients:
+            return
+        now = _time.time()
+        # Build once per tick — both modes consume the same source data.
+        current_detected = self._build_detected_payload()
+        current_ports = self._build_ports_payload(detected=current_detected)
+        alive = []
+        for entry in self._stream_clients:
+            ok = self._broadcast_to_entry(
+                entry, now, current_ports, current_detected)
+            if ok:
+                alive.append(entry)
+            else:
+                self._log.debug("status stream client disconnected")
+        self._stream_clients = alive
+
+    def _broadcast_to_entry(self, entry, now, current_ports, current_detected):
+        """Send pending updates to one stream client. Returns False if the
+        client's socket is gone (caller drops the entry).
+
+        Peer-EOF detection is now handled inside uhttp itself (its
+        process_request_event drains a non-blocking recv on streaming
+        connections and raises HttpDisconnected on close), so subsequent
+        send_ndjson() returns False and the entry is dropped naturally.
+        """
+        client = entry['client']
+        if entry.get('mode') == 'filter':
+            return self._broadcast_filter(
+                entry, client, now, current_ports)
+        return self._broadcast_all(
+            entry, client, now, current_ports, current_detected)
+
+    def _broadcast_all(self, entry, client, now,
+            current_ports, current_detected):
+        last_ports = entry['last_ports']
+        last_detected = entry['last_detected']
+        ok = True
+        sent_anything = False
+        if len(last_ports) != len(current_ports):
+            # Port added/removed — replay full snapshot. Cheaper than
+            # diffing across mismatched indices.
+            ok = client.send_ndjson({
+                'ports': current_ports,
+                'detected': current_detected,
+                'admin': entry['admin']})
+            sent_anything = True
+        else:
+            for idx, (last, cur) in enumerate(
+                    zip(last_ports, current_ports)):
+                if last == cur:
+                    continue
+                delta = {'port_index': idx, '_delta': True}
+                keys = set(last) | set(cur)
+                for k in keys:
+                    if last.get(k) != cur.get(k):
+                        delta[k] = cur.get(k)
+                ok = client.send_ndjson(delta)
+                sent_anything = True
+                if not ok:
+                    break
+            if ok and last_detected != current_detected:
+                ok = client.send_ndjson({'detected': current_detected})
+                sent_anything = True
+        if ok and not sent_anything and (now - entry['last_send']) > 30:
+            ok = client.send_ndjson({})
+            sent_anything = True
+        if not ok:
+            return False
+        if sent_anything:
+            entry['last_send'] = now
+        entry['last_ports'] = [dict(p) for p in current_ports]
+        entry['last_detected'] = [dict(d) for d in current_detected]
+        return True
+
+    def _broadcast_filter(self, entry, client, now, current_ports):
+        match, _idx = self._find_port_by_filter(
+            current_ports,
+            port_name=entry.get('port_name'),
+            endpoint=entry.get('endpoint'))
+        last = entry['last_port']
+        ok = True
+        sent_anything = False
+        if match is None and last is not None:
+            # Filtered port disappeared (config edit / rename) — let the
+            # client know once, then keep the connection open in case it
+            # comes back (cheaper than client reconnects).
+            ok = client.send_ndjson({'_removed': True})
+            sent_anything = True
+        elif match is not None and last is None:
+            # Port re-appeared (or was missing at subscribe). Send full
+            # payload as a fresh snapshot.
+            ok = client.send_ndjson({'port': match, 'admin': entry['admin']})
+            sent_anything = True
+        elif match is not None and match != last:
+            delta = {'_delta': True}
+            keys = set(last) | set(match)
+            for k in keys:
+                if last.get(k) != match.get(k):
+                    delta[k] = match.get(k)
+            ok = client.send_ndjson(delta)
+            sent_anything = True
+        if ok and not sent_anything and (now - entry['last_send']) > 30:
+            ok = client.send_ndjson({})
+            sent_anything = True
+        if not ok:
+            return False
+        if sent_anything:
+            entry['last_send'] = now
+        entry['last_port'] = dict(match) if match else None
+        return True
+
+    DETECT_CACHE_TTL = 1.0  # seconds — see _detect_cache comment in __init__
+
+    def _build_detected_payload(self, force=False):
+        """Enumerate currently-attached USB serial devices.
+
+        Cached for DETECT_CACHE_TTL seconds so the stream tick can call
+        this every ~100 ms cheaply. Pass `force=True` to bypass the cache
+        (used by the REST endpoint which expects a fresh read).
+
+        Logs INFO lines on plug / unplug by diffing against the previous
+        cache contents (keyed on device path).
+        """
+        now = _time.time()
+        if not force and (now - self._detect_cache_at) < self.DETECT_CACHE_TTL:
+            return self._detect_cache
         ports = []
         for port in _list_ports.comports():
             info = {'device': port.device}
@@ -553,7 +874,26 @@ class HttpServerWrapper():
                 if port.location:
                     info['location'] = port.location
             ports.append(info)
-        client.respond(ports)
+        # Skip the diff log on the very first build so we don't spam the
+        # log with every device that was already plugged in at startup.
+        if self._detect_cache_at:
+            prev_by_dev = {p['device']: p for p in self._detect_cache}
+            cur_by_dev = {p['device']: p for p in ports}
+            for dev, info in cur_by_dev.items():
+                if dev not in prev_by_dev:
+                    self._log.info(
+                        "USB device plugged: %s", _describe_detected(info))
+            for dev, info in prev_by_dev.items():
+                if dev not in cur_by_dev:
+                    self._log.info(
+                        "USB device unplugged: %s", _describe_detected(info))
+        self._detect_cache = ports
+        self._detect_cache_at = now
+        return ports
+
+    def _handle_api_detect(self, client):
+        """Return list of available serial ports (REST, fresh read)"""
+        client.respond(self._build_detected_payload(force=True))
 
     def _handle_api_signals(self, client):
         """Return signal states for all ports"""
