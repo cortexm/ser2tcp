@@ -246,6 +246,7 @@ function updateNav() {
   const userBtn = $('user-btn');
   const userName = $('user-name');
   const navUsers = $('nav-users');
+  const navCerts = $('nav-certificates');
   header.hidden = !_authed;
   if (token && username) {
     userName.textContent = username;
@@ -255,6 +256,7 @@ function updateNav() {
     userBtn.hidden = true;
   }
   if (navUsers) navUsers.hidden = !isAdmin;
+  if (navCerts) navCerts.hidden = !isAdmin;
 }
 
 function updateActiveTab() {
@@ -398,6 +400,7 @@ function backToList() {
   if (hash.startsWith('/ports')) navigate('/ports');
   else if (hash.startsWith('/users') || hash.startsWith('/tokens')) navigate('/users');
   else if (hash.startsWith('/settings')) navigate('/settings');
+  else if (hash.startsWith('/certificates')) navigate('/certificates');
   else closeModal();
 }
 
@@ -429,6 +432,11 @@ const routes = [
   [/^\/settings\/session$/,        () => showSessionEditor()],
   [/^\/settings\/http\/new$/,      () => showHttpEditor(null)],
   [/^\/settings\/http\/(\d+)\/edit$/, m => showHttpEditor(parseInt(m[1]))],
+  [/^\/certificates$/,             () => showCertificates()],
+  [/^\/certificates\/new$/,        () => showCertEditor(null)],
+  [/^\/certificates\/([^/]+)$/,    m => showCertEditor(decodeURIComponent(m[1]))],
+  [/^\/certificates\/([^/]+)\/paste\/(cert\.pem|key\.pem|ca\.pem)$/,
+    m => _showPasteCertModal(decodeURIComponent(m[1]), m[2])],
   [/^\/login$/,                    () => showLogin()],
 ];
 
@@ -437,7 +445,8 @@ function route() {
   const [path, queryStr] = fullHash.split('?');
   const q = _parseQuery(queryStr || '');
   // List-view routes — close any modal so it doesn't linger.
-  if (path === '/ports' || path === '/users' || path === '/settings') {
+  if (path === '/ports' || path === '/users' || path === '/settings'
+      || path === '/certificates') {
     closeModal();
   }
   for (const [re, handler] of routes) {
@@ -995,7 +1004,15 @@ function showPortEditor(index, query) {
     setTimeout(() => showPortEditor(index, query), 50);
     return;
   }
+  // Load cert bundles fresh — needed for SSL server config.
+  api('GET', '/api/certs').then(data => {
+    _showPortEditorWithBundles(index, query, data.bundles || []);
+  }).catch(e => {
+    if (e !== 'unauthorized') alert(String(e));
+  });
+}
 
+function _showPortEditorWithBundles(index, query, bundles) {
   let cfg;
   if (index !== null) {
     const port = portsStatus.ports[index];
@@ -1012,7 +1029,7 @@ function showPortEditor(index, query) {
     }
   }
 
-  const form = _buildPortForm(cfg, index);
+  const form = _buildPortForm(cfg, index, bundles);
   const saveBtn = btn('Save', 'btn-primary',
     () => _savePortFromForm(form, index));
   const addSrvBtn = btn('+ Add Server', 'btn-accent btn-small',
@@ -1036,7 +1053,7 @@ function showPortEditor(index, query) {
   });
 }
 
-function _buildPortForm(cfg, editIndex) {
+function _buildPortForm(cfg, editIndex, bundles) {
   const root = el('div');
 
   // Name
@@ -1225,7 +1242,7 @@ function _buildPortForm(cfg, editIndex) {
       if (idx >= 0) serverBoxes.splice(idx, 1);
       sb.box.remove();
       _refreshRemoveButtons();
-    }, editIndex, () => serverBoxes);
+    }, editIndex, () => serverBoxes, bundles);
     serverBoxes.push(sb);
     serversDiv.appendChild(sb.box);
     _refreshRemoveButtons();
@@ -1262,7 +1279,7 @@ function _getDetectedAttr(device, attr) {
   return found ? (found[attr] || '') : '';
 }
 
-function _buildServerBox(srv, onRemove, editIndex, getAllBoxes) {
+function _buildServerBox(srv, onRemove, editIndex, getAllBoxes, bundles) {
   const box = el('div', { class: 'server-box' });
   const removeBtn = el('button', {
     type: 'button', class: 'server-remove',
@@ -1310,15 +1327,15 @@ function _buildServerBox(srv, onRemove, editIndex, getAllBoxes) {
   });
   const portRow = formRow('Port', portInput);
 
-  // SSL fields
-  const ssl = srv.ssl || {};
-  const certInput = el('input', { type: 'text', value: ssl.certfile || '' });
-  const keyInput = el('input', { type: 'text', value: ssl.keyfile || '' });
-  const caInput = el('input', { type: 'text', value: ssl.ca_certs || '' });
-  const sslDiv = el('div', { class: 'subgroup' },
-    formRow('Certfile', certInput),
-    formRow('Keyfile', keyInput),
-    formRow('CA certs', caInput));
+  // SSL fields: bundle dropdown + mTLS toggle. Built via shared helper
+  // so port-SSL and HTTPS editors stay consistent. We always want the
+  // ssl block when protocol=SSL, so we hide the SSL-enable checkbox the
+  // helper exposes and treat the bundle as required.
+  const ssl = _buildSslFields(srv.ssl, bundles || []);
+  ssl.sslCb.checked = true;
+  ssl.sslCb.style.display = 'none';
+  ssl.wrap.classList.remove('hidden');
+  const sslDiv = ssl.wrap;
 
   // Control fields
   const ctlEnableCb = el('input', { type: 'checkbox', checked: !!srv.control });
@@ -1490,7 +1507,7 @@ function _buildServerBox(srv, onRemove, editIndex, getAllBoxes) {
     boxData: {
       get proto() { return protoSel.value; },
       protoSel, addrInput, portInput, epInput: wsEndpointInput,
-      tokenInput: wsTokenInput, certInput, keyInput, caInput,
+      tokenInput: wsTokenInput, ssl,
       ctlEnableCb, dataCb, writeRowCbs, reportCbs, pollSel,
       allowInput, denyInput, maxConnInput,
     },
@@ -1538,14 +1555,9 @@ function _collectPortConfig(form) {
       }
     }
     if (proto === 'ssl') {
-      const ssl = {};
-      const cf = d.certInput.value.trim();
-      const kf = d.keyInput.value.trim();
-      const ca = d.caInput.value.trim();
-      if (cf) ssl.certfile = cf;
-      if (kf) ssl.keyfile = kf;
-      if (ca) ssl.ca_certs = ca;
-      if (Object.keys(ssl).length) srv.ssl = ssl;
+      const sslVal = d.ssl.getValue();
+      if (!sslVal) throw new Error('SSL server requires a bundle');
+      srv.ssl = sslVal;
     }
     if (proto !== 'telnet' && d.ctlEnableCb.checked) {
       if (!d.dataCb.checked) srv.data = false;
@@ -1576,7 +1588,9 @@ function _collectPortConfig(form) {
 }
 
 function _savePortFromForm(form, index) {
-  const cfg = _collectPortConfig(form);
+  let cfg;
+  try { cfg = _collectPortConfig(form); }
+  catch (e) { return modalError(e.message); }
   const method = index !== null ? 'PUT' : 'POST';
   const path = index !== null ? '/api/ports/' + index : '/api/ports';
   api(method, path, cfg)
@@ -1943,8 +1957,13 @@ function renderHttpCard(srv, index) {
     el('span', {}, `${srv.address || '0.0.0.0'}:${srv.port}${ssl}`)));
   if (srv.ssl) {
     meta.appendChild(el('div', { class: 'card-meta-row' },
-      el('span', { class: 'card-meta-label' }, 'Cert'),
-      el('span', {}, srv.ssl.certfile || '-')));
+      el('span', { class: 'card-meta-label' }, 'Bundle'),
+      el('span', {}, srv.ssl.bundle || '-')));
+    if (srv.ssl.require_client_cert) {
+      meta.appendChild(el('div', { class: 'card-meta-row' },
+        el('span', { class: 'card-meta-label' }, 'mTLS'),
+        el('span', {}, 'required')));
+    }
   }
   card.appendChild(meta);
   return card;
@@ -1982,6 +2001,63 @@ function showSessionEditor() {
   });
 }
 
+// Build the bundle dropdown + mTLS toggle used by both HTTP and port SSL
+// editors. Returns {wrap, sslCb, getValue} — `wrap` is the div to insert,
+// `sslCb` is the enable checkbox (caller decides where to put it),
+// `getValue()` returns the ssl block or null.
+function _buildSslFields(currentSsl, bundles) {
+  const sslCb = el('input', { type: 'checkbox', checked: !!currentSsl });
+  const bundleSelect = el('select');
+  const placeholderOpt = el('option', { value: '' }, '-- select bundle --');
+  bundleSelect.appendChild(placeholderOpt);
+  bundles.forEach(b => {
+    const hasCert = b.files['cert.pem'];
+    const hasKey = b.files['key.pem'];
+    const ok = hasCert && hasKey;
+    const opt = el('option', {
+      value: b.name,
+      disabled: !ok,
+    }, b.name + (ok ? '' : ' (incomplete)')
+      + (b.files['ca.pem'] ? ' [mTLS-capable]' : ''));
+    bundleSelect.appendChild(opt);
+  });
+  if (currentSsl && currentSsl.bundle) {
+    bundleSelect.value = currentSsl.bundle;
+  }
+  const mtlsCb = el('input', { type: 'checkbox',
+    checked: !!(currentSsl && currentSsl.require_client_cert) });
+  const updateMtlsState = () => {
+    const sel = bundleSelect.value;
+    const b = bundles.find(x => x.name === sel);
+    const hasCa = b && b.files['ca.pem'];
+    mtlsCb.disabled = !hasCa;
+    if (!hasCa) mtlsCb.checked = false;
+  };
+  bundleSelect.onchange = updateMtlsState;
+  updateMtlsState();
+  const manageLink = el('a', {
+    href: '#/certificates', onclick: () => closeModal(),
+    style: 'font-size:12px;margin-left:8px',
+  }, 'Manage certificates…');
+  const sslDiv = el('div', { class: 'subgroup' },
+    formRow('Bundle', [bundleSelect, manageLink]),
+    el('div', { style: 'margin:6px 0 0 120px' },
+      el('label', { class: 'checkbox-label' },
+        mtlsCb, el('span', {}, ' Require client certificate (mTLS)'))));
+  if (!sslCb.checked) sslDiv.classList.add('hidden');
+  sslCb.onchange = () => sslDiv.classList.toggle('hidden', !sslCb.checked);
+
+  function getValue() {
+    if (!sslCb.checked) return null;
+    const bundle = bundleSelect.value;
+    if (!bundle) throw new Error('Select a certificate bundle');
+    const out = { bundle };
+    if (mtlsCb.checked) out.require_client_cert = true;
+    return out;
+  }
+  return { wrap: sslDiv, sslCb, getValue };
+}
+
 function showHttpEditor(index) {
   if (!isAdmin) { navigate('/settings'); return; }
   if (!currentSettings) {
@@ -1989,6 +2065,15 @@ function showHttpEditor(index) {
     setTimeout(() => showHttpEditor(index), 50);
     return;
   }
+  // Fetch bundle list each time so newly created bundles show up.
+  api('GET', '/api/certs').then(data => {
+    _showHttpEditorWithBundles(index, data.bundles || []);
+  }).catch(e => {
+    if (e !== 'unauthorized') alert(String(e));
+  });
+}
+
+function _showHttpEditorWithBundles(index, bundles) {
   const isNew = index === null;
   const srv = isNew ? { address: '0.0.0.0', port: 8080 }
                     : (currentSettings.http || [])[index] || {};
@@ -1999,18 +2084,7 @@ function showHttpEditor(index) {
     value: srv.address || '0.0.0.0', placeholder: '0.0.0.0' });
   const portInput = el('input', { type: 'number',
     value: String(srv.port || 8080), min: '1', max: '65535' });
-  const sslCb = el('input', { type: 'checkbox', checked: !!srv.ssl });
-  const certInput = el('input', { type: 'text',
-    value: (srv.ssl && srv.ssl.certfile) || '',
-    placeholder: '/path/to/cert.pem' });
-  const keyInput = el('input', { type: 'text',
-    value: (srv.ssl && srv.ssl.keyfile) || '',
-    placeholder: '/path/to/key.pem' });
-  const sslDiv = el('div', { class: 'subgroup' },
-    formRow('Cert', certInput),
-    formRow('Key', keyInput));
-  if (!sslCb.checked) sslDiv.classList.add('hidden');
-  sslCb.onchange = () => sslDiv.classList.toggle('hidden', !sslCb.checked);
+  const ssl = _buildSslFields(srv.ssl, bundles);
 
   const body = el('div',
     {},
@@ -2019,8 +2093,8 @@ function showHttpEditor(index) {
     formRow('Port', portInput),
     el('div', { style: 'margin:8px 0' },
       el('label', { class: 'checkbox-label' },
-        sslCb, el('span', {}, ' SSL'))),
-    sslDiv);
+        ssl.sslCb, el('span', {}, ' SSL'))),
+    ssl.wrap);
 
   openModal({
     title: isNew ? 'New HTTP server' : 'Edit HTTP server',
@@ -2032,7 +2106,7 @@ function showHttpEditor(index) {
       btn('Cancel', '', () => backToList()),
       btn('Save', 'btn-primary',
         () => _saveHttpServer(isNew ? null : index,
-          { nameInput, addrInput, portInput, sslCb, certInput, keyInput })),
+          { nameInput, addrInput, portInput, ssl })),
     ].filter(Boolean),
   });
 }
@@ -2044,12 +2118,10 @@ function _saveHttpServer(index, fields) {
   };
   const name = fields.nameInput.value.trim();
   if (name) data.name = name;
-  if (fields.sslCb.checked) {
-    const cf = fields.certInput.value.trim();
-    const kf = fields.keyInput.value.trim();
-    if (!cf || !kf) return modalError('SSL requires certificate and key file paths');
-    data.ssl = { certfile: cf, keyfile: kf };
-  }
+  let sslVal;
+  try { sslVal = fields.ssl.getValue(); }
+  catch (e) { return modalError(e.message); }
+  if (sslVal) data.ssl = sslVal;
   const method = index === null ? 'POST' : 'PUT';
   const path = index === null
     ? '/api/settings/http' : '/api/settings/http/' + index;
@@ -2063,6 +2135,291 @@ function confirmDeleteHttp(index) {
   api('DELETE', '/api/settings/http/' + index)
     .then(() => navigate('/settings'))
     .catch(e => { if (e !== 'unauthorized') alert(e); });
+}
+
+// ===========================================================================
+// Certificates
+// ===========================================================================
+let currentCerts = null;  // {certs_dir, bundles: [...]}
+
+const CERT_FILES = ['cert.pem', 'key.pem', 'ca.pem'];
+
+function showCertificates() {
+  if (!isAdmin) { navigate('/ports'); return; }
+  show('certificates-view');
+  loadCerts();
+}
+
+function loadCerts() {
+  api('GET', '/api/certs').then(data => {
+    currentCerts = data;
+    renderCertsActions();
+    renderCertsList();
+  }).catch(e => { if (e !== 'unauthorized') console.error(e); });
+}
+
+function renderCertsActions() {
+  const c = $('certificates-actions');
+  c.innerHTML = '';
+  c.appendChild(btn('+ Add Bundle', 'btn-primary btn-small',
+    () => navigate('/certificates/new')));
+}
+
+function renderCertsList() {
+  $('certificates-path').textContent =
+    'Certificates stored in: ' + (currentCerts.certs_dir || '');
+  const root = $('certificates-content');
+  root.innerHTML = '';
+  const bundles = currentCerts.bundles || [];
+  if (!bundles.length) {
+    root.appendChild(el('p', { class: 'empty' },
+      'No certificate bundles. Click "+ Add Bundle" to create one.'));
+    return;
+  }
+  const grid = el('div', { class: 'card-grid' });
+  bundles.forEach(b => grid.appendChild(renderCertCard(b)));
+  root.appendChild(grid);
+}
+
+function renderCertCard(bundle) {
+  const hasCert = bundle.files['cert.pem'];
+  const hasKey = bundle.files['key.pem'];
+  const hasCa = bundle.files['ca.pem'];
+  // Mark incomplete server bundles (have one of cert/key but not both)
+  // as warning; pure CA bundles (only ca.pem) are ok.
+  const isServerComplete = hasCert && hasKey;
+  const isCaOnly = !hasCert && !hasKey && hasCa;
+  let cls = 'card card-online';
+  if (!isServerComplete && !isCaOnly) cls = 'card card-warning';
+  const card = el('div', { class: cls });
+  const headerRow = el('div', { class: 'card-header-row' },
+    el('span', { class: 'card-title' }, bundle.name));
+  headerRow.appendChild(kebabMenu([
+    { label: 'Edit', cls: 'btn-accent',
+      onclick: () => navigate('/certificates/' + encodeURIComponent(bundle.name)) },
+    { label: 'Delete', cls: 'btn-danger',
+      onclick: () => confirmDeleteCertBundle(bundle.name) },
+  ]));
+  card.appendChild(headerRow);
+  const meta = el('div', { class: 'card-meta' });
+  CERT_FILES.forEach(fname => {
+    meta.appendChild(el('div', { class: 'card-meta-row' },
+      el('span', { class: 'card-meta-label' }, fname),
+      el('span', {}, bundle.files[fname] ? '✓' : '—')));
+  });
+  card.appendChild(meta);
+  return card;
+}
+
+function confirmDeleteCertBundle(name) {
+  if (!confirm('Delete certificate bundle "' + name
+      + '" and all its files?')) return;
+  api('DELETE', '/api/certs/' + encodeURIComponent(name))
+    .then(() => navigate('/certificates'))
+    .catch(e => { if (e !== 'unauthorized') alert(e); });
+}
+
+function showCertEditor(name) {
+  if (!isAdmin) { navigate('/certificates'); return; }
+  if (name !== null && !currentCerts) {
+    loadCerts();
+    setTimeout(() => showCertEditor(name), 50);
+    return;
+  }
+  const isNew = name === null;
+  if (isNew) {
+    _showNewBundleModal();
+    return;
+  }
+  // Existing bundle: fetch detail (has mtime/size/symlink info)
+  api('GET', '/api/certs/' + encodeURIComponent(name)).then(info => {
+    _showBundleEditor(info);
+  }).catch(e => {
+    if (e !== 'unauthorized') alert(e);
+    navigate('/certificates');
+  });
+}
+
+function _showNewBundleModal() {
+  const nameInput = el('input', {
+    type: 'text', autocomplete: 'off',
+    placeholder: 'e.g. main, le-mydomain, internal-ca',
+  });
+  openModal({
+    title: 'New certificate bundle',
+    body: el('div', {},
+      formGroup('Bundle name', nameInput, {
+        hint: 'Letters, digits, dot, dash, underscore. '
+          + 'After creating, you can upload cert.pem, key.pem and (optionally) ca.pem.',
+      })),
+    footer: [
+      btn('Cancel', '', () => backToList()),
+      btn('Create', 'btn-primary', () => {
+        const n = nameInput.value.trim();
+        if (!n) return modalError('Name is required');
+        api('POST', '/api/certs', { name: n })
+          .then(() => navigate('/certificates/' + encodeURIComponent(n)))
+          .catch(e => modalError(String(e)));
+      }),
+    ],
+  });
+  nameInput.focus();
+}
+
+function _showBundleEditor(info) {
+  const body = el('div', {});
+  body.appendChild(el('div', {
+    class: 'card-subtitle', style: 'margin-bottom:12px;word-break:break-all',
+  }, 'Path: ' + info.path));
+
+  CERT_FILES.forEach(fname => {
+    body.appendChild(_renderCertFileRow(info.name, fname, info.files[fname]));
+  });
+
+  openModal({
+    title: 'Bundle: ' + info.name,
+    body,
+    wide: true,
+    footer: [
+      btn('Delete bundle', 'btn-danger',
+        () => confirmDeleteCertBundle(info.name)),
+      el('span', { class: 'footer-spacer' }),
+      btn('Close', '', () => backToList()),
+    ],
+  });
+}
+
+function _renderCertFileRow(bundleName, fname, fileInfo) {
+  const wrap = el('div', {
+    class: 'subgroup cert-file-row',
+    style: 'margin-bottom:16px;transition:background-color .15s',
+  });
+  // Drag-and-drop: highlight on dragover, upload on drop. dragenter/leave
+  // counter avoids flicker when crossing child elements.
+  let dragDepth = 0;
+  wrap.addEventListener('dragenter', e => {
+    e.preventDefault();
+    dragDepth++;
+    wrap.style.backgroundColor = 'var(--accent-bg, rgba(0,120,255,0.1))';
+  });
+  wrap.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) wrap.style.backgroundColor = '';
+  });
+  wrap.addEventListener('dragover', e => { e.preventDefault(); });
+  wrap.addEventListener('drop', e => {
+    e.preventDefault();
+    dragDepth = 0;
+    wrap.style.backgroundColor = '';
+    const f = e.dataTransfer.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => _uploadCertFile(bundleName, fname, reader.result);
+    reader.readAsText(f);
+  });
+  const header = el('div', { class: 'card-header-row' },
+    el('strong', {}, fname));
+  if (fileInfo.present) {
+    const status = el('span', { class: 'card-subtitle' },
+      fileInfo.symlink
+        ? '→ ' + fileInfo.symlink
+        : new Date(fileInfo.mtime * 1000).toLocaleString()
+          + ' · ' + fileInfo.size + ' B');
+    header.appendChild(status);
+  } else {
+    header.appendChild(el('span', { class: 'card-subtitle' }, 'not uploaded'));
+  }
+  wrap.appendChild(header);
+
+  // Action buttons
+  const fileInput = el('input', { type: 'file', accept: '.pem,.crt,.key,.cer,application/x-pem-file' });
+  fileInput.style.display = 'none';
+  fileInput.onchange = () => {
+    const f = fileInput.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      _uploadCertFile(bundleName, fname, reader.result);
+    };
+    reader.readAsText(f);
+  };
+
+  const actions = el('div', { style: 'display:flex;gap:8px;margin-top:8px;flex-wrap:wrap' });
+  actions.appendChild(btn('Upload file', 'btn-small btn-accent',
+    () => fileInput.click()));
+  actions.appendChild(btn('Paste content', 'btn-small',
+    () => navigate('/certificates/' + encodeURIComponent(bundleName)
+      + '/paste/' + fname)));
+  if (fileInfo.present) {
+    if (fname !== 'key.pem') {
+      actions.appendChild(btn('View / download', 'btn-small',
+        () => _downloadCertFile(bundleName, fname)));
+    }
+    actions.appendChild(btn('Delete', 'btn-small btn-danger',
+      () => _confirmDeleteCertFile(bundleName, fname)));
+  }
+  wrap.appendChild(fileInput);
+  wrap.appendChild(actions);
+  return wrap;
+}
+
+function _uploadCertFile(bundleName, fname, content) {
+  api('POST', '/api/certs/' + encodeURIComponent(bundleName) + '/files',
+      { filename: fname, content })
+    .then(() => navigate('/certificates/' + encodeURIComponent(bundleName)))
+    .catch(e => alert(String(e)));
+}
+
+function _showPasteCertModal(bundleName, fname) {
+  if (!isAdmin) { navigate('/certificates'); return; }
+  const ta = el('textarea', {
+    rows: '14', style: 'width:100%;font-family:monospace;font-size:12px',
+    placeholder: '-----BEGIN ...-----\n...\n-----END ...-----',
+  });
+  openModal({
+    title: 'Paste ' + fname + ' (' + bundleName + ')',
+    body: el('div', {},
+      formGroup('PEM content', ta, {
+        hint: 'Paste the full PEM block including BEGIN/END markers.',
+      })),
+    wide: true,
+    footer: [
+      btn('Cancel', '', () => backToList()),
+      btn('Save', 'btn-primary', () => {
+        const content = ta.value;
+        if (!content.trim()) return modalError('Content is required');
+        api('POST', '/api/certs/' + encodeURIComponent(bundleName) + '/files',
+            { filename: fname, content })
+          .then(() => navigate(
+            '/certificates/' + encodeURIComponent(bundleName)))
+          .catch(e => modalError(String(e)));
+      }),
+    ],
+  });
+  ta.focus();
+}
+
+function _downloadCertFile(bundleName, fname) {
+  api('GET', '/api/certs/' + encodeURIComponent(bundleName)
+        + '/files/' + encodeURIComponent(fname))
+    .then(data => {
+      const blob = new Blob([data.content], { type: 'application/x-pem-file' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = bundleName + '-' + fname;
+      a.click();
+      URL.revokeObjectURL(url);
+    })
+    .catch(e => alert(String(e)));
+}
+
+function _confirmDeleteCertFile(bundleName, fname) {
+  if (!confirm('Delete ' + fname + ' from bundle "' + bundleName + '"?')) return;
+  api('DELETE', '/api/certs/' + encodeURIComponent(bundleName)
+        + '/files/' + encodeURIComponent(fname))
+    .then(() => navigate('/certificates/' + encodeURIComponent(bundleName)))
+    .catch(e => alert(String(e)));
 }
 
 // ===========================================================================

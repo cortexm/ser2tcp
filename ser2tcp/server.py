@@ -7,6 +7,7 @@ import os as _os
 import socket as _socket
 import ssl as _ssl
 
+import ser2tcp.cert_manager as _cert_manager
 import ser2tcp.connection_control as _connection_control
 import ser2tcp.connection_socket as _connection_socket
 import ser2tcp.connection_ssl as _connection_ssl
@@ -29,10 +30,11 @@ class Server():
         'SOCKET': _connection_socket.ConnectionSocket,
     }
 
-    def __init__(self, config, ser, log=None):
+    def __init__(self, config, ser, log=None, certs_dir=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._config = config
         self._serial = ser
+        self._certs_dir = certs_dir
         self._connections = []
         self._protocol = self._config['protocol'].upper()
         self._send_timeout = self._config.get('send_timeout')
@@ -91,19 +93,15 @@ class Server():
         self.close()
 
     def _create_ssl_context(self):
-        """Create SSL context from config"""
+        """Create SSL context from config (bundle-based)."""
+        if not self._certs_dir:
+            raise ConfigError(
+                'SSL protocol requires certs_dir (internal wiring error)')
         ssl_config = self._config.get('ssl', {})
-        certfile = ssl_config.get('certfile')
-        keyfile = ssl_config.get('keyfile')
-        ca_certs = ssl_config.get('ca_certs')
-        if not certfile or not keyfile:
-            raise ConfigError('SSL protocol requires certfile and keyfile')
-        context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile, keyfile)
-        if ca_certs:
-            context.load_verify_locations(ca_certs)
-            context.verify_mode = _ssl.CERT_REQUIRED
-        return context
+        try:
+            return _cert_manager.build_ssl_context(ssl_config, self._certs_dir)
+        except _cert_manager.CertManagerError as err:
+            raise ConfigError(str(err)) from err
 
     @property
     def protocol(self):

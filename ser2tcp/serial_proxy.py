@@ -37,9 +37,10 @@ class SerialProxy():
     MATCH_ATTRIBUTES = ('vid', 'pid', 'serial_number', 'manufacturer',
         'product', 'location', 'description', 'hwid')
 
-    def __init__(self, config, log=None):
+    def __init__(self, config, log=None, certs_dir=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._serial = None
+        self._certs_dir = certs_dir
         self._reader_thread = None
         self._reader_sock_r = None
         self._reader_sock_w = None
@@ -69,7 +70,9 @@ class SerialProxy():
                         server_config, self, log))
             else:
                 self._servers.append(
-                    _server.Server(server_config, self, log))
+                    _server.Server(
+                        server_config, self, log,
+                        certs_dir=self._certs_dir))
         # Detect control-enabled servers and set poll interval
         for server in self._servers:
             if server.control:

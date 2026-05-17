@@ -12,6 +12,7 @@ import serial.tools.list_ports as _list_ports
 
 import uhttp.server as _uhttp_server
 
+import ser2tcp.cert_manager as _cert_manager
 import ser2tcp.http_auth as _http_auth
 import ser2tcp.connection_control as _control
 import ser2tcp.ip_filter as _ip_filter
@@ -66,6 +67,11 @@ class HttpServerWrapper():
                     auth_config = config['auth']
                     break
         self._auth = _http_auth.SessionManager(auth_config) if auth_config else None
+        # Cert manager — lives next to config.json (or under default config
+        # dir if running without a config path, e.g. tests).
+        cfg_dir = _os.path.dirname(config_path) if config_path \
+            else _os.path.expanduser('~/.config/ser2tcp')
+        self._cert_manager = _cert_manager.CertManager(cfg_dir, log=self._log)
         self._ws_clients = {}  # uhttp client -> ServerWebSocket or ServerMonitor
         self._monitor_servers = {}  # port name -> ServerMonitor
         self._servers = []  # list of (HttpServer, IpFilter or None)
@@ -84,26 +90,14 @@ class HttpServerWrapper():
             port = config.get('port', 8080)
             ssl_context = None
             if 'ssl' in config:
-                ssl_config = config['ssl']
-                certfile = ssl_config.get('certfile')
-                keyfile = ssl_config.get('keyfile')
-                if not certfile or not keyfile:
+                try:
+                    ssl_context = _cert_manager.build_ssl_context(
+                        config['ssl'], self._cert_manager.certs_dir)
+                except _cert_manager.CertManagerError as err:
                     self._log.error(
-                        "HTTPS server %s:%d: missing certfile or keyfile, skipping",
-                        address, port)
+                        "HTTPS server %s:%d: %s, skipping",
+                        address, port, err)
                     continue
-                if not _os.path.exists(certfile):
-                    self._log.error(
-                        "HTTPS server %s:%d: certfile not found: %s, skipping",
-                        address, port, certfile)
-                    continue
-                if not _os.path.exists(keyfile):
-                    self._log.error(
-                        "HTTPS server %s:%d: keyfile not found: %s, skipping",
-                        address, port, keyfile)
-                    continue
-                ssl_context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-                ssl_context.load_cert_chain(certfile, keyfile)
                 self._log.info(
                     "HTTPS server: %s:%d", address, port)
             else:
@@ -127,17 +121,11 @@ class HttpServerWrapper():
         port = config.get('port', 8080)
         ssl_context = None
         if 'ssl' in config:
-            ssl_config = config['ssl']
-            certfile = ssl_config.get('certfile')
-            keyfile = ssl_config.get('keyfile')
-            if not certfile or not keyfile:
-                raise ValueError(f"HTTPS {address}:{port}: missing certfile or keyfile")
-            if not _os.path.exists(certfile):
-                raise ValueError(f"HTTPS {address}:{port}: certfile not found: {certfile}")
-            if not _os.path.exists(keyfile):
-                raise ValueError(f"HTTPS {address}:{port}: keyfile not found: {keyfile}")
-            ssl_context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.load_cert_chain(certfile, keyfile)
+            try:
+                ssl_context = _cert_manager.build_ssl_context(
+                    config['ssl'], self._cert_manager.certs_dir)
+            except _cert_manager.CertManagerError as err:
+                raise ValueError(f"HTTPS {address}:{port}: {err}") from err
             self._log.info("HTTPS server: %s:%d", address, port)
         else:
             self._log.info("HTTP server: %s:%d", address, port)
@@ -459,6 +447,15 @@ class HttpServerWrapper():
                 self._handle_api_tokens_delete(client, user, token_id)
             else:
                 self._error(client, 'Method not allowed', 405)
+        elif client.path == '/api/certs':
+            if client.method == 'GET':
+                self._handle_api_certs_list(client)
+            elif client.method == 'POST':
+                self._handle_api_certs_create(client, user)
+            else:
+                self._error(client, 'Method not allowed', 405)
+        elif client.path.startswith('/api/certs/'):
+            self._route_api_certs_item(client, user)
         elif client.path == '/api/settings':
             if client.method == 'GET':
                 self._handle_api_settings_get(client)
@@ -997,6 +994,12 @@ class HttpServerWrapper():
             else:
                 if 'port' not in srv:
                     return 'Server port required'
+            if proto == 'SSL':
+                if 'ssl' not in srv:
+                    return 'SSL protocol requires ssl config'
+                err = self._validate_ssl_config(srv['ssl'])
+                if err:
+                    return err
             if 'control' in srv:
                 if proto == 'TELNET':
                     return 'Control not supported with TELNET'
@@ -1053,7 +1056,8 @@ class HttpServerWrapper():
 
     def _create_proxy(self, config):
         """Create SerialProxy from config"""
-        proxy = _serial_proxy.SerialProxy(config, self._log)
+        proxy = _serial_proxy.SerialProxy(
+            config, self._log, certs_dir=self._cert_manager.certs_dir)
         return proxy
 
     def _handle_api_ports_add(self, client, user):
@@ -1444,11 +1448,26 @@ class HttpServerWrapper():
         if not isinstance(data['port'], int) or data['port'] < 1 or data['port'] > 65535:
             return 'port must be 1-65535'
         if 'ssl' in data:
-            ssl = data['ssl']
-            if not isinstance(ssl, dict):
-                return 'ssl must be an object'
-            if not ssl.get('certfile') or not ssl.get('keyfile'):
-                return 'ssl requires certfile and keyfile paths'
+            err = self._validate_ssl_config(data['ssl'])
+            if err:
+                return err
+        return None
+
+    def _validate_ssl_config(self, ssl):
+        """Validate {"bundle": "...", "require_client_cert": bool} block.
+        Checks that the referenced bundle exists and has required files."""
+        if not isinstance(ssl, dict):
+            return 'ssl must be an object'
+        bundle = ssl.get('bundle')
+        if not bundle:
+            return 'ssl requires bundle name'
+        mtls = bool(ssl.get('require_client_cert'))
+        try:
+            _cert_manager.resolve_bundle_paths(
+                self._cert_manager.certs_dir, bundle,
+                require_client_cert=mtls)
+        except _cert_manager.CertManagerError as err:
+            return str(err)
         return None
 
     def _handle_api_http_add(self, client, user):
@@ -1536,3 +1555,175 @@ class HttpServerWrapper():
         self._save_config()
         self._log.info("HTTP server deleted")
         client.respond({'ok': True})
+
+    # ------------------------------------------------------------------
+    # Certificate bundles
+    # ------------------------------------------------------------------
+
+    def _find_bundle_usage(self, bundle_name):
+        """Return list of servers using this bundle. Each entry is a
+        dict describing where the bundle is referenced — used for
+        "used_by" display in the UI and to block deletion of bundles
+        currently in use."""
+        usage = []
+        # Port SSL servers
+        for p_idx, port in enumerate(self._get_ports_config()):
+            for s_idx, srv in enumerate(port.get('servers', [])):
+                ssl_cfg = srv.get('ssl')
+                if not ssl_cfg or ssl_cfg.get('bundle') != bundle_name:
+                    continue
+                usage.append({
+                    'type': 'port',
+                    'port_index': p_idx,
+                    'port_name': port.get('name'),
+                    'server_index': s_idx,
+                    'address': srv.get('address'),
+                    'server_port': srv.get('port'),
+                })
+        # HTTP servers
+        http_list = self._configuration.get('http', [])
+        if isinstance(http_list, dict):
+            http_list = [http_list]
+        for h_idx, srv in enumerate(http_list):
+            ssl_cfg = srv.get('ssl')
+            if not ssl_cfg or ssl_cfg.get('bundle') != bundle_name:
+                continue
+            usage.append({
+                'type': 'http',
+                'index': h_idx,
+                'name': srv.get('name'),
+                'address': srv.get('address'),
+                'server_port': srv.get('port'),
+            })
+        return usage
+
+    def _handle_api_certs_list(self, client):
+        """List all cert bundles (auth required, not admin)."""
+        try:
+            bundles = self._cert_manager.list_bundles()
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 400)
+            return
+        for b in bundles:
+            b['used_by'] = self._find_bundle_usage(b['name'])
+        client.respond({
+            'certs_dir': self._cert_manager.certs_dir,
+            'bundles': bundles,
+        })
+
+    def _handle_api_certs_create(self, client, user):
+        """Create an empty bundle (admin)."""
+        if not self._require_admin(client, user):
+            return
+        data = client.data
+        if not isinstance(data, dict) or 'name' not in data:
+            self._error(client, 'name is required', 400)
+            return
+        try:
+            self._cert_manager.create_bundle(data['name'])
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 400)
+            return
+        client.respond({'ok': True}, status=201)
+
+    def _route_api_certs_item(self, client, user):
+        """Route /api/certs/<bundle>[/files[/<filename>]]."""
+        rest = client.path[len('/api/certs/'):]
+        parts = rest.split('/')
+        bundle = parts[0]
+        if not bundle:
+            self._error(client, 'Bundle name required', 400)
+            return
+        # /api/certs/<bundle>
+        if len(parts) == 1:
+            if client.method == 'GET':
+                self._handle_api_certs_get(client, bundle)
+            elif client.method == 'DELETE':
+                self._handle_api_certs_delete(client, user, bundle)
+            else:
+                self._error(client, 'Method not allowed', 405)
+            return
+        # /api/certs/<bundle>/files
+        if len(parts) == 2 and parts[1] == 'files':
+            if client.method == 'POST':
+                self._handle_api_certs_save_file(client, user, bundle)
+            else:
+                self._error(client, 'Method not allowed', 405)
+            return
+        # /api/certs/<bundle>/files/<filename>
+        if len(parts) == 3 and parts[1] == 'files':
+            filename = parts[2]
+            if client.method == 'GET':
+                self._handle_api_certs_download_file(client, bundle, filename)
+            elif client.method == 'DELETE':
+                self._handle_api_certs_delete_file(
+                    client, user, bundle, filename)
+            else:
+                self._error(client, 'Method not allowed', 405)
+            return
+        self._error(client, 'Not found', 404)
+
+    def _handle_api_certs_get(self, client, bundle):
+        try:
+            info = self._cert_manager.get_bundle(bundle)
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 404)
+            return
+        info['used_by'] = self._find_bundle_usage(bundle)
+        client.respond(info)
+
+    def _handle_api_certs_delete(self, client, user, bundle):
+        if not self._require_admin(client, user):
+            return
+        usage = self._find_bundle_usage(bundle)
+        if usage:
+            self._error(
+                client,
+                f"Bundle '{bundle}' is in use by {len(usage)} server(s); "
+                "remove SSL references first",
+                400)
+            return
+        try:
+            self._cert_manager.delete_bundle(bundle)
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 404)
+            return
+        client.respond({'ok': True})
+
+    def _handle_api_certs_save_file(self, client, user, bundle):
+        if not self._require_admin(client, user):
+            return
+        data = client.data
+        if not isinstance(data, dict) \
+                or 'filename' not in data or 'content' not in data:
+            self._error(client, 'filename and content required', 400)
+            return
+        try:
+            self._cert_manager.save_file(
+                bundle, data['filename'], data['content'])
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 400)
+            return
+        client.respond({'ok': True})
+
+    def _handle_api_certs_delete_file(self, client, user, bundle, filename):
+        if not self._require_admin(client, user):
+            return
+        try:
+            self._cert_manager.delete_file(bundle, filename)
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 404)
+            return
+        client.respond({'ok': True})
+
+    def _handle_api_certs_download_file(self, client, bundle, filename):
+        try:
+            content = self._cert_manager.read_public_file(bundle, filename)
+        except _cert_manager.CertManagerError as err:
+            # Distinguish "forbidden" (key.pem) from "not found"
+            status = 403 if 'private' in str(err) else 404
+            self._error(client, str(err), status)
+            return
+        # Return as JSON so the UI can show it; downloading as text/plain
+        # is also fine but JSON is consistent with other endpoints.
+        client.respond({'filename': filename, 'content': content})

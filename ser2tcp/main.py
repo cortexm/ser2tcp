@@ -151,11 +151,15 @@ def main():
     if not ports and not http_config:
         raise SystemExit("No ports or HTTP server configured")
 
+    # Cert bundles live next to config.json. Pass to SerialProxy so SSL
+    # servers can resolve bundle references.
+    certs_dir = _os.path.join(_os.path.dirname(config_path) or '.', 'certs')
+
     servers_manager = _server_manager.ServersManager()
     serial_proxies = []
     for config in ports:
         try:
-            proxy = _serial_proxy.SerialProxy(config, log)
+            proxy = _serial_proxy.SerialProxy(config, log, certs_dir=certs_dir)
         except Exception as err:
             log.error("Failed to create port: %s", err)
             continue

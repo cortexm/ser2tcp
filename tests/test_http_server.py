@@ -350,7 +350,7 @@ class TestApiStatus(unittest.TestCase):
         self.assertEqual(serial['stopbits'], 'TWO')
 
     def test_ssl_config_in_status(self):
-        ssl_cfg = {'certfile': 'server.crt', 'keyfile': 'server.key'}
+        ssl_cfg = {'bundle': 'main', 'require_client_cert': False}
         server = self._make_server(
             protocol='SSL', port=10443, ssl=ssl_cfg)
         proxy = self._make_proxy(

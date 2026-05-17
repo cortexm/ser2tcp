@@ -24,6 +24,7 @@ https://github.com/cortexm/ser2tcp
 - web interface for viewing configured ports and connections
 - web terminal clients (xterm.js VT100 terminal and raw colored view)
 - authentication with session management and API tokens
+- SSL certificate manager via web UI (upload, paste, drag-and-drop PEM files)
 - light/dark mode web UI (follows system preference)
 
 ## Installation
@@ -220,7 +221,8 @@ For `socket` protocol, `address` is the path to the Unix domain socket:
 
 #### SSL configuration
 
-For `ssl` protocol, add `ssl` object with certificate paths:
+For `ssl` protocol, reference a certificate bundle managed by the
+Certificate Manager (see [below](#managing-certificates-via-web-ui)):
 
 ```json
 {
@@ -228,20 +230,18 @@ For `ssl` protocol, add `ssl` object with certificate paths:
     "port": 10003,
     "protocol": "ssl",
     "ssl": {
-        "certfile": "/path/to/server.crt",
-        "keyfile": "/path/to/server.key",
-        "ca_certs": "/path/to/ca.crt"
+        "bundle": "main",
+        "require_client_cert": false
     }
 }
 ```
 
 | Parameter | Description | Required |
 |-----------|-------------|----------|
-| `certfile` | Server certificate (PEM) | yes |
-| `keyfile` | Server private key (PEM) | yes |
-| `ca_certs` | CA certificate for client verification (mTLS) | no |
+| `bundle` | Name of bundle in `{config_dir}/certs/<bundle>/` (must contain `cert.pem` + `key.pem`) | yes |
+| `require_client_cert` | Enable mTLS — requires `ca.pem` in the bundle | no (default false) |
 
-If `ca_certs` is specified, clients must provide a valid certificate signed by the CA.
+When `require_client_cert: true`, clients must provide a valid certificate signed by `ca.pem` from the bundle.
 
 #### IP filtering
 
@@ -269,6 +269,52 @@ Filter logic:
 - **Both**: deny takes precedence, then allow list is checked
 
 Works on TCP, TELNET, SSL, WebSocket and HTTP servers. Not applicable to Unix socket (no IP addresses). Rejected connections are logged.
+
+##### Managing certificates via web UI
+
+The web UI has a **Certificates** tab (admin only) for managing SSL
+certificate bundles without shell access. A bundle is a directory under
+`{config_dir}/certs/{bundle_name}/` containing a fixed set of PEM files:
+
+```
+~/.config/ser2tcp/certs/
+  main/
+    cert.pem      # server certificate (or full chain)
+    key.pem       # private key (file mode 0600, never served via API)
+    ca.pem        # optional — CA cert(s) for mTLS client verification
+```
+
+- Bundle names: letters, digits, dot, underscore, dash (no leading dot)
+- Directory mode `0700`, key file `0600`
+- PEM format validated on upload (BEGIN/END markers must match the file type)
+- `key.pem` is never downloadable via API — only filesystem access
+- Bundles are referenced from SSL config via `"bundle": "<name>"` (both
+  port SSL servers and HTTPS servers); a bundle cannot be deleted while
+  any server still references it
+
+**Web UI operations** (Certificates tab):
+- Create / delete bundles
+- Upload PEM file via file picker
+- Paste PEM content into a textarea
+- Drag-and-drop PEM file onto the file row
+- Download public files (cert.pem / ca.pem)
+- Delete individual files within a bundle
+
+**Let's Encrypt** — point a bundle at LE's `live/` directory using
+symlinks (no native LE handling in code):
+
+```bash
+mkdir -p ~/.config/ser2tcp/certs/elhome.sk
+ln -s /etc/letsencrypt/live/elhome.sk/fullchain.pem \
+    ~/.config/ser2tcp/certs/elhome.sk/cert.pem
+ln -s /etc/letsencrypt/live/elhome.sk/privkey.pem \
+    ~/.config/ser2tcp/certs/elhome.sk/key.pem
+```
+
+Note: `privkey.pem` in `/etc/letsencrypt/live/` is owned by `root:root`
+with mode `0600`, so ser2tcp needs to either run as root or use an LE
+`--deploy-hook` to copy files into the bundle dir with appropriate
+ownership/permissions on renewal.
 
 ##### Creating self-signed certificates
 
@@ -360,14 +406,14 @@ Generate password hash:
 ser2tcp --hash-password mysecretpassword
 ```
 
-HTTPS with SSL:
+HTTPS with SSL — uses the same bundle-based config as port SSL servers:
 
 ```json
 {
     "http": [
         {"address": "0.0.0.0", "port": 8080},
         {"address": "0.0.0.0", "port": 8443, "ssl": {
-            "certfile": "server.crt", "keyfile": "server.key"
+            "bundle": "main", "require_client_cert": false
         }}
     ]
 }
@@ -413,6 +459,13 @@ With IP filtering:
 | POST | `/api/settings/http` | admin | Add HTTP server |
 | PUT | `/api/settings/http/<index>` | admin | Update HTTP server |
 | DELETE | `/api/settings/http/<index>` | admin | Delete HTTP server |
+| GET | `/api/certs` | yes | List certificate bundles |
+| POST | `/api/certs` | admin | Create empty bundle |
+| GET | `/api/certs/<bundle>` | yes | Bundle detail (files, mtime, symlink target) |
+| DELETE | `/api/certs/<bundle>` | admin | Delete bundle and all its files |
+| POST | `/api/certs/<bundle>/files` | admin | Upload/paste a file into bundle |
+| GET | `/api/certs/<bundle>/files/<filename>` | yes | Download public file (cert.pem / ca.pem) |
+| DELETE | `/api/certs/<bundle>/files/<filename>` | admin | Delete single file from bundle |
 | GET | `/xterm/<endpoint>` | no | WebSocket VT100 terminal |
 | GET | `/raw/<endpoint>` | no | WebSocket raw terminal |
 
