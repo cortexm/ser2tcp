@@ -7,7 +7,8 @@ import unittest
 
 from ser2tcp.cert_manager import (
     CertManager, CertManagerError,
-    resolve_bundle_paths, build_ssl_context)
+    resolve_bundle_paths, build_ssl_context, inspect_certificate,
+    generate_certificate, generate_private_key, _parse_signer)
 
 
 # Minimal valid PEM blocks for testing — content is not parsed
@@ -161,8 +162,8 @@ class TestBundleOperations(unittest.TestCase):
         names = [b['name'] for b in bundles]
         self.assertEqual(names, ['alpha', 'beta'])
         for b in bundles:
-            self.assertEqual(b['files'],
-                {'cert.pem': False, 'key.pem': False, 'ca.pem': False})
+            for fname in ('cert.pem', 'key.pem', 'ca.pem'):
+                self.assertFalse(b['files'][fname]['present'])
 
     def test_list_skips_non_dirs_and_bad_names(self):
         certs_dir = os.path.join(self.tmp, 'certs')
@@ -329,27 +330,40 @@ class TestResolveBundlePaths(unittest.TestCase):
             resolve_bundle_paths(self.certs_dir, '../escape')
 
 
-def _generate_test_cert(out_dir):
+def _generate_test_cert(
+        out_dir=None, common_name='test', days=1,
+        is_ca=False, san_dns=None, san_ip=None):
     """Generate a real self-signed cert + key for SSL load tests.
     Uses cryptography lib (available as test dep)."""
     from cryptography import x509
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    import datetime
+    import datetime, ipaddress
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, 'test'),
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
     ])
-    cert = (x509.CertificateBuilder()
+    builder = (x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.datetime.utcnow())
         .not_valid_after(datetime.datetime.utcnow()
-            + datetime.timedelta(days=1))
-        .sign(key, hashes.SHA256()))
+            + datetime.timedelta(days=days)))
+    if is_ca:
+        builder = builder.add_extension(
+            x509.BasicConstraints(ca=True, path_length=None), critical=True)
+    san_list = []
+    for d in (san_dns or []):
+        san_list.append(x509.DNSName(d))
+    for ip in (san_ip or []):
+        san_list.append(x509.IPAddress(ipaddress.ip_address(ip)))
+    if san_list:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName(san_list), critical=False)
+    cert = builder.sign(key, hashes.SHA256())
     cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
     key_pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -404,6 +418,257 @@ class TestBuildSslContext(unittest.TestCase):
         with self.assertRaises(CertManagerError) as cm:
             build_ssl_context({'bundle': 'badcert'}, self.certs_dir)
         self.assertIn("Bundle 'badcert'", str(cm.exception))
+
+
+class TestInspectCertificate(unittest.TestCase):
+    def test_empty_content(self):
+        info = inspect_certificate('')
+        self.assertIn('error', info)
+
+    def test_invalid_pem(self):
+        info = inspect_certificate('not a cert')
+        self.assertIn('error', info)
+
+    def test_server_cert(self):
+        cert, _ = _generate_test_cert(common_name='myhost')
+        info = inspect_certificate(cert)
+        self.assertNotIn('error', info)
+        self.assertEqual(info['subject_cn'], 'myhost')
+        self.assertEqual(info['issuer_cn'], 'myhost')  # self-signed
+        self.assertTrue(info['self_signed'])
+        self.assertFalse(info['is_ca'])
+        self.assertEqual(info['key_type'], 'RSA')
+        self.assertEqual(info['key_size'], 2048)
+        self.assertIn('fingerprint_sha256', info)
+        # Format: 32 hex pairs separated by colons
+        self.assertEqual(info['fingerprint_sha256'].count(':'), 31)
+        self.assertIn('not_before', info)
+        self.assertIn('not_after', info)
+        self.assertGreater(info['not_after'], info['not_before'])
+
+    def test_ca_cert(self):
+        cert, _ = _generate_test_cert(common_name='myca', is_ca=True)
+        info = inspect_certificate(cert)
+        self.assertTrue(info['is_ca'])
+        self.assertEqual(info['subject_cn'], 'myca')
+
+    def test_san(self):
+        cert, _ = _generate_test_cert(
+            common_name='srv',
+            san_dns=['example.com', 'www.example.com'],
+            san_ip=['127.0.0.1', '192.168.1.1'])
+        info = inspect_certificate(cert)
+        self.assertEqual(info['san_dns'], ['example.com', 'www.example.com'])
+        self.assertEqual(info['san_ip'], ['127.0.0.1', '192.168.1.1'])
+
+    def test_no_san_omitted(self):
+        cert, _ = _generate_test_cert(common_name='nosan')
+        info = inspect_certificate(cert)
+        self.assertNotIn('san_dns', info)
+        self.assertNotIn('san_ip', info)
+
+
+class TestGetBundleIncludesCertInfo(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = CertManager(self.tmp)
+        self.mgr.create_bundle('b')
+        cert, key = _generate_test_cert(common_name='inspected')
+        self.mgr.save_file('b', 'cert.pem', cert)
+        self.mgr.save_file('b', 'key.pem', key)
+        ca_cert, _ = _generate_test_cert(common_name='ca-inspected', is_ca=True)
+        self.mgr.save_file('b', 'ca.pem', ca_cert)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_cert_info_attached(self):
+        info = self.mgr.get_bundle('b')
+        cert_info = info['files']['cert.pem']['cert_info']
+        self.assertEqual(cert_info['subject_cn'], 'inspected')
+        self.assertFalse(cert_info['is_ca'])
+
+    def test_ca_info_attached(self):
+        info = self.mgr.get_bundle('b')
+        ca_info = info['files']['ca.pem']['cert_info']
+        self.assertEqual(ca_info['subject_cn'], 'ca-inspected')
+        self.assertTrue(ca_info['is_ca'])
+
+    def test_key_not_parsed(self):
+        info = self.mgr.get_bundle('b')
+        # key.pem must not carry cert_info — it's not a cert
+        self.assertNotIn('cert_info', info['files']['key.pem'])
+
+
+class TestGenerateKey(unittest.TestCase):
+    def test_rsa2048(self):
+        key = generate_private_key('rsa2048')
+        self.assertEqual(key.key_size, 2048)
+
+    def test_rsa4096(self):
+        key = generate_private_key('rsa4096')
+        self.assertEqual(key.key_size, 4096)
+
+    def test_ec_p256(self):
+        key = generate_private_key('ec_p256')
+        self.assertEqual(key.curve.name, 'secp256r1')
+
+    def test_ed25519(self):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        key = generate_private_key('ed25519')
+        self.assertIsInstance(key, ed25519.Ed25519PrivateKey)
+
+    def test_unknown_type(self):
+        with self.assertRaises(CertManagerError):
+            generate_private_key('rsa1024')
+
+
+class TestGenerateCertificate(unittest.TestCase):
+    def test_self_signed_server(self):
+        cert_pem, key_pem = generate_certificate(
+            cn='myserver', days=30,
+            san_dns=['localhost'], san_ip=['127.0.0.1'])
+        info = inspect_certificate(cert_pem)
+        self.assertEqual(info['subject_cn'], 'myserver')
+        self.assertEqual(info['issuer_cn'], 'myserver')
+        self.assertTrue(info['self_signed'])
+        self.assertFalse(info['is_ca'])
+        self.assertEqual(info['san_dns'], ['localhost'])
+        self.assertEqual(info['san_ip'], ['127.0.0.1'])
+        # Should load as a usable cert via load_pem_private_key
+        from cryptography.hazmat.primitives import serialization
+        serialization.load_pem_private_key(key_pem.encode(), password=None)
+
+    def test_self_signed_ca(self):
+        cert_pem, _ = generate_certificate(
+            cn='myca', days=365, is_ca=True)
+        info = inspect_certificate(cert_pem)
+        self.assertTrue(info['is_ca'])
+        self.assertTrue(info['self_signed'])
+
+    def test_signed_by_ca(self):
+        ca_cert_pem, ca_key_pem = generate_certificate(
+            cn='myca', is_ca=True, days=365)
+        signer = _parse_signer(ca_cert_pem, ca_key_pem)
+        srv_cert_pem, _ = generate_certificate(
+            cn='myserver', days=30, signer=signer,
+            san_dns=['localhost'])
+        info = inspect_certificate(srv_cert_pem)
+        self.assertEqual(info['subject_cn'], 'myserver')
+        self.assertEqual(info['issuer_cn'], 'myca')
+        self.assertFalse(info['self_signed'])
+        self.assertFalse(info['is_ca'])
+
+    def test_client_cert(self):
+        ca_cert_pem, ca_key_pem = generate_certificate(
+            cn='myca', is_ca=True, days=365)
+        signer = _parse_signer(ca_cert_pem, ca_key_pem)
+        client_cert_pem, _ = generate_certificate(
+            cn='alice', signer=signer, is_client=True, days=30)
+        # We can't easily inspect EKU through inspect_certificate, but
+        # we can re-parse and check the extension directly.
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(client_cert_pem.encode())
+        eku = cert.extensions.get_extension_for_class(
+            x509.ExtendedKeyUsage).value
+        self.assertIn(x509.ExtendedKeyUsageOID.CLIENT_AUTH, list(eku))
+
+    def test_server_cert_has_serverauth_eku(self):
+        cert_pem, _ = generate_certificate(cn='srv', days=30)
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(cert_pem.encode())
+        eku = cert.extensions.get_extension_for_class(
+            x509.ExtendedKeyUsage).value
+        self.assertIn(x509.ExtendedKeyUsageOID.SERVER_AUTH, list(eku))
+
+    def test_ca_has_keycertsign(self):
+        cert_pem, _ = generate_certificate(cn='ca', is_ca=True, days=365)
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(cert_pem.encode())
+        ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+        self.assertTrue(ku.key_cert_sign)
+        self.assertTrue(ku.crl_sign)
+        self.assertFalse(ku.key_encipherment)
+
+    def test_server_has_digital_signature(self):
+        cert_pem, _ = generate_certificate(cn='srv', days=30)
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(cert_pem.encode())
+        ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+        self.assertTrue(ku.digital_signature)
+        self.assertTrue(ku.key_encipherment)
+        self.assertFalse(ku.key_cert_sign)
+
+    def test_validity_period(self):
+        cert_pem, _ = generate_certificate(cn='srv', days=10)
+        info = inspect_certificate(cert_pem)
+        delta = info['not_after'] - info['not_before']
+        # ~10 days in seconds
+        self.assertAlmostEqual(delta, 10 * 86400, delta=60)
+
+    def test_invalid_days(self):
+        with self.assertRaises(CertManagerError):
+            generate_certificate(cn='x', days=0)
+        with self.assertRaises(CertManagerError):
+            generate_certificate(cn='x', days=999999)
+
+    def test_invalid_cn(self):
+        with self.assertRaises(CertManagerError):
+            generate_certificate(cn='', days=30)
+        with self.assertRaises(CertManagerError):
+            generate_certificate(cn='x' * 100, days=30)
+
+    def test_invalid_san_ip(self):
+        with self.assertRaises(CertManagerError):
+            generate_certificate(cn='x', days=30, san_ip=['not.an.ip'])
+
+    def test_ec_key_signed(self):
+        # Sanity: full pipeline works with EC keys too
+        cert_pem, key_pem = generate_certificate(
+            cn='ec-srv', days=30, key_type='ec_p256')
+        info = inspect_certificate(cert_pem)
+        self.assertEqual(info['key_type'], 'EC')
+
+    def test_ed25519_key_signed(self):
+        # Ed25519 signs without a hash algorithm — verify the builder
+        # path handles that correctly.
+        cert_pem, key_pem = generate_certificate(
+            cn='ed-srv', days=30, key_type='ed25519')
+        info = inspect_certificate(cert_pem)
+        self.assertEqual(info['key_type'], 'Ed25519')
+
+    def test_ed25519_ca_signs_other(self):
+        # CA with Ed25519 signing a server cert with RSA — mixed-algorithm
+        # chain should still work.
+        ca_cert, ca_key = generate_certificate(
+            cn='ed-ca', is_ca=True, days=365, key_type='ed25519')
+        signer = _parse_signer(ca_cert, ca_key)
+        srv_cert, _ = generate_certificate(
+            cn='srv', signer=signer, key_type='rsa2048', days=30)
+        info = inspect_certificate(srv_cert)
+        self.assertEqual(info['issuer_cn'], 'ed-ca')
+
+
+class TestParseSigner(unittest.TestCase):
+    def test_non_ca_rejected(self):
+        cert_pem, key_pem = generate_certificate(cn='srv', days=30)
+        # Not a CA — should reject
+        with self.assertRaises(CertManagerError) as cm:
+            _parse_signer(cert_pem, key_pem)
+        self.assertIn('not a CA', str(cm.exception))
+
+    def test_mismatched_key(self):
+        cert_pem, _ = generate_certificate(cn='ca', is_ca=True, days=30)
+        # Generate a *different* key
+        _, other_key = generate_certificate(cn='other', is_ca=True, days=30)
+        with self.assertRaises(CertManagerError) as cm:
+            _parse_signer(cert_pem, other_key)
+        self.assertIn('do not match', str(cm.exception))
+
+    def test_invalid_cert(self):
+        with self.assertRaises(CertManagerError):
+            _parse_signer('not pem', 'not pem')
 
 
 if __name__ == '__main__':

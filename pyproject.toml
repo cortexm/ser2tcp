@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
     "pyserial>=3.0",
     "uhttp-server>=2.5.1",
+    "cryptography>=42.0",
 ]
 
 [project.urls]

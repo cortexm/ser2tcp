@@ -434,6 +434,7 @@ const routes = [
   [/^\/settings\/http\/(\d+)\/edit$/, m => showHttpEditor(parseInt(m[1]))],
   [/^\/certificates$/,             () => showCertificates()],
   [/^\/certificates\/new$/,        () => showCertEditor(null)],
+  [/^\/certificates\/generate$/,   () => showCertGenerator()],
   [/^\/certificates\/([^/]+)$/,    m => showCertEditor(decodeURIComponent(m[1]))],
   [/^\/certificates\/([^/]+)\/paste\/(cert\.pem|key\.pem|ca\.pem)$/,
     m => _showPasteCertModal(decodeURIComponent(m[1]), m[2])],
@@ -2011,14 +2012,14 @@ function _buildSslFields(currentSsl, bundles) {
   const placeholderOpt = el('option', { value: '' }, '-- select bundle --');
   bundleSelect.appendChild(placeholderOpt);
   bundles.forEach(b => {
-    const hasCert = b.files['cert.pem'];
-    const hasKey = b.files['key.pem'];
+    const hasCert = _certFilePresent(b, 'cert.pem');
+    const hasKey = _certFilePresent(b, 'key.pem');
     const ok = hasCert && hasKey;
     const opt = el('option', {
       value: b.name,
       disabled: !ok,
     }, b.name + (ok ? '' : ' (incomplete)')
-      + (b.files['ca.pem'] ? ' [mTLS-capable]' : ''));
+      + (_certFilePresent(b, 'ca.pem') ? ' [mTLS-capable]' : ''));
     bundleSelect.appendChild(opt);
   });
   if (currentSsl && currentSsl.bundle) {
@@ -2029,7 +2030,7 @@ function _buildSslFields(currentSsl, bundles) {
   const updateMtlsState = () => {
     const sel = bundleSelect.value;
     const b = bundles.find(x => x.name === sel);
-    const hasCa = b && b.files['ca.pem'];
+    const hasCa = b && _certFilePresent(b, 'ca.pem');
     mtlsCb.disabled = !hasCa;
     if (!hasCa) mtlsCb.checked = false;
   };
@@ -2163,6 +2164,8 @@ function renderCertsActions() {
   c.innerHTML = '';
   c.appendChild(btn('+ Add Bundle', 'btn-primary btn-small',
     () => navigate('/certificates/new')));
+  c.appendChild(btn('Generate…', 'btn-accent btn-small',
+    () => navigate('/certificates/generate')));
 }
 
 function renderCertsList() {
@@ -2181,10 +2184,16 @@ function renderCertsList() {
   root.appendChild(grid);
 }
 
+function _certFilePresent(bundle, fname) {
+  const f = bundle.files[fname];
+  // Tolerate both bool (legacy) and {present: bool} (current backend).
+  return !!(f && (typeof f === 'boolean' ? f : f.present));
+}
+
 function renderCertCard(bundle) {
-  const hasCert = bundle.files['cert.pem'];
-  const hasKey = bundle.files['key.pem'];
-  const hasCa = bundle.files['ca.pem'];
+  const hasCert = _certFilePresent(bundle, 'cert.pem');
+  const hasKey = _certFilePresent(bundle, 'key.pem');
+  const hasCa = _certFilePresent(bundle, 'ca.pem');
   // Mark incomplete server bundles (have one of cert/key but not both)
   // as warning; pure CA bundles (only ca.pem) are ok.
   const isServerComplete = hasCert && hasKey;
@@ -2203,9 +2212,21 @@ function renderCertCard(bundle) {
   card.appendChild(headerRow);
   const meta = el('div', { class: 'card-meta' });
   CERT_FILES.forEach(fname => {
-    meta.appendChild(el('div', { class: 'card-meta-row' },
+    const f = bundle.files[fname];
+    const present = !!(f && (typeof f === 'boolean' ? f : f.present));
+    let label = present ? '✓' : '—';
+    let color = null;
+    // Pull cert_info from list endpoint if backend provides it
+    const ci = f && typeof f === 'object' ? f.cert_info : null;
+    if (ci && !ci.error) {
+      const exp = _expiryStatus(ci.not_after);
+      if (exp) { label = '✓ · ' + exp.label; color = exp.color; }
+      if (ci.is_ca && fname === 'cert.pem') label += ' · CA';
+    }
+    const row = el('div', { class: 'card-meta-row' },
       el('span', { class: 'card-meta-label' }, fname),
-      el('span', {}, bundle.files[fname] ? '✓' : '—')));
+      el('span', color ? { style: 'color:' + color } : {}, label));
+    meta.appendChild(row);
   });
   card.appendChild(meta);
   return card;
@@ -2289,6 +2310,71 @@ function _showBundleEditor(info) {
   });
 }
 
+// Map a not_after epoch (seconds) to an expiry status: returns
+// {label, color} where color is a CSS color string used inline.
+function _expiryStatus(notAfter) {
+  if (!notAfter) return null;
+  const now = Date.now() / 1000;
+  const days = Math.floor((notAfter - now) / 86400);
+  if (days < 0) return { label: 'expired ' + (-days) + 'd ago', color: 'var(--error)' };
+  if (days < 7) return { label: 'expires in ' + days + 'd', color: 'var(--error)' };
+  if (days < 30) return { label: 'expires in ' + days + 'd', color: 'var(--warning)' };
+  return { label: 'expires in ' + days + 'd', color: 'var(--success, #4caf50)' };
+}
+
+function _renderCertInfo(info) {
+  // Best-effort: if backend couldn't parse, just show a hint
+  if (!info || info.error) {
+    return el('div', {
+      class: 'card-subtitle',
+      style: 'margin-top:6px;color:var(--warning)',
+    }, info && info.error
+      ? 'Cert parse error: ' + info.error
+      : 'No cert metadata');
+  }
+  const rows = [];
+  const row = (label, val) => el('div', { class: 'card-meta-row' },
+    el('span', { class: 'card-meta-label' }, label),
+    el('span', {}, val));
+  rows.push(row('Subject', info.subject_cn || '(no CN)'));
+  if (!info.self_signed) {
+    rows.push(row('Issuer', info.issuer_cn || '(no CN)'));
+  } else {
+    rows.push(row('Issuer', 'self-signed'));
+  }
+  if (info.san_dns && info.san_dns.length) {
+    rows.push(row('SAN DNS', info.san_dns.join(', ')));
+  }
+  if (info.san_ip && info.san_ip.length) {
+    rows.push(row('SAN IP', info.san_ip.join(', ')));
+  }
+  const exp = _expiryStatus(info.not_after);
+  if (exp) {
+    rows.push(el('div', { class: 'card-meta-row' },
+      el('span', { class: 'card-meta-label' }, 'Validity'),
+      el('span', { style: 'color:' + exp.color },
+        new Date(info.not_after * 1000).toLocaleDateString()
+        + ' (' + exp.label + ')')));
+  }
+  if (info.key_type) {
+    const keyStr = info.key_type
+      + (info.key_size ? ' ' + info.key_size : '');
+    rows.push(row('Key', keyStr));
+  }
+  if (info.fingerprint_sha256) {
+    const fp = info.fingerprint_sha256;
+    const short = fp.slice(0, 23) + '…' + fp.slice(-8);
+    rows.push(el('div', { class: 'card-meta-row', title: fp },
+      el('span', { class: 'card-meta-label' }, 'SHA-256'),
+      el('span', { style: 'font-family:monospace;font-size:11px' }, short)));
+  }
+  return el('div', {
+    class: 'card-meta',
+    style: 'margin-top:6px;padding:6px 8px;background:var(--bg-alt);'
+      + 'border-radius:4px;font-size:13px',
+  }, ...rows);
+}
+
 function _renderCertFileRow(bundleName, fname, fileInfo) {
   const wrap = el('div', {
     class: 'subgroup cert-file-row',
@@ -2320,6 +2406,14 @@ function _renderCertFileRow(bundleName, fname, fileInfo) {
   const header = el('div', { class: 'card-header-row' },
     el('strong', {}, fname));
   if (fileInfo.present) {
+    // CA badge on header for quick visual identification
+    if (fileInfo.cert_info && fileInfo.cert_info.is_ca) {
+      header.appendChild(el('span', {
+        class: 'card-status-badge',
+        style: 'background:var(--accent);color:#fff;padding:1px 6px;'
+          + 'border-radius:8px;font-size:11px;margin-left:6px',
+      }, 'CA'));
+    }
     const status = el('span', { class: 'card-subtitle' },
       fileInfo.symlink
         ? '→ ' + fileInfo.symlink
@@ -2330,6 +2424,12 @@ function _renderCertFileRow(bundleName, fname, fileInfo) {
     header.appendChild(el('span', { class: 'card-subtitle' }, 'not uploaded'));
   }
   wrap.appendChild(header);
+
+  // Parsed cert metadata (CN / issuer / SAN / expiry / fingerprint).
+  // Only shown for cert.pem and ca.pem (key.pem has no cert_info).
+  if (fileInfo.present && fileInfo.cert_info) {
+    wrap.appendChild(_renderCertInfo(fileInfo.cert_info));
+  }
 
   // Action buttons
   const fileInput = el('input', { type: 'file', accept: '.pem,.crt,.key,.cer,application/x-pem-file' });
@@ -2412,6 +2512,248 @@ function _downloadCertFile(bundleName, fname) {
       URL.revokeObjectURL(url);
     })
     .catch(e => alert(String(e)));
+}
+
+// ----- Certificate generator -----
+function showCertGenerator() {
+  if (!isAdmin) { navigate('/certificates'); return; }
+  // Fetch bundles (for signer dropdown — only CA-flagged bundles allowed)
+  api('GET', '/api/certs').then(data => {
+    _showCertGeneratorWithBundles(data.bundles || []);
+  }).catch(e => { if (e !== 'unauthorized') alert(String(e)); });
+}
+
+function _showCertGeneratorWithBundles(bundles) {
+  // Identify CA bundles — those whose cert.pem parses to is_ca=true and
+  // also have a key.pem (so we can actually sign with them).
+  const caBundles = bundles.filter(b => {
+    const cf = b.files['cert.pem'];
+    return _certFilePresent(b, 'cert.pem')
+      && _certFilePresent(b, 'key.pem')
+      && cf.cert_info && cf.cert_info.is_ca;
+  });
+
+  // Mode selector (radio)
+  const modes = [
+    { value: 'self_signed', label: 'Self-signed server cert',
+      hint: 'Standalone cert+key. Clients must pin or skip validation.' },
+    { value: 'ca', label: 'CA (root)',
+      hint: 'Use to sign server/client certs. Distribute the CA cert to clients.' },
+    { value: 'signed_by', label: 'Server cert signed by CA',
+      hint: 'Server cert chain-validated by clients that trust the CA.' },
+    { value: 'client', label: 'Client cert (for mTLS)',
+      hint: 'Generates cert+key, downloads as files. Not stored on server.' },
+  ];
+  const modeInputs = {};
+  const modeWrap = el('div', { style: 'margin-bottom:12px' });
+  modes.forEach((m, i) => {
+    const r = el('input', { type: 'radio', name: 'cert-mode',
+      value: m.value, checked: i === 0 });
+    modeInputs[m.value] = r;
+    const row = el('div', { style: 'margin:4px 0' },
+      el('label', { class: 'checkbox-label',
+        style: 'align-items:flex-start' },
+        r,
+        el('div', { style: 'margin-left:4px' },
+          el('div', {}, m.label),
+          el('div', { class: 'card-subtitle',
+            style: 'font-size:11px' }, m.hint))));
+    modeWrap.appendChild(row);
+  });
+
+  // Form fields
+  const bundleNameInput = el('input', { type: 'text',
+    placeholder: 'e.g. main, internal-ca' });
+  const cnInput = el('input', { type: 'text',
+    placeholder: 'e.g. myserver.local' });
+  const sanDnsInput = el('input', { type: 'text',
+    placeholder: 'localhost, myserver.local' });
+  const sanIpInput = el('input', { type: 'text',
+    placeholder: '127.0.0.1, 192.168.1.10' });
+  const daysInput = el('input', { type: 'number',
+    value: '365', min: '1', max: '36500' });
+  const keyTypeSel = el('select');
+  // Order: most-compatible first. Ed25519 is fastest/smallest but
+  // requires a modern TLS stack on the client (TLS 1.3 typically).
+  const KEY_TYPE_LABELS = {
+    rsa2048: 'RSA 2048 (universal compatibility)',
+    rsa4096: 'RSA 4096 (slower, for long-lived CA)',
+    ec_p256: 'EC P-256 (modern, fast — recommended)',
+    ed25519: 'Ed25519 (fastest, needs modern client)',
+  };
+  Object.entries(KEY_TYPE_LABELS).forEach(([kt, label]) => {
+    keyTypeSel.appendChild(el('option', { value: kt }, label));
+  });
+  const signerSel = el('select');
+  signerSel.appendChild(el('option', { value: '' }, '-- select CA bundle --'));
+  caBundles.forEach(b => {
+    signerSel.appendChild(el('option', { value: b.name }, b.name));
+  });
+
+  // Group rows so we can show/hide based on mode
+  const bundleRow = formRow('Target bundle', bundleNameInput);
+  const cnRow = formRow('Common Name (CN)', cnInput);
+  const sanDnsRow = formRow('SAN DNS', sanDnsInput);
+  const sanIpRow = formRow('SAN IP', sanIpInput);
+  const daysRow = formRow('Validity (days)', daysInput);
+  const keyTypeRow = formRow('Key type', keyTypeSel);
+  const signerRow = formRow('Signing CA', signerSel);
+
+  // Track whether the user has manually edited `days` so we don't
+  // clobber their value when switching modes.
+  let daysTouched = false;
+  daysInput.addEventListener('input', () => { daysTouched = true; });
+
+  function updateFieldVisibility() {
+    const mode = _getCheckedValue(modeInputs);
+    const isClient = mode === 'client';
+    const isCa = mode === 'ca';
+    const needsSigner = mode === 'signed_by' || mode === 'client';
+    bundleRow.style.display = isClient ? 'none' : '';
+    signerRow.style.display = needsSigner ? '' : 'none';
+    // SAN is only meaningful for end-entity server certs. Client certs
+    // usually don't need it (clientAuth doesn't match on hostname), and
+    // CA certs ignore it entirely (chain validation skips SAN on CAs).
+    sanDnsRow.style.display = (isClient || isCa) ? 'none' : '';
+    sanIpRow.style.display = (isClient || isCa) ? 'none' : '';
+    // CAs should outlive the certs they sign — default to ~10 years
+    // for CA mode, 1 year for everything else. User-typed values take
+    // precedence (daysTouched flag).
+    if (!daysTouched) {
+      daysInput.value = isCa ? '3650' : '365';
+    }
+  }
+  Object.values(modeInputs).forEach(r => {
+    r.onchange = updateFieldVisibility;
+  });
+
+  const disclaimer = el('div', {
+    class: 'card-subtitle',
+    style: 'margin-top:12px;padding:8px;background:var(--bg-alt);'
+      + 'border-left:3px solid var(--warning);font-size:12px',
+  }, 'Generated certificates are intended for testing and internal '
+    + 'use. For production PKI use a dedicated tool (smallstep, '
+    + 'Vault, ACM, etc.).');
+
+  const body = el('div', {},
+    modeWrap,
+    bundleRow,
+    cnRow,
+    sanDnsRow,
+    sanIpRow,
+    daysRow,
+    keyTypeRow,
+    signerRow,
+    disclaimer);
+  updateFieldVisibility();
+
+  if (!caBundles.length) {
+    // Disable modes that need a CA
+    modeInputs.signed_by.disabled = true;
+    modeInputs.client.disabled = true;
+    body.appendChild(el('div', { class: 'card-subtitle',
+      style: 'margin-top:8px;color:var(--warning);font-size:12px' },
+      'No CA bundles available. Generate a "CA (root)" bundle first '
+      + 'to enable signing.'));
+  }
+
+  openModal({
+    title: 'Generate certificate',
+    body,
+    wide: true,
+    footer: [
+      btn('Cancel', '', () => backToList()),
+      btn('Generate', 'btn-primary',
+        () => _submitCertGeneration({
+          modeInputs, bundleNameInput, cnInput,
+          sanDnsInput, sanIpInput, daysInput,
+          keyTypeSel, signerSel,
+        })),
+    ],
+  });
+  cnInput.focus();
+}
+
+function _getCheckedValue(radioMap) {
+  for (const [v, el] of Object.entries(radioMap)) {
+    if (el.checked) return v;
+  }
+  return null;
+}
+
+function _splitCsv(s) {
+  return s.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function _submitCertGeneration(fields) {
+  const mode = _getCheckedValue(fields.modeInputs);
+  const cn = fields.cnInput.value.trim();
+  if (!cn) return modalError('CN is required');
+  const days = parseInt(fields.daysInput.value) || 365;
+  const params = {
+    cn,
+    days,
+    key_type: fields.keyTypeSel.value,
+    san_dns: _splitCsv(fields.sanDnsInput.value),
+    san_ip: _splitCsv(fields.sanIpInput.value),
+  };
+  if (mode === 'signed_by' || mode === 'client') {
+    const signer = fields.signerSel.value;
+    if (!signer) return modalError('Select a signing CA');
+    params.signer_bundle = signer;
+  }
+  if (mode === 'client') {
+    api('POST', '/api/certs/generate-client', params)
+      .then(data => _showClientCertDownload(data))
+      .catch(e => modalError(String(e)));
+    return;
+  }
+  // Bundle modes
+  const bundle = fields.bundleNameInput.value.trim();
+  if (!bundle) return modalError('Target bundle name is required');
+  params.mode = mode;
+  api('POST', '/api/certs/' + encodeURIComponent(bundle) + '/generate', params)
+    .then(() => navigate('/certificates/' + encodeURIComponent(bundle)))
+    .catch(e => modalError(String(e)));
+}
+
+function _showClientCertDownload(data) {
+  // Present cert+key+ca as separate downloads. Combined ZIP would
+  // require a JS library; three buttons is good enough and lets the
+  // user pick what to install on the client.
+  const downloadBtn = (label, filename, content) => btn(
+    label, 'btn-accent btn-small',
+    () => {
+      const blob = new Blob([content], { type: 'application/x-pem-file' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  const namePrefix = (data.cn || 'client').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const body = el('div', {},
+    el('p', {},
+      'Client certificate generated. Download the files and install '
+      + 'them on the mTLS client. ',
+      el('strong', {}, 'The private key is not stored on the server '),
+      '— if you lose it, regenerate.'),
+    el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin:12px 0' },
+      downloadBtn('cert.pem', namePrefix + '-cert.pem', data.cert_pem),
+      downloadBtn('key.pem', namePrefix + '-key.pem', data.key_pem),
+      downloadBtn('ca.pem', namePrefix + '-ca.pem', data.ca_pem)),
+    el('p', { class: 'card-subtitle', style: 'font-size:12px' },
+      'On the client, configure your TLS stack to present '
+      + namePrefix + '-cert.pem + ' + namePrefix + '-key.pem '
+      + 'and trust ' + namePrefix + '-ca.pem.'));
+  openModal({
+    title: 'Client certificate ready',
+    body,
+    footer: [
+      btn('Done', 'btn-primary', () => navigate('/certificates')),
+    ],
+  });
 }
 
 function _confirmDeleteCertFile(bundleName, fname) {

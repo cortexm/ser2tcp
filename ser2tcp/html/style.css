@@ -600,6 +600,15 @@ body {
   color: var(--text);
   margin-bottom: 0;
 }
+/* Gray out the label text when its radio/checkbox is disabled — the
+ * native control alone is too subtle a hint that the row is inert. */
+.modal-body label.checkbox-label:has(input:disabled) {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+.modal-body label.checkbox-label:has(input:disabled) .card-subtitle {
+  opacity: 0.6;
+}
 .modal-body input[type="text"],
 .modal-body input[type="number"],
 .modal-body input[type="password"],

@@ -299,6 +299,18 @@ certificate bundles without shell access. A bundle is a directory under
 - Drag-and-drop PEM file onto the file row
 - Download public files (cert.pem / ca.pem)
 - Delete individual files within a bundle
+- **Generate certificates** — self-signed server, CA, server signed by CA, client cert
+  (downloads cert+key+ca for installation on the mTLS client; private key is
+  not stored on the server)
+
+For each bundle, the UI displays the parsed certificate metadata: CN, issuer
+(or "self-signed"), Subject Alternative Names, expiry with color-coded warnings
+(green > 30 days, orange < 30 days, red < 7 days or expired), key type/size,
+SHA-256 fingerprint, and a "CA" badge for CA bundles.
+
+> The built-in generator is intended for testing and internal use (lab,
+> embedded, industrial LAN). For production PKI use a dedicated tool
+> like smallstep, HashiCorp Vault, AWS ACM, or your existing infrastructure.
 
 **Let's Encrypt** — point a bundle at LE's `live/` directory using
 symlinks (no native LE handling in code):
@@ -352,15 +364,49 @@ openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key -CAcreateser
 rm client.csr
 ```
 
-Testing SSL connection:
+Testing SSL connection with `openssl s_client`:
 
 ```bash
-# Without client certificate
+# Plain TLS — skip cert validation (quick smoke test)
 openssl s_client -connect localhost:10003
 
-# With client certificate (mTLS)
-openssl s_client -connect localhost:10003 -cert client.crt -key client.key
+# With CA cert verification
+openssl s_client -connect localhost:10003 -CAfile ca.pem -verify_return_error
+
+# With hostname check against SAN (matches "server.local" against SAN DNS)
+openssl s_client -connect server.local:10003 -CAfile ca.pem -verify_hostname server.local
+
+# mTLS (client certificate required)
+openssl s_client -connect localhost:10003 -CAfile ca.pem \
+    -cert client-cert.pem -key client-key.pem
+
+# Inspect what cert the server actually presents (no interactive session)
+openssl s_client -connect localhost:10003 -showcerts </dev/null 2>/dev/null \
+    | openssl x509 -text -noout | head -30
 ```
+
+After connecting, `s_client` gives you a bidirectional stdin/stdout tunnel
+to the serial port. A few quirks worth knowing:
+
+- **Ctrl-C kills `s_client` itself** — it does not pass through to the
+  remote serial. To send byte 0x03 (ETX / serial Ctrl-C) over the tunnel,
+  either pipe it in: `printf '\x03' | openssl s_client … -quiet -ign_eof`,
+  or put the terminal in raw mode first:
+
+  ```bash
+  stty -isig -icanon -echo
+  openssl s_client -connect localhost:10003 -quiet
+  stty sane                # restore terminal afterwards
+  ```
+
+  In raw mode press `Ctrl-D` (EOF) to exit.
+
+- **`-quiet`** suppresses the verbose session info banner. Useful when
+  forwarding binary data so the banner doesn't pollute the stream.
+
+- For purely binary serial protocols, `socat` (`brew install socat`) or
+  `ncat --ssl` (`brew install nmap`) are more transparent — no built-in
+  command interception, raw mode by default.
 
 ### HTTP server and API
 
@@ -466,6 +512,8 @@ With IP filtering:
 | POST | `/api/certs/<bundle>/files` | admin | Upload/paste a file into bundle |
 | GET | `/api/certs/<bundle>/files/<filename>` | yes | Download public file (cert.pem / ca.pem) |
 | DELETE | `/api/certs/<bundle>/files/<filename>` | admin | Delete single file from bundle |
+| POST | `/api/certs/<bundle>/generate` | admin | Generate cert+key into bundle (modes: self_signed / ca / signed_by) |
+| POST | `/api/certs/generate-client` | admin | Generate mTLS client cert (returns PEM, not stored on server) |
 | GET | `/xterm/<endpoint>` | no | WebSocket VT100 terminal |
 | GET | `/raw/<endpoint>` | no | WebSocket raw terminal |
 

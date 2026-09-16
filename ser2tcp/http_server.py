@@ -454,6 +454,11 @@ class HttpServerWrapper():
                 self._handle_api_certs_create(client, user)
             else:
                 self._error(client, 'Method not allowed', 405)
+        elif client.path == '/api/certs/generate-client':
+            if client.method == 'POST':
+                self._handle_api_certs_generate_client(client, user)
+            else:
+                self._error(client, 'Method not allowed', 405)
         elif client.path.startswith('/api/certs/'):
             self._route_api_certs_item(client, user)
         elif client.path == '/api/settings':
@@ -1661,6 +1666,13 @@ class HttpServerWrapper():
             else:
                 self._error(client, 'Method not allowed', 405)
             return
+        # /api/certs/<bundle>/generate
+        if len(parts) == 2 and parts[1] == 'generate':
+            if client.method == 'POST':
+                self._handle_api_certs_generate(client, user, bundle)
+            else:
+                self._error(client, 'Method not allowed', 405)
+            return
         self._error(client, 'Not found', 404)
 
     def _handle_api_certs_get(self, client, bundle):
@@ -1715,6 +1727,156 @@ class HttpServerWrapper():
             self._error(client, str(err), 404)
             return
         client.respond({'ok': True})
+
+    def _parse_generate_params(self, data, require_signer=False):
+        """Validate common generate-cert params. Returns dict of normalized
+        params or raises ValueError with a user-facing message."""
+        if not isinstance(data, dict):
+            raise ValueError('Expected JSON object')
+        cn = (data.get('cn') or '').strip()
+        if not cn:
+            raise ValueError('cn is required')
+        try:
+            days = int(data.get('days', 365))
+        except (TypeError, ValueError):
+            raise ValueError('days must be integer')
+        if days < 1 or days > 36500:
+            raise ValueError('days must be 1-36500')
+        key_type = data.get('key_type', 'rsa2048')
+        if key_type not in _cert_manager.KEY_TYPES:
+            raise ValueError(
+                f"Unknown key_type (allowed: {', '.join(_cert_manager.KEY_TYPES)})")
+        san_dns = data.get('san_dns') or []
+        san_ip = data.get('san_ip') or []
+        if not isinstance(san_dns, list) or not isinstance(san_ip, list):
+            raise ValueError('san_dns and san_ip must be arrays')
+        signer_name = data.get('signer_bundle')
+        if require_signer and not signer_name:
+            raise ValueError('signer_bundle is required')
+        return {
+            'cn': cn, 'days': days, 'key_type': key_type,
+            'san_dns': san_dns, 'san_ip': san_ip,
+            'signer_name': signer_name,
+        }
+
+    def _load_signer(self, signer_name):
+        """Load a signer (cert, key) pair from a bundle. Raises ValueError
+        with user-facing message on any problem."""
+        try:
+            cert_path, key_path, _ca = _cert_manager.resolve_bundle_paths(
+                self._cert_manager.certs_dir, signer_name)
+        except _cert_manager.CertManagerError as err:
+            raise ValueError(str(err)) from err
+        with open(cert_path, 'r', encoding='utf-8') as f:
+            cert_pem = f.read()
+        with open(key_path, 'r', encoding='utf-8') as f:
+            key_pem = f.read()
+        try:
+            return _cert_manager._parse_signer(cert_pem, key_pem), cert_pem
+        except _cert_manager.CertManagerError as err:
+            raise ValueError(str(err)) from err
+
+    def _handle_api_certs_generate(self, client, user, bundle):
+        """Generate a cert+key into <bundle>. Mode controls intent:
+          self_signed — standalone server cert
+          ca          — root CA cert (basicConstraints CA:TRUE)
+          signed_by   — server cert signed by another bundle's CA;
+                        also copies signer's cert to bundle/ca.pem so
+                        the server can immediately do mTLS
+        Bundle is created on demand if it doesn't exist yet.
+        Will refuse to overwrite an existing cert.pem in the target."""
+        if not self._require_admin(client, user):
+            return
+        data = client.data or {}
+        mode = data.get('mode', 'self_signed')
+        if mode not in ('self_signed', 'ca', 'signed_by'):
+            self._error(client, f"Unknown mode '{mode}'", 400)
+            return
+        try:
+            params = self._parse_generate_params(
+                data, require_signer=(mode == 'signed_by'))
+        except ValueError as err:
+            self._error(client, str(err), 400)
+            return
+        # Refuse to clobber an existing cert.pem so a typo doesn't
+        # silently overwrite a working cert.
+        try:
+            existing = self._cert_manager.get_bundle(bundle)
+            if existing['files']['cert.pem'].get('present'):
+                self._error(
+                    client,
+                    f"Bundle '{bundle}' already has cert.pem; delete it first",
+                    400)
+                return
+        except _cert_manager.CertManagerError:
+            pass  # bundle doesn't exist yet, that's fine
+        signer = None
+        signer_cert_pem = None
+        if mode == 'signed_by':
+            try:
+                signer, signer_cert_pem = self._load_signer(params['signer_name'])
+            except ValueError as err:
+                self._error(client, str(err), 400)
+                return
+        try:
+            cert_pem, key_pem = _cert_manager.generate_certificate(
+                cn=params['cn'], days=params['days'],
+                key_type=params['key_type'],
+                is_ca=(mode == 'ca'),
+                san_dns=params['san_dns'], san_ip=params['san_ip'],
+                signer=signer)
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 400)
+            return
+        try:
+            self._cert_manager.save_file(bundle, 'cert.pem', cert_pem)
+            self._cert_manager.save_file(bundle, 'key.pem', key_pem)
+            # Copy signer's cert into ca.pem for one-step mTLS setup
+            if mode == 'signed_by' and signer_cert_pem:
+                self._cert_manager.save_file(bundle, 'ca.pem', signer_cert_pem)
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 400)
+            return
+        self._log.info(
+            "Generated %s cert for bundle '%s' (CN=%s)",
+            mode, bundle, params['cn'])
+        client.respond({'ok': True}, status=201)
+
+    def _handle_api_certs_generate_client(self, client, user):
+        """Generate a client cert signed by a CA bundle. Returns cert+key+ca
+        as PEM strings; not stored server-side. The UI packages them as a
+        download (zip or .p12) for the human to install on the client."""
+        if not self._require_admin(client, user):
+            return
+        data = client.data or {}
+        try:
+            params = self._parse_generate_params(data, require_signer=True)
+        except ValueError as err:
+            self._error(client, str(err), 400)
+            return
+        try:
+            signer, signer_cert_pem = self._load_signer(params['signer_name'])
+        except ValueError as err:
+            self._error(client, str(err), 400)
+            return
+        try:
+            cert_pem, key_pem = _cert_manager.generate_certificate(
+                cn=params['cn'], days=params['days'],
+                key_type=params['key_type'],
+                is_client=True, signer=signer,
+                san_dns=params['san_dns'], san_ip=params['san_ip'])
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 400)
+            return
+        self._log.info(
+            "Generated client cert signed by '%s' (CN=%s)",
+            params['signer_name'], params['cn'])
+        client.respond({
+            'cn': params['cn'],
+            'cert_pem': cert_pem,
+            'key_pem': key_pem,
+            'ca_pem': signer_cert_pem,
+        })
 
     def _handle_api_certs_download_file(self, client, bundle, filename):
         try:
