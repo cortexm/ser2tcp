@@ -216,5 +216,85 @@ class TestBundleReload(base.IntegrationTestCase):
         self.assertNotEqual(_serial_of(served), first_serial)
 
 
+class TestPortSslBundleUsage(base.IntegrationTestCase):
+    """A port SSL server reports its bundle usage and accepts a reload.
+
+    The HTTP API here is plain — what is under test is the port server
+    on the other side of it.
+    """
+
+    ssl_port = None
+
+    @classmethod
+    def build_config(cls):
+        return {
+            'ports': [{
+                'name': 'demo',
+                'serial': {'port': '/dev/tty.not-a-real-device',
+                    'baudrate': 9600},
+                'servers': [{
+                    'protocol': 'ssl',
+                    'address': '127.0.0.1', 'port': cls.ssl_port,
+                    'ssl': {'bundle': 'web', 'require_client_cert': True},
+                }],
+            }],
+            'http': [{'address': '127.0.0.1', 'port': cls.port}],
+        }
+
+    @classmethod
+    def prepare(cls, proc):
+        ca_cert, ca_key = _gen('Port CA', is_ca=True)
+        signer = cert_manager.parse_signer(ca_cert, ca_key)
+        cert, key = _gen('localhost', san_dns=['localhost'], signer=signer)
+        cert_manager.CertManager(proc.dir).save_files('web', [
+            ('cert.pem', cert), ('key.pem', key), ('ca.pem', ca_cert)])
+        client_cert, client_key = _gen(
+            'operator', is_client=True, signer=signer)
+        cls.client_cert_file = os.path.join(proc.dir, 'port-client-cert.pem')
+        cls.client_key_file = os.path.join(proc.dir, 'port-client-key.pem')
+        _write(cls.client_cert_file, client_cert)
+        _write(cls.client_key_file, client_key)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ssl_port = base.free_port()
+        super().setUpClass()
+
+    def test_used_by_reports_the_port_server(self):
+        status, body = self.get('/api/certs/web')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body['used_by']), 1)
+        usage = body['used_by'][0]
+        self.assertEqual(usage['type'], 'port')
+        self.assertEqual(usage['port_name'], 'demo')
+        self.assertEqual(usage['server_port'], self.ssl_port)
+        # ca.pem is in play for this server, so the UI can warn before
+        # anyone deletes it
+        self.assertTrue(usage['mtls'])
+
+    def test_bundle_in_use_cannot_be_deleted(self):
+        status, body = self.delete('/api/certs/web')
+        self.assertEqual(status, 400)
+        self.assertIn('in use', body['error'])
+
+    def test_reload_reaches_the_port_server(self):
+        status, body = self.post('/api/certs/web/reload')
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body['reloaded'], [f'port 127.0.0.1:{self.ssl_port}'])
+
+    def test_port_server_serves_the_bundle_cert(self):
+        # The configured serial device does not exist, so ser2tcp drops
+        # the client right after the handshake — which is far enough to
+        # see whose certificate it offered. mTLS rejection itself is
+        # covered by TestMutualTls, against a server that stays up.
+        pem = base.tls_peer_cert(
+            '127.0.0.1', self.ssl_port,
+            client_cert=self.client_cert_file,
+            client_key=self.client_key_file,
+            probe=False)
+        self.assertEqual(_cn_of(pem), 'localhost')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -232,12 +232,17 @@ def unverified_context():
     return context
 
 
-def tls_peer_cert(host, port, cafile=None, client_cert=None, client_key=None):
+def tls_peer_cert(
+        host, port, cafile=None, client_cert=None, client_key=None,
+        probe=True):
     """Open a TLS connection and return the peer certificate as PEM.
 
     With cafile the chain and hostname are verified (so a bad chain
     raises); without it the handshake is unverified and the cert is
     fetched only to identify which one the server presented.
+
+    probe=False skips the post-handshake exchange, for a server that is
+    expected to hang up straight after the handshake.
     """
     context = _ssl.create_default_context(cafile=cafile) if cafile \
         else unverified_context()
@@ -250,6 +255,7 @@ def tls_peer_cert(host, port, cafile=None, client_cert=None, client_key=None):
             # server has checked its certificate, so a rejected client
             # only finds out on the first read. Exchange a byte to make
             # that rejection surface here rather than nowhere.
-            tls.sendall(b'GET /api/status HTTP/1.0\r\n\r\n')
-            tls.recv(1)
+            if probe:
+                tls.sendall(b'GET /api/status HTTP/1.0\r\n\r\n')
+                tls.recv(1)
             return pem

@@ -2307,8 +2307,9 @@ function _showBundleEditor(info) {
   if (usedBy.length) {
     body.appendChild(el('div', {
       class: 'card-subtitle', style: 'margin-bottom:12px',
-    }, 'In use by ' + usedBy.length + ' server(s). After replacing the '
-       + 'certificate, use Reload so running servers pick it up.'));
+    }, 'In use by ' + usedBy.map(_usageLabel).join(', ')
+       + '. After replacing the certificate, use Reload so running '
+       + 'servers pick it up.'));
   }
 
   if (info.key_match === false) {
@@ -2325,7 +2326,8 @@ function _showBundleEditor(info) {
         + '/replace'))));
 
   CERT_FILES.forEach(fname => {
-    body.appendChild(_renderCertFileRow(info.name, fname, info.files[fname]));
+    body.appendChild(
+      _renderCertFileRow(info.name, fname, info.files[fname], usedBy));
   });
 
   const footer = [
@@ -2479,7 +2481,7 @@ function _renderCertInfo(info) {
   }, ...rows);
 }
 
-function _renderCertFileRow(bundleName, fname, fileInfo) {
+function _renderCertFileRow(bundleName, fname, fileInfo, usedBy) {
   const wrap = el('div', {
     class: 'subgroup cert-file-row',
     style: 'margin-bottom:16px;transition:background-color .15s',
@@ -2560,7 +2562,7 @@ function _renderCertFileRow(bundleName, fname, fileInfo) {
         () => _downloadCertFile(bundleName, fname)));
     }
     actions.appendChild(btn('Delete', 'btn-small btn-danger',
-      () => _confirmDeleteCertFile(bundleName, fname)));
+      () => _confirmDeleteCertFile(bundleName, fname, usedBy)));
   }
   wrap.appendChild(fileInput);
   wrap.appendChild(actions);
@@ -2860,8 +2862,37 @@ function _showClientCertDownload(data) {
   });
 }
 
-function _confirmDeleteCertFile(bundleName, fname) {
-  if (!confirm('Delete ' + fname + ' from bundle "' + bundleName + '"?')) return;
+// Short "where is this used" label for one entry of a bundle's used_by.
+function _usageLabel(u) {
+  const where = u.type === 'http'
+    ? 'HTTPS ' + (u.name || '')
+    : 'port ' + (u.port_name || '#' + u.port_index);
+  return where.trim() + ' ' + (u.address || '') + ':' + u.server_port;
+}
+
+// Servers that would break if this file went away. ca.pem only matters
+// to a server that verifies client certificates; cert.pem and key.pem
+// matter to every server using the bundle.
+function _certFileUsers(fname, usedBy) {
+  if (!usedBy || !usedBy.length) return [];
+  if (fname === 'ca.pem') return usedBy.filter(u => u.mtls);
+  return usedBy;
+}
+
+function _confirmDeleteCertFile(bundleName, fname, usedBy) {
+  // Deleting a file from a bundle in use is allowed on purpose — it is
+  // how you regenerate into a bundle, since generate refuses to
+  // overwrite cert.pem. Say what it costs rather than blocking it.
+  const users = _certFileUsers(fname, usedBy);
+  let msg = 'Delete ' + fname + ' from bundle "' + bundleName + '"?';
+  if (users.length) {
+    msg += '\n\nIn use by:\n'
+      + users.map(u => '  · ' + _usageLabel(u)).join('\n')
+      + '\n\nThose servers keep running on the certificate they already '
+      + 'loaded, but will fail on the next reload or restart until '
+      + fname + ' is back.';
+  }
+  if (!confirm(msg)) return;
   api('DELETE', '/api/certs/' + encodeURIComponent(bundleName)
         + '/files/' + encodeURIComponent(fname))
     .then(() => navigate('/certificates/' + encodeURIComponent(bundleName)))

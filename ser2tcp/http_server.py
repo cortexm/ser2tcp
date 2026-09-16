@@ -1549,7 +1549,8 @@ class HttpServerWrapper():
         """Return list of servers using this bundle. Each entry is a
         dict describing where the bundle is referenced — used for
         "used_by" display in the UI and to block deletion of bundles
-        currently in use."""
+        currently in use. `mtls` says whether that server verifies
+        client certificates, i.e. whether ca.pem matters to it."""
         usage = []
         # Port SSL servers
         for p_idx, port in enumerate(self._get_ports_config()):
@@ -1564,6 +1565,7 @@ class HttpServerWrapper():
                     'server_index': s_idx,
                     'address': srv.get('address'),
                     'server_port': srv.get('port'),
+                    'mtls': bool(ssl_cfg.get('require_client_cert')),
                 })
         # HTTP servers
         http_list = self._configuration.get('http', [])
@@ -1579,6 +1581,7 @@ class HttpServerWrapper():
                 'name': srv.get('name'),
                 'address': srv.get('address'),
                 'server_port': srv.get('port'),
+                'mtls': bool(ssl_cfg.get('require_client_cert')),
             })
         return usage
 

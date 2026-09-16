@@ -301,7 +301,8 @@ certificate bundles without shell access. A bundle is a directory under
 - Paste PEM content into a textarea
 - Drag-and-drop PEM file onto the file row
 - Download public files (cert.pem / ca.pem)
-- Delete individual files within a bundle
+- Delete individual files within a bundle — if the bundle is in use, the
+  confirmation names the servers that will fail on their next reload
 - **Replace cert + key** — upload both halves as one set (see *Renewing a
   certificate* below)
 - **Reload** — apply a renewed certificate to running servers without a
