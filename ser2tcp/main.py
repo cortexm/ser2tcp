@@ -155,7 +155,7 @@ def main():
     # servers can resolve bundle references.
     certs_dir = _os.path.join(_os.path.dirname(config_path) or '.', 'certs')
 
-    servers_manager = _server_manager.ServersManager()
+    servers_manager = _server_manager.ServersManager(log=log)
     serial_proxies = []
     for config in ports:
         try:

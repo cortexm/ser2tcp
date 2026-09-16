@@ -1,5 +1,6 @@
 """Server manager"""
 
+import logging as _logging
 import selectors as _selectors
 
 
@@ -10,11 +11,17 @@ class ServersManager():
     their own sockets in this selector and carry themselves as the key's
     data, so dispatch is a single call to the owner rather than a fan-out
     over every socket in the process.
+
+    Every call out of this loop is guarded: one loop serves every serial
+    port, every client and the whole HTTP API, so an unhandled exception
+    anywhere used to reach main() and take all of them down together.
+    A failing owner now loses its own event and nothing else.
     """
 
     TIMEOUT = .1
 
-    def __init__(self, selector=None):
+    def __init__(self, selector=None, log=None):
+        self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._selector = selector or _selectors.DefaultSelector()
         self._owns_selector = selector is None
         self._servers = []
@@ -63,9 +70,21 @@ class ServersManager():
             # themselves on the next pass.
             events = ()
         for key, mask in events:
-            self._dispatch(key, mask)
+            try:
+                self._dispatch(key, mask)
+            except Exception:  # pylint: disable=W0703
+                # Contain the damage to this one event. BaseException
+                # (KeyboardInterrupt, SystemExit) still gets through.
+                self._log.exception(
+                    "Unhandled error handling event for %s",
+                    type(key.data).__name__)
         for server in self._servers:
-            server.process_stale()
+            try:
+                server.process_stale()
+            except Exception:  # pylint: disable=W0703
+                self._log.exception(
+                    "Unhandled error in %s.process_stale()",
+                    type(server).__name__)
 
     def _dispatch(self, key, mask):
         """Hand one ready socket to whatever owns it.
@@ -77,16 +96,50 @@ class ServersManager():
         """
         ready = key.data.handle_event(key.fileobj, mask)
         while ready is not None:
-            if self._client_handler is not None:
-                self._client_handler(ready)
-            # One recv() can carry several requests or WebSocket frames,
-            # and select() will not report them again - the OS buffer is
-            # already drained. Take them now.
-            ready = ready if ready.next() else None
+            try:
+                if self._client_handler is not None:
+                    self._client_handler(ready)
+                # One recv() can carry several requests or WebSocket
+                # frames, and select() will not report them again - the
+                # OS buffer is already drained. Take them now.
+                keep_going = ready.next()
+            except Exception:  # pylint: disable=W0703
+                self._log.exception("Unhandled error handling a request")
+                self._drop_client(ready)
+                return
+            ready = ready if keep_going else None
+
+    def _drop_client(self, client):
+        """Let go of a connection whose handler failed.
+
+        Containing the exception is not enough: a handler that raised
+        never answered, so uhttp still holds the request and reports the
+        connection ready on every pass from here on. That is a 100% CPU
+        spin which outlives the request, the client, and any interest in
+        the answer - the process has to be killed to stop it.
+
+        Answering 500 first turns a silent hang into an error the client
+        can act on; both steps are best-effort, because the reason the
+        handler blew up may well be that the socket is already gone.
+        """
+        try:
+            client.respond({'error': 'Internal server error'}, status=500)
+        except Exception:  # pylint: disable=W0703
+            pass
+        try:
+            client.close()
+        except Exception:  # pylint: disable=W0703
+            pass
 
     def close(self):
         """Close all servers"""
         for server in self._servers:
-            server.close()
+            try:
+                server.close()
+            except Exception:  # pylint: disable=W0703
+                # Shutdown closes everything it can reach; one server
+                # failing must not leave the rest open.
+                self._log.exception(
+                    "Unhandled error closing %s", type(server).__name__)
         if self._owns_selector:
             self._selector.close()
