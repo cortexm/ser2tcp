@@ -1,8 +1,12 @@
 """Tests for HTTP server wrapper"""
 
+import os
+import shutil
+import tempfile
 import unittest
 from unittest.mock import Mock, MagicMock, patch
 
+from ser2tcp.cert_manager import CertManager, generate_certificate
 from ser2tcp.http_auth import hash_password
 from ser2tcp.http_server import HttpServerWrapper, _describe_detected
 
@@ -45,8 +49,12 @@ class MockClient:
         self.ndjson_alive = False
 
 
-def make_wrapper(auth_config=None, serial_proxies=None):
-    """Create HttpServerWrapper with mocked uhttp server"""
+def make_wrapper(auth_config=None, serial_proxies=None, config_path=None):
+    """Create HttpServerWrapper with mocked uhttp server.
+
+    Pass config_path to keep the cert manager inside a temporary
+    directory — without it, it would fall back to ~/.config/ser2tcp.
+    """
     http_config = {'address': '127.0.0.1', 'port': 0}
     # Auth config goes at root level of configuration
     configuration = {'http': [http_config]}
@@ -60,7 +68,7 @@ def make_wrapper(auth_config=None, serial_proxies=None):
     proxies = serial_proxies if serial_proxies is not None else []
     with patch('ser2tcp.http_server._uhttp_server.HttpServer'):
         return HttpServerWrapper(http_config, proxies, log=Mock(),
-            configuration=configuration)
+            config_path=config_path, configuration=configuration)
 
 
 class TestRouting(unittest.TestCase):
@@ -1792,3 +1800,113 @@ class TestHttpBindError(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestApiCertsReloadAndUpload(unittest.TestCase):
+    """Reload gating and the multi-file upload form.
+
+    The routing and the actual cert swap are covered end-to-end in
+    tests/integration/ — these cover the guards a MockClient can reach.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.tmp, 'config.json')
+        self.wrapper = make_wrapper(
+            auth_config=self._auth_config(), config_path=self.config_path)
+        self.mgr = CertManager(self.tmp)
+        self.cert, self.key = generate_certificate('a', key_type='ec_p256')
+        self.other_cert, self.other_key = generate_certificate(
+            'b', key_type='ec_p256')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _auth_config(self):
+        return {
+            'users': [
+                {'login': 'admin', 'password': hash_password('secret'),
+                    'admin': True},
+                {'login': 'viewer', 'password': hash_password('secret'),
+                    'admin': False},
+            ],
+        }
+
+    def _token(self, login):
+        client = MockClient(
+            method='POST', path='/api/login',
+            data={'login': login, 'password': 'secret'})
+        self.wrapper._handle_request(client)
+        return client.responded['token']
+
+    def _call(self, login, method, path, data=None):
+        client = MockClient(
+            method=method, path=path, data=data,
+            headers={'authorization': f'Bearer {self._token(login)}'})
+        self.wrapper._handle_request(client)
+        return client
+
+    def test_reload_requires_admin(self):
+        self.mgr.save_files(
+            'web', [('cert.pem', self.cert), ('key.pem', self.key)])
+        client = self._call('viewer', 'POST', '/api/certs/web/reload')
+        self.assertEqual(client.respond_status, 403)
+
+    def test_reload_unknown_bundle_is_404(self):
+        client = self._call('admin', 'POST', '/api/certs/nope/reload')
+        self.assertEqual(client.respond_status, 404)
+
+    def test_reload_unused_bundle_reports_nothing(self):
+        self.mgr.save_files(
+            'web', [('cert.pem', self.cert), ('key.pem', self.key)])
+        client = self._call('admin', 'POST', '/api/certs/web/reload')
+        self.assertEqual(client.respond_status, 200)
+        self.assertEqual(client.responded['reloaded'], [])
+
+    def test_reload_rejects_get(self):
+        client = self._call('admin', 'GET', '/api/certs/web/reload')
+        self.assertEqual(client.respond_status, 405)
+
+    def test_upload_single_file(self):
+        client = self._call(
+            'admin', 'POST', '/api/certs/web/files',
+            {'filename': 'cert.pem', 'content': self.cert})
+        self.assertEqual(client.respond_status, 200)
+        self.assertTrue(
+            self.mgr.get_bundle('web')['files']['cert.pem']['present'])
+
+    def test_upload_file_set(self):
+        client = self._call(
+            'admin', 'POST', '/api/certs/web/files',
+            {'files': [
+                {'filename': 'cert.pem', 'content': self.cert},
+                {'filename': 'key.pem', 'content': self.key},
+            ]})
+        self.assertEqual(client.respond_status, 200)
+        self.assertTrue(self.mgr.get_bundle('web')['key_match'])
+
+    def test_upload_mismatched_set_rejected(self):
+        client = self._call(
+            'admin', 'POST', '/api/certs/web/files',
+            {'files': [
+                {'filename': 'cert.pem', 'content': self.cert},
+                {'filename': 'key.pem', 'content': self.other_key},
+            ]})
+        self.assertEqual(client.respond_status, 400)
+        self.assertIn('does not match', client.responded['error'])
+
+    def test_upload_entry_without_content_rejected(self):
+        client = self._call(
+            'admin', 'POST', '/api/certs/web/files',
+            {'files': [{'filename': 'cert.pem'}]})
+        self.assertEqual(client.respond_status, 400)
+
+    def test_upload_empty_set_rejected(self):
+        client = self._call(
+            'admin', 'POST', '/api/certs/web/files', {'files': []})
+        self.assertEqual(client.respond_status, 400)
+
+    def test_upload_without_filename_rejected(self):
+        client = self._call(
+            'admin', 'POST', '/api/certs/web/files', {'content': self.cert})
+        self.assertEqual(client.respond_status, 400)

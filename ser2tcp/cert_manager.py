@@ -53,6 +53,22 @@ class CertManagerError(Exception):
     """User-facing error from cert manager (validation, not-found, etc)."""
 
 
+def _as_bytes(pem):
+    """Accept a PEM blob as str or bytes, return bytes."""
+    return pem.encode('utf-8') if isinstance(pem, str) else pem
+
+
+def _public_key_der(cert_or_key):
+    """SubjectPublicKeyInfo DER of a cert's or private key's public key.
+
+    public_numbers() would do for RSA/EC but not for Ed25519/Ed448 —
+    the serialized SPKI form compares equal for every algorithm.
+    """
+    return cert_or_key.public_key().public_bytes(
+        _serialization.Encoding.DER,
+        _serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
 def _key_type_info(public_key):
     """Return (algorithm_name, bit_size_or_curve_name) for a public key."""
     if isinstance(public_key, _rsa.RSAPublicKey):
@@ -88,9 +104,7 @@ def inspect_certificate(pem_content):
     if not pem_content:
         return {'error': 'empty content'}
     try:
-        data = pem_content.encode('utf-8') if isinstance(pem_content, str) \
-            else pem_content
-        cert = _x509.load_pem_x509_certificate(data)
+        cert = _x509.load_pem_x509_certificate(_as_bytes(pem_content))
     except (ValueError, TypeError) as err:
         return {'error': f'parse failed: {err}'}
     info = {}
@@ -204,28 +218,47 @@ def _serialize_cert_pem(cert):
     return cert.public_bytes(_serialization.Encoding.PEM).decode('utf-8')
 
 
-def _parse_signer(signer_cert_pem, signer_key_pem):
-    """Load a CA's cert + key from PEM for signing. Used when generating
-    end-entity certs against an existing bundle."""
+def cert_key_match(cert_pem, key_pem):
+    """Return True/False whether a cert and private key belong together.
+
+    Returns None when either side cannot be parsed — an encrypted key or
+    a dangling symlink is not a mismatch, and the caller decides what to
+    do with a file it cannot read.
+    """
     try:
-        cert = _x509.load_pem_x509_certificate(signer_cert_pem.encode())
+        cert = _x509.load_pem_x509_certificate(_as_bytes(cert_pem))
+        key = _serialization.load_pem_private_key(
+            _as_bytes(key_pem), password=None)
+    except (ValueError, TypeError):
+        return None
+    return _public_key_der(cert) == _public_key_der(key)
+
+
+def load_cert_and_key(cert_pem, key_pem, what='Cert'):
+    """Load a PEM cert + private key, verifying they belong together.
+
+    Returns (cert, key) as cryptography objects; raises CertManagerError
+    with a user-facing message on a parse failure or a mismatch.
+    """
+    try:
+        cert = _x509.load_pem_x509_certificate(_as_bytes(cert_pem))
     except (ValueError, TypeError) as err:
-        raise CertManagerError(f"Signer cert is invalid: {err}") from err
+        raise CertManagerError(f"{what} cert is invalid: {err}") from err
     try:
         key = _serialization.load_pem_private_key(
-            signer_key_pem.encode(), password=None)
+            _as_bytes(key_pem), password=None)
     except (ValueError, TypeError) as err:
-        raise CertManagerError(f"Signer key is invalid: {err}") from err
-    # Sanity check: cert and key must match. public_numbers() works for
-    # RSA/EC but not Ed25519/Ed448 — compare the serialized DER form
-    # (SubjectPublicKeyInfo) which works for every algorithm.
-    fmt = _serialization.Encoding.DER
-    spki = _serialization.PublicFormat.SubjectPublicKeyInfo
-    if cert.public_key().public_bytes(fmt, spki) \
-            != key.public_key().public_bytes(fmt, spki):
+        raise CertManagerError(f"{what} key is invalid: {err}") from err
+    if _public_key_der(cert) != _public_key_der(key):
         raise CertManagerError(
-            'Signer cert and key do not match (different public keys)')
-    # Sanity check: signer must actually be a CA
+            f"{what} cert and key do not match (different public keys)")
+    return cert, key
+
+
+def parse_signer(signer_cert_pem, signer_key_pem):
+    """Load a CA's cert + key from PEM for signing. Used when generating
+    end-entity certs against an existing bundle."""
+    cert, key = load_cert_and_key(signer_cert_pem, signer_key_pem, 'Signer')
     try:
         bc = cert.extensions.get_extension_for_class(
             _x509.BasicConstraints).value
@@ -256,7 +289,7 @@ def generate_certificate(
       is_client  — if True (and not is_ca), use extendedKeyUsage clientAuth
                    instead of serverAuth (for mTLS client certs)
       signer     — None for self-signed, or (cert, key) tuple from
-                   `_parse_signer()` to sign with an existing CA
+                   `parse_signer()` to sign with an existing CA
 
     Returns (cert_pem: str, key_pem: str).
     """
@@ -278,7 +311,7 @@ def generate_certificate(
         issuer = subject
         sign_key = key
 
-    now = _datetime.datetime.utcnow()
+    now = _datetime.datetime.now(_datetime.timezone.utc)
     builder = (_x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer)
@@ -347,12 +380,16 @@ def generate_certificate(
     return _serialize_cert_pem(cert), _serialize_key_pem(key)
 
 
-def build_ssl_context(ssl_config, certs_dir):
-    """Build an SSLContext from a server SSL config dict + certs_dir.
+def reload_ssl_context(context, ssl_config, certs_dir):
+    """Re-read a bundle's files into an existing SSLContext.
 
-    Expected config: {"bundle": "<name>", "require_client_cert": bool?}
+    Handshakes made from now on use the new cert; connections already
+    established keep the one they negotiated with. This is what lets a
+    renewed certificate take effect without restarting the process.
 
-    Raises CertManagerError on missing/invalid config or missing files.
+    load_verify_locations() adds to the context's trust store and
+    OpenSSL exposes no way to clear it, so a CA *removed* from ca.pem
+    stays trusted until restart; an added one takes effect at once.
     """
     if not isinstance(ssl_config, dict):
         raise CertManagerError('ssl config must be an object')
@@ -360,7 +397,6 @@ def build_ssl_context(ssl_config, certs_dir):
     mtls = bool(ssl_config.get('require_client_cert'))
     cert_path, key_path, ca_path = resolve_bundle_paths(
         certs_dir, bundle, require_client_cert=mtls)
-    context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
     # Translate OpenSSL load errors into CertManagerError so callers
     # don't need to know about the ssl module's exception types.
     try:
@@ -375,6 +411,17 @@ def build_ssl_context(ssl_config, certs_dir):
             raise CertManagerError(
                 f"Bundle '{bundle}': failed to load ca.pem — {err}") from err
         context.verify_mode = _ssl.CERT_REQUIRED
+
+
+def build_ssl_context(ssl_config, certs_dir):
+    """Build an SSLContext from a server SSL config dict + certs_dir.
+
+    Expected config: {"bundle": "<name>", "require_client_cert": bool?}
+
+    Raises CertManagerError on missing/invalid config or missing files.
+    """
+    context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+    reload_ssl_context(context, ssl_config, certs_dir)
     return context
 
 
@@ -475,8 +522,8 @@ class CertManager():
 
         For cert.pem and ca.pem, the response includes a `cert_info`
         sub-dict from `inspect_certificate()` — best-effort parsing.
-        key.pem is intentionally not parsed (we never read it server-
-        side beyond loading into SSLContext).
+        key.pem is read only to compare its public key against cert.pem
+        (`key_match`); nothing derived from it is ever returned.
         """
         path = self._bundle_path(name)
         if not _os.path.isdir(path):
@@ -503,7 +550,32 @@ class CertManager():
                     except (OSError, UnicodeDecodeError) as err:
                         info['cert_info'] = {'error': str(err)}
             files[fname] = info
-        return {'name': name, 'path': path, 'files': files}
+        return {
+            'name': name, 'path': path, 'files': files,
+            'key_match': self._key_match(path),
+        }
+
+    @staticmethod
+    def _key_match(path):
+        """True/False if cert.pem and key.pem in this bundle belong
+        together, None if either is missing or cannot be parsed.
+
+        A bundle can reach a mismatched state without going through
+        save_file() — a symlink, an scp, a half-finished rotation — so
+        the UI gets the answer with every listing, not just on upload.
+        """
+        cert_path = _os.path.join(path, 'cert.pem')
+        key_path = _os.path.join(path, 'key.pem')
+        if not (_os.path.isfile(cert_path) and _os.path.isfile(key_path)):
+            return None
+        try:
+            with open(cert_path, 'rb') as f:
+                cert_pem = f.read()
+            with open(key_path, 'rb') as f:
+                key_pem = f.read()
+        except OSError:
+            return None
+        return cert_key_match(cert_pem, key_pem)
 
     def create_bundle(self, name):
         """Create an empty bundle directory. Raises if it exists."""
@@ -526,12 +598,65 @@ class CertManager():
         """Write content into bundle/{filename}. Creates bundle dir if
         missing. Validates PEM. Sets correct mode (0600 for key, 0644
         for cert/ca)."""
-        self._validate_filename(filename)
-        self._validate_pem(filename, content)
+        self.save_files(name, [(filename, content)])
+
+    def save_files(self, name, items):
+        """Write several files into a bundle, validating them as a set.
+
+        `items` is a sequence of (filename, content) pairs. Rotating a
+        certificate means replacing cert.pem and key.pem together, and
+        checking each one on its own against what is still on disk would
+        reject whichever half arrived first — so the pair is resolved
+        across this call before anything is written.
+
+        Not atomic across files: each file lands atomically, but a
+        failure partway leaves the earlier ones written.
+        """
+        items = list(items)
+        for filename, content in items:
+            self._validate_filename(filename)
+            self._validate_pem(filename, content)
+        self._check_pair(name, dict(items))
         self._ensure_certs_dir()
         path = self._bundle_path(name)
         if not _os.path.isdir(path):
             _os.makedirs(path, mode=_DIR_MODE)
+        for filename, content in items:
+            self._write_file(path, name, filename, content)
+
+    def _check_pair(self, name, pending):
+        """Reject a cert.pem/key.pem combination that does not match.
+
+        Each half is taken from this upload if present, otherwise from
+        the bundle on disk. Without the check the mismatch only surfaces
+        as an OpenSSL error at the next TLS handshake — long after the
+        upload reported success, on a server that may not be restarted
+        for weeks.
+        """
+        if not ({'cert.pem', 'key.pem'} & set(pending)):
+            return
+        halves = {}
+        for filename in ('cert.pem', 'key.pem'):
+            if filename in pending:
+                halves[filename] = pending[filename]
+                continue
+            fpath = _os.path.join(self._bundle_path(name), filename)
+            if not _os.path.isfile(fpath):
+                return
+            try:
+                with open(fpath, 'rb') as file:
+                    halves[filename] = file.read()
+            except OSError:
+                return
+        if cert_key_match(halves['cert.pem'], halves['key.pem']) is False:
+            uploaded = ' and '.join(sorted(set(pending) & set(halves)))
+            raise CertManagerError(
+                f"{uploaded} does not match the cert/key pair in bundle "
+                f"'{name}' — upload cert.pem and key.pem together, or "
+                "delete the other half first")
+
+    def _write_file(self, path, name, filename, content):
+        """Atomically write one validated file into the bundle dir."""
         fpath = _os.path.join(path, filename)
         # Normalize content: ensure trailing newline.
         text = content.strip() + '\n'

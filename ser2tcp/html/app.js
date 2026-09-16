@@ -438,6 +438,8 @@ const routes = [
   [/^\/certificates\/([^/]+)$/,    m => showCertEditor(decodeURIComponent(m[1]))],
   [/^\/certificates\/([^/]+)\/paste\/(cert\.pem|key\.pem|ca\.pem)$/,
     m => _showPasteCertModal(decodeURIComponent(m[1]), m[2])],
+  [/^\/certificates\/([^/]+)\/replace$/,
+    m => _showReplacePairModal(decodeURIComponent(m[1]))],
   [/^\/login$/,                    () => showLogin()],
 ];
 
@@ -2200,6 +2202,9 @@ function renderCertCard(bundle) {
   const isCaOnly = !hasCert && !hasKey && hasCa;
   let cls = 'card card-online';
   if (!isServerComplete && !isCaOnly) cls = 'card card-warning';
+  // A complete-looking bundle whose key belongs to another cert fails
+  // only at handshake time — flag it here instead.
+  if (bundle.key_match === false) cls = 'card card-warning';
   const card = el('div', { class: cls });
   const headerRow = el('div', { class: 'card-header-row' },
     el('span', { class: 'card-title' }, bundle.name));
@@ -2228,6 +2233,11 @@ function renderCertCard(bundle) {
       el('span', color ? { style: 'color:' + color } : {}, label));
     meta.appendChild(row);
   });
+  if (bundle.key_match === false) {
+    meta.appendChild(el('div', { class: 'card-meta-row' },
+      el('span', { class: 'card-meta-label' }, 'pair'),
+      el('span', { style: 'color:var(--error)' }, 'cert/key mismatch')));
+  }
   card.appendChild(meta);
   return card;
 }
@@ -2293,21 +2303,115 @@ function _showBundleEditor(info) {
     class: 'card-subtitle', style: 'margin-bottom:12px;word-break:break-all',
   }, 'Path: ' + info.path));
 
+  const usedBy = info.used_by || [];
+  if (usedBy.length) {
+    body.appendChild(el('div', {
+      class: 'card-subtitle', style: 'margin-bottom:12px',
+    }, 'In use by ' + usedBy.length + ' server(s). After replacing the '
+       + 'certificate, use Reload so running servers pick it up.'));
+  }
+
+  if (info.key_match === false) {
+    body.appendChild(el('div', {
+      class: 'card-subtitle',
+      style: 'margin-bottom:12px;color:var(--error)',
+    }, 'cert.pem and key.pem do not match — TLS handshakes will fail. '
+       + 'Use "Replace cert + key" to upload a matching pair.'));
+  }
+
+  body.appendChild(el('div', { style: 'margin-bottom:16px' },
+    btn('Replace cert + key', 'btn-small btn-accent',
+      () => navigate('/certificates/' + encodeURIComponent(info.name)
+        + '/replace'))));
+
   CERT_FILES.forEach(fname => {
     body.appendChild(_renderCertFileRow(info.name, fname, info.files[fname]));
   });
 
+  const footer = [
+    btn('Delete bundle', 'btn-danger',
+      () => confirmDeleteCertBundle(info.name)),
+    el('span', { class: 'footer-spacer' }),
+  ];
+  if (usedBy.length) {
+    footer.push(btn('Reload', 'btn-accent',
+      () => _reloadCertBundle(info.name)));
+  }
+  footer.push(btn('Close', '', () => backToList()));
+
+  openModal({ title: 'Bundle: ' + info.name, body, wide: true, footer });
+}
+
+function _reloadCertBundle(name) {
+  api('POST', '/api/certs/' + encodeURIComponent(name) + '/reload')
+    .then(res => {
+      const servers = res.reloaded || [];
+      alert(servers.length
+        ? 'New certificate is live on:\n' + servers.join('\n')
+        : 'No running server uses this bundle — nothing to reload.');
+    })
+    .catch(e => { if (e !== 'unauthorized') alert(String(e)); });
+}
+
+// A PEM textarea with a "load from file" button next to it.
+function _pemField(label, placeholder) {
+  const ta = el('textarea', {
+    rows: '8', style: 'width:100%;font-family:monospace;font-size:12px',
+    placeholder,
+  });
+  const fileInput = el('input', {
+    type: 'file', accept: '.pem,.crt,.key,.cer,application/x-pem-file',
+  });
+  fileInput.style.display = 'none';
+  fileInput.onchange = () => {
+    const f = fileInput.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => { ta.value = reader.result; };
+    reader.readAsText(f);
+  };
+  const group = formGroup(label, ta);
+  group.appendChild(fileInput);
+  group.appendChild(btn('Load from file', 'btn-small',
+    () => fileInput.click()));
+  return { group, ta };
+}
+
+function _showReplacePairModal(bundleName) {
+  if (!isAdmin) { navigate('/certificates'); return; }
+  const certField = _pemField(
+    'cert.pem', '-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----');
+  const keyField = _pemField(
+    'key.pem', '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----');
   openModal({
-    title: 'Bundle: ' + info.name,
-    body,
+    title: 'Replace cert + key (' + bundleName + ')',
+    body: el('div', {},
+      el('div', { class: 'card-subtitle', style: 'margin-bottom:12px' },
+        'Sent and validated as a pair. Uploading them one at a time is '
+        + 'rejected while the other half still belongs to a different '
+        + 'certificate.'),
+      certField.group, keyField.group),
     wide: true,
     footer: [
-      btn('Delete bundle', 'btn-danger',
-        () => confirmDeleteCertBundle(info.name)),
-      el('span', { class: 'footer-spacer' }),
-      btn('Close', '', () => backToList()),
+      btn('Cancel', '', () => backToList()),
+      btn('Save both', 'btn-primary', () => {
+        const cert = certField.ta.value.trim();
+        const key = keyField.ta.value.trim();
+        if (!cert || !key) {
+          return modalError('Both cert.pem and key.pem are required');
+        }
+        api('POST', '/api/certs/' + encodeURIComponent(bundleName) + '/files',
+            { files: [
+              { filename: 'cert.pem', content: cert },
+              { filename: 'key.pem', content: key },
+            ] })
+          .then(() => navigate(
+            '/certificates/' + encodeURIComponent(bundleName)))
+          .catch(e => modalError(String(e)));
+      }),
     ],
   });
+  certField.ta.focus();
 }
 
 // Map a not_after epoch (seconds) to an expiry status: returns

@@ -103,6 +103,19 @@ class Server():
         except _cert_manager.CertManagerError as err:
             raise ConfigError(str(err)) from err
 
+    def reload_ssl_context(self):
+        """Re-read the bundle into this server's existing SSLContext.
+
+        Clients connecting from now on are served the new certificate;
+        the ones already connected keep the session they negotiated.
+        Returns False for a non-SSL server, which has nothing to reload.
+        """
+        if self._ssl_context is None:
+            return False
+        _cert_manager.reload_ssl_context(
+            self._ssl_context, self._config.get('ssl', {}), self._certs_dir)
+        return True
+
     @property
     def protocol(self):
         """Return protocol name"""

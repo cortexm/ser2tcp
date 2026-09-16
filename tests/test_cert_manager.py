@@ -7,8 +7,9 @@ import unittest
 
 from ser2tcp.cert_manager import (
     CertManager, CertManagerError,
-    resolve_bundle_paths, build_ssl_context, inspect_certificate,
-    generate_certificate, generate_private_key, _parse_signer)
+    resolve_bundle_paths, build_ssl_context, reload_ssl_context,
+    inspect_certificate, cert_key_match, load_cert_and_key,
+    generate_certificate, generate_private_key, parse_signer)
 
 
 # Minimal valid PEM blocks for testing — content is not parsed
@@ -340,6 +341,10 @@ def _generate_test_cert(
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     import datetime, ipaddress
+
+    def _now():
+        return datetime.datetime.now(datetime.timezone.utc)
+
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, common_name),
@@ -349,9 +354,8 @@ def _generate_test_cert(
         .issuer_name(issuer)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow()
-            + datetime.timedelta(days=days)))
+        .not_valid_before(_now())
+        .not_valid_after(_now() + datetime.timedelta(days=days)))
     if is_ca:
         builder = builder.add_extension(
             x509.BasicConstraints(ca=True, path_length=None), critical=True)
@@ -550,7 +554,7 @@ class TestGenerateCertificate(unittest.TestCase):
     def test_signed_by_ca(self):
         ca_cert_pem, ca_key_pem = generate_certificate(
             cn='myca', is_ca=True, days=365)
-        signer = _parse_signer(ca_cert_pem, ca_key_pem)
+        signer = parse_signer(ca_cert_pem, ca_key_pem)
         srv_cert_pem, _ = generate_certificate(
             cn='myserver', days=30, signer=signer,
             san_dns=['localhost'])
@@ -563,7 +567,7 @@ class TestGenerateCertificate(unittest.TestCase):
     def test_client_cert(self):
         ca_cert_pem, ca_key_pem = generate_certificate(
             cn='myca', is_ca=True, days=365)
-        signer = _parse_signer(ca_cert_pem, ca_key_pem)
+        signer = parse_signer(ca_cert_pem, ca_key_pem)
         client_cert_pem, _ = generate_certificate(
             cn='alice', signer=signer, is_client=True, days=30)
         # We can't easily inspect EKU through inspect_certificate, but
@@ -643,7 +647,7 @@ class TestGenerateCertificate(unittest.TestCase):
         # chain should still work.
         ca_cert, ca_key = generate_certificate(
             cn='ed-ca', is_ca=True, days=365, key_type='ed25519')
-        signer = _parse_signer(ca_cert, ca_key)
+        signer = parse_signer(ca_cert, ca_key)
         srv_cert, _ = generate_certificate(
             cn='srv', signer=signer, key_type='rsa2048', days=30)
         info = inspect_certificate(srv_cert)
@@ -655,7 +659,7 @@ class TestParseSigner(unittest.TestCase):
         cert_pem, key_pem = generate_certificate(cn='srv', days=30)
         # Not a CA — should reject
         with self.assertRaises(CertManagerError) as cm:
-            _parse_signer(cert_pem, key_pem)
+            parse_signer(cert_pem, key_pem)
         self.assertIn('not a CA', str(cm.exception))
 
     def test_mismatched_key(self):
@@ -663,12 +667,171 @@ class TestParseSigner(unittest.TestCase):
         # Generate a *different* key
         _, other_key = generate_certificate(cn='other', is_ca=True, days=30)
         with self.assertRaises(CertManagerError) as cm:
-            _parse_signer(cert_pem, other_key)
+            parse_signer(cert_pem, other_key)
         self.assertIn('do not match', str(cm.exception))
 
     def test_invalid_cert(self):
         with self.assertRaises(CertManagerError):
-            _parse_signer('not pem', 'not pem')
+            parse_signer('not pem', 'not pem')
+
+
+class TestCertKeyMatch(unittest.TestCase):
+    def test_matching_pair(self):
+        cert, key = generate_certificate('a', key_type='ec_p256')
+        self.assertTrue(cert_key_match(cert, key))
+
+    def test_mismatched_pair(self):
+        cert, _ = generate_certificate('a', key_type='ec_p256')
+        _, other_key = generate_certificate('b', key_type='ec_p256')
+        self.assertFalse(cert_key_match(cert, other_key))
+
+    def test_accepts_bytes(self):
+        cert, key = generate_certificate('a', key_type='ec_p256')
+        self.assertTrue(cert_key_match(cert.encode(), key.encode()))
+
+    def test_unparseable_is_none_not_mismatch(self):
+        cert, _ = generate_certificate('a', key_type='ec_p256')
+        self.assertIsNone(cert_key_match(cert, KEY_PEM))
+        self.assertIsNone(cert_key_match(CERT_PEM, KEY_PEM))
+
+    def test_encrypted_key_is_none(self):
+        from cryptography.hazmat.primitives import serialization
+        key_obj = generate_private_key('ec_p256')
+        encrypted = key_obj.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(
+                b'secret')).decode()
+        cert, _ = generate_certificate('a', key_type='ec_p256')
+        self.assertIsNone(cert_key_match(cert, encrypted))
+
+
+class TestLoadCertAndKey(unittest.TestCase):
+    def test_returns_objects(self):
+        cert_pem, key_pem = generate_certificate('a', key_type='ec_p256')
+        cert, key = load_cert_and_key(cert_pem, key_pem)
+        self.assertIsNotNone(cert.subject)
+        self.assertIsNotNone(key.public_key())
+
+    def test_mismatch_rejected(self):
+        cert_pem, _ = generate_certificate('a', key_type='ec_p256')
+        _, other_key = generate_certificate('b', key_type='ec_p256')
+        with self.assertRaises(CertManagerError) as err:
+            load_cert_and_key(cert_pem, other_key)
+        self.assertIn('do not match', str(err.exception))
+
+    def test_label_used_in_message(self):
+        with self.assertRaises(CertManagerError) as err:
+            load_cert_and_key('nope', 'nope', 'Signer')
+        self.assertIn('Signer cert is invalid', str(err.exception))
+
+
+class TestSaveFilesPairValidation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = CertManager(self.tmp)
+        self.cert, self.key = generate_certificate('a', key_type='ec_p256')
+        self.other_cert, self.other_key = generate_certificate(
+            'b', key_type='ec_p256')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_pair_saved_together(self):
+        self.mgr.save_files('b1', [
+            ('cert.pem', self.cert), ('key.pem', self.key)])
+        self.assertTrue(self.mgr.get_bundle('b1')['key_match'])
+
+    def test_mismatched_pair_rejected_together(self):
+        with self.assertRaises(CertManagerError) as err:
+            self.mgr.save_files('b1', [
+                ('cert.pem', self.cert), ('key.pem', self.other_key)])
+        self.assertIn('does not match', str(err.exception))
+
+    def test_mismatched_half_rejected_against_disk(self):
+        self.mgr.save_files('b1', [
+            ('cert.pem', self.cert), ('key.pem', self.key)])
+        with self.assertRaises(CertManagerError):
+            self.mgr.save_file('b1', 'key.pem', self.other_key)
+        # the rejected upload left the bundle as it was
+        self.assertTrue(self.mgr.get_bundle('b1')['key_match'])
+
+    def test_rotation_replaces_both_at_once(self):
+        self.mgr.save_files('b1', [
+            ('cert.pem', self.cert), ('key.pem', self.key)])
+        self.mgr.save_files('b1', [
+            ('cert.pem', self.other_cert), ('key.pem', self.other_key)])
+        bundle = self.mgr.get_bundle('b1')
+        self.assertTrue(bundle['key_match'])
+        self.assertEqual(
+            bundle['files']['cert.pem']['cert_info']['subject_cn'], 'b')
+
+    def test_first_half_alone_is_allowed(self):
+        self.mgr.save_file('b1', 'cert.pem', self.cert)
+        self.assertIsNone(self.mgr.get_bundle('b1')['key_match'])
+        self.mgr.save_file('b1', 'key.pem', self.key)
+        self.assertTrue(self.mgr.get_bundle('b1')['key_match'])
+
+    def test_ca_pem_is_not_pair_checked(self):
+        self.mgr.save_files('b1', [
+            ('cert.pem', self.cert), ('key.pem', self.key)])
+        self.mgr.save_file('b1', 'ca.pem', self.other_cert)
+        self.assertTrue(self.mgr.get_bundle('b1')['key_match'])
+
+    def test_key_match_none_when_half_missing(self):
+        self.mgr.create_bundle('empty')
+        self.assertIsNone(self.mgr.get_bundle('empty')['key_match'])
+
+    def test_bad_filename_in_set_rejects_everything(self):
+        with self.assertRaises(CertManagerError):
+            self.mgr.save_files('b1', [
+                ('cert.pem', self.cert), ('evil.pem', self.key)])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, 'certs', 'b1', 'cert.pem')))
+
+
+class TestReloadSslContext(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = CertManager(self.tmp)
+        self.certs_dir = os.path.join(self.tmp, 'certs')
+        cert, key = generate_certificate(
+            'before', key_type='ec_p256', days=30)
+        self.mgr.save_files(
+            'web', [('cert.pem', cert), ('key.pem', key)])
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_reload_picks_up_new_files(self):
+        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        cert, key = generate_certificate(
+            'after', key_type='ec_p256', days=30)
+        self.mgr.save_files(
+            'web', [('cert.pem', cert), ('key.pem', key)])
+        reload_ssl_context(ctx, {'bundle': 'web'}, self.certs_dir)
+        loaded = ctx.get_ca_certs()  # empty, but the call must not raise
+        self.assertEqual(loaded, [])
+
+    def test_reload_missing_bundle_raises(self):
+        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        with self.assertRaises(CertManagerError):
+            reload_ssl_context(ctx, {'bundle': 'gone'}, self.certs_dir)
+
+    def test_reload_after_cert_deleted_raises(self):
+        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        self.mgr.delete_file('web', 'cert.pem')
+        with self.assertRaises(CertManagerError):
+            reload_ssl_context(ctx, {'bundle': 'web'}, self.certs_dir)
+
+    def test_reload_mtls_requires_ca(self):
+        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        with self.assertRaises(CertManagerError):
+            reload_ssl_context(
+                ctx, {'bundle': 'web', 'require_client_cert': True},
+                self.certs_dir)
 
 
 if __name__ == '__main__':

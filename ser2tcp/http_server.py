@@ -74,7 +74,8 @@ class HttpServerWrapper():
         self._cert_manager = _cert_manager.CertManager(cfg_dir, log=self._log)
         self._ws_clients = {}  # uhttp client -> ServerWebSocket or ServerMonitor
         self._monitor_servers = {}  # port name -> ServerMonitor
-        self._servers = []  # list of (HttpServer, IpFilter or None)
+        # (HttpServer, IpFilter or None, config, SSLContext or None)
+        self._servers = []
         self._pending_reload = False
         # NDJSON status streaming clients.
         # Each entry: {client, last_ports, admin, last_send}
@@ -86,37 +87,18 @@ class HttpServerWrapper():
         self._detect_cache = []
         self._detect_cache_at = 0.0
         for config in configs:
-            address = config.get('address', '0.0.0.0')
-            port = config.get('port', 8080)
-            ssl_context = None
-            if 'ssl' in config:
-                try:
-                    ssl_context = _cert_manager.build_ssl_context(
-                        config['ssl'], self._cert_manager.certs_dir)
-                except _cert_manager.CertManagerError as err:
-                    self._log.error(
-                        "HTTPS server %s:%d: %s, skipping",
-                        address, port, err)
-                    continue
-                self._log.info(
-                    "HTTPS server: %s:%d", address, port)
-            else:
-                self._log.info(
-                    "HTTP server: %s:%d", address, port)
-            ip_flt = _ip_filter.create_filter(config, log=self._log)
             try:
-                server = _uhttp_server.HttpServer(
-                    address=address, port=port, ssl_context=ssl_context,
-                    event_mode=True)
-            except OSError as err:
-                self._log.error(
-                    "HTTP server %s:%d: failed to bind: %s, skipping",
-                    address, port, err.strerror or err)
-                continue
-            self._servers.append((server, ip_flt))
+                self._servers.append(self._create_http_server(config))
+            except ValueError as err:
+                self._log.error("%s, skipping", err)
 
     def _create_http_server(self, config):
-        """Create a single HTTP server from config, return (server, ip_flt) or None"""
+        """Create one HTTP server from config.
+
+        Returns (server, ip_filter, config, ssl_context). The config and
+        the context are kept alongside the server so a cert bundle can
+        later be reloaded into it without rebuilding the socket.
+        """
         address = config.get('address', '0.0.0.0')
         port = config.get('port', 8080)
         ssl_context = None
@@ -138,7 +120,7 @@ class HttpServerWrapper():
             raise ValueError(
                 f"HTTP {address}:{port}: failed to bind: "
                 f"{err.strerror or err}") from err
-        return (server, ip_flt)
+        return (server, ip_flt, config, ssl_context)
 
     def add_http_server(self, config):
         """Add a new HTTP server dynamically"""
@@ -150,14 +132,14 @@ class HttpServerWrapper():
         """Remove HTTP server by index"""
         if index < 0 or index >= len(self._servers):
             raise ValueError("Invalid server index")
-        server, _ = self._servers[index]
+        server = self._servers[index][0]
         server.close()
         del self._servers[index]
 
     def reload_http_servers(self):
         """Reload all HTTP servers from current configuration"""
         # Close all existing servers
-        for server, _ in self._servers:
+        for server, *_ in self._servers:
             server.close()
         self._servers.clear()
         # Create new servers from config
@@ -178,14 +160,14 @@ class HttpServerWrapper():
     def read_sockets(self):
         """Return sockets for reading"""
         sockets = []
-        for server, _ in self._servers:
+        for server, *_ in self._servers:
             sockets.extend(server.read_sockets)
         return sockets
 
     def write_sockets(self):
         """Return sockets for writing"""
         sockets = []
-        for server, _ in self._servers:
+        for server, *_ in self._servers:
             sockets.extend(server.write_sockets)
         return sockets
 
@@ -199,7 +181,7 @@ class HttpServerWrapper():
 
     def _process_uhttp(self, read_sockets, write_sockets):
         """Process uhttp events"""
-        for server, ip_flt in self._servers:
+        for server, ip_flt, *_ in self._servers:
             client = server.process_events(read_sockets, write_sockets)
             if client:
                 # Check IP filter for new requests
@@ -249,7 +231,7 @@ class HttpServerWrapper():
 
     def close(self):
         """Close all HTTP servers"""
-        for server, _ in self._servers:
+        for server, *_ in self._servers:
             server.close()
 
     def _get_ws_endpoints(self):
@@ -1530,8 +1512,7 @@ class HttpServerWrapper():
             old.get('ssl') != srv.get('ssl'))
         if needs_restart and index < len(self._servers):
             # Restart only this server
-            server, _ = self._servers[index]
-            server.close()
+            self._servers[index][0].close()
             try:
                 self._servers[index] = self._create_http_server(srv)
             except ValueError as e:
@@ -1553,8 +1534,7 @@ class HttpServerWrapper():
             return
         # Close server before removing from config
         if index < len(self._servers):
-            server, _ = self._servers[index]
-            server.close()
+            self._servers[index][0].close()
             del self._servers[index]
         del http_list[index]
         self._save_config()
@@ -1666,6 +1646,13 @@ class HttpServerWrapper():
             else:
                 self._error(client, 'Method not allowed', 405)
             return
+        # /api/certs/<bundle>/reload
+        if len(parts) == 2 and parts[1] == 'reload':
+            if client.method == 'POST':
+                self._handle_api_certs_reload(client, user, bundle)
+            else:
+                self._error(client, 'Method not allowed', 405)
+            return
         # /api/certs/<bundle>/generate
         if len(parts) == 2 and parts[1] == 'generate':
             if client.method == 'POST':
@@ -1703,16 +1690,40 @@ class HttpServerWrapper():
         client.respond({'ok': True})
 
     def _handle_api_certs_save_file(self, client, user, bundle):
+        """Upload one file ({filename, content}) or a set of them
+        ({files: [{filename, content}, ...]}).
+
+        Replacing a certificate means replacing cert.pem and key.pem
+        together — sent one at a time they would be rejected as a
+        mismatched pair, so the set form exists to send both at once.
+        """
         if not self._require_admin(client, user):
             return
         data = client.data
-        if not isinstance(data, dict) \
-                or 'filename' not in data or 'content' not in data:
-            self._error(client, 'filename and content required', 400)
+        if not isinstance(data, dict):
+            self._error(client, 'Expected JSON object', 400)
+            return
+        if isinstance(data.get('files'), list):
+            entries = data['files']
+        elif 'filename' in data and 'content' in data:
+            entries = [data]
+        else:
+            self._error(
+                client, 'filename and content (or files) required', 400)
+            return
+        items = []
+        for entry in entries:
+            if not isinstance(entry, dict) \
+                    or 'filename' not in entry or 'content' not in entry:
+                self._error(
+                    client, 'each file needs filename and content', 400)
+                return
+            items.append((entry['filename'], entry['content']))
+        if not items:
+            self._error(client, 'No files given', 400)
             return
         try:
-            self._cert_manager.save_file(
-                bundle, data['filename'], data['content'])
+            self._cert_manager.save_files(bundle, items)
         except _cert_manager.CertManagerError as err:
             self._error(client, str(err), 400)
             return
@@ -1772,7 +1783,7 @@ class HttpServerWrapper():
         with open(key_path, 'r', encoding='utf-8') as f:
             key_pem = f.read()
         try:
-            return _cert_manager._parse_signer(cert_pem, key_pem), cert_pem
+            return _cert_manager.parse_signer(cert_pem, key_pem), cert_pem
         except _cert_manager.CertManagerError as err:
             raise ValueError(str(err)) from err
 
@@ -1828,12 +1839,12 @@ class HttpServerWrapper():
         except _cert_manager.CertManagerError as err:
             self._error(client, str(err), 400)
             return
+        files = [('cert.pem', cert_pem), ('key.pem', key_pem)]
+        # Copy signer's cert into ca.pem for one-step mTLS setup
+        if mode == 'signed_by' and signer_cert_pem:
+            files.append(('ca.pem', signer_cert_pem))
         try:
-            self._cert_manager.save_file(bundle, 'cert.pem', cert_pem)
-            self._cert_manager.save_file(bundle, 'key.pem', key_pem)
-            # Copy signer's cert into ca.pem for one-step mTLS setup
-            if mode == 'signed_by' and signer_cert_pem:
-                self._cert_manager.save_file(bundle, 'ca.pem', signer_cert_pem)
+            self._cert_manager.save_files(bundle, files)
         except _cert_manager.CertManagerError as err:
             self._error(client, str(err), 400)
             return
@@ -1877,6 +1888,69 @@ class HttpServerWrapper():
             'key_pem': key_pem,
             'ca_pem': signer_cert_pem,
         })
+
+    def _reload_bundle_contexts(self, bundle_name):
+        """Re-read bundle_name into every live SSLContext that uses it.
+
+        Returns (reloaded, errors): labels of the servers that picked up
+        the new files, and user-facing messages for those that refused.
+        A server whose reload fails keeps serving its previous cert —
+        load_cert_chain() raises before installing anything.
+        """
+        reloaded = []
+        errors = []
+        for proxy in self._serial_proxies:
+            for srv in proxy.servers:
+                ssl_cfg = srv.config.get('ssl') or {}
+                if srv.protocol != 'SSL' \
+                        or ssl_cfg.get('bundle') != bundle_name:
+                    continue
+                label = "port %s:%s" % (
+                    srv.config.get('address'), srv.config.get('port'))
+                try:
+                    srv.reload_ssl_context()
+                except _cert_manager.CertManagerError as err:
+                    errors.append(f"{label}: {err}")
+                else:
+                    reloaded.append(label)
+        for _server, _flt, cfg, ctx in self._servers:
+            ssl_cfg = cfg.get('ssl') or {}
+            if ctx is None or ssl_cfg.get('bundle') != bundle_name:
+                continue
+            label = "http %s:%s" % (
+                cfg.get('address', '0.0.0.0'), cfg.get('port'))
+            try:
+                _cert_manager.reload_ssl_context(
+                    ctx, ssl_cfg, self._cert_manager.certs_dir)
+            except _cert_manager.CertManagerError as err:
+                errors.append(f"{label}: {err}")
+            else:
+                reloaded.append(label)
+        return reloaded, errors
+
+    def _handle_api_certs_reload(self, client, user, bundle):
+        """Re-read a bundle into the SSLContext of every server using it.
+
+        This is what makes a renewed certificate (Let's Encrypt deploy
+        hook, re-upload, generate) take effect without a restart: new
+        handshakes get the new cert, established connections are left
+        alone. A CA removed from ca.pem still needs a restart — see
+        cert_manager.reload_ssl_context().
+        """
+        if not self._require_admin(client, user):
+            return
+        try:
+            self._cert_manager.get_bundle(bundle)
+        except _cert_manager.CertManagerError as err:
+            self._error(client, str(err), 404)
+            return
+        reloaded, errors = self._reload_bundle_contexts(bundle)
+        if errors:
+            self._error(client, '; '.join(errors), 400)
+            return
+        self._log.info(
+            "Bundle '%s' reloaded into %d server(s)", bundle, len(reloaded))
+        client.respond({'ok': True, 'reloaded': reloaded})
 
     def _handle_api_certs_download_file(self, client, bundle, filename):
         try:

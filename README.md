@@ -287,6 +287,9 @@ certificate bundles without shell access. A bundle is a directory under
 - Bundle names: letters, digits, dot, underscore, dash (no leading dot)
 - Directory mode `0700`, key file `0600`
 - PEM format validated on upload (BEGIN/END markers must match the file type)
+- `cert.pem` and `key.pem` are checked against each other on upload — a key
+  that belongs to a different certificate is rejected instead of failing
+  later at the TLS handshake
 - `key.pem` is never downloadable via API — only filesystem access
 - Bundles are referenced from SSL config via `"bundle": "<name>"` (both
   port SSL servers and HTTPS servers); a bundle cannot be deleted while
@@ -299,6 +302,10 @@ certificate bundles without shell access. A bundle is a directory under
 - Drag-and-drop PEM file onto the file row
 - Download public files (cert.pem / ca.pem)
 - Delete individual files within a bundle
+- **Replace cert + key** — upload both halves as one set (see *Renewing a
+  certificate* below)
+- **Reload** — apply a renewed certificate to running servers without a
+  restart
 - **Generate certificates** — self-signed server, CA, server signed by CA, client cert
   (downloads cert+key+ca for installation on the mTLS client; private key is
   not stored on the server)
@@ -311,6 +318,50 @@ SHA-256 fingerprint, and a "CA" badge for CA bundles.
 > The built-in generator is intended for testing and internal use (lab,
 > embedded, industrial LAN). For production PKI use a dedicated tool
 > like smallstep, HashiCorp Vault, AWS ACM, or your existing infrastructure.
+
+#### Renewing a certificate
+
+A running server holds the certificate it loaded at startup, so replacing
+the files on disk is only half the job:
+
+1. Put the new pair in the bundle. Because the two files are validated
+   against each other, send them together — in the UI use **Replace cert +
+   key**, over the API use the set form:
+
+   ```bash
+   curl -X POST http://localhost:8080/api/certs/main/files \
+       -H 'Authorization: Bearer <token>' \
+       -H 'Content-Type: application/json' \
+       -d '{"files": [
+             {"filename": "cert.pem", "content": "-----BEGIN CERTIFICATE..."},
+             {"filename": "key.pem",  "content": "-----BEGIN PRIVATE KEY..."}
+           ]}'
+   ```
+
+   (The single-file form `{"filename": ..., "content": ...}` still works for
+   `ca.pem`, or for the first half of an empty bundle.)
+
+2. Tell the running servers to pick it up:
+
+   ```bash
+   curl -X POST http://localhost:8080/api/certs/main/reload \
+       -H 'Authorization: Bearer <token>'
+   ```
+
+   Every server using that bundle — HTTPS servers and port SSL servers
+   alike — re-reads the files into its existing `SSLContext`. Connections
+   in flight keep the certificate they negotiated with; every handshake
+   from that moment on uses the new one. The response lists the servers
+   that were reloaded.
+
+`generate` refuses to overwrite an existing `cert.pem`, so regenerating
+into a bundle in use means deleting `cert.pem` first, then generating,
+then reloading.
+
+> **CA changes still need a restart.** OpenSSL can add certificates to a
+> context's trust store but not remove them, so a CA *added* to `ca.pem`
+> takes effect on reload while one *removed* from it stays trusted until
+> the process restarts.
 
 **Let's Encrypt** — point a bundle at LE's `live/` directory using
 symlinks (no native LE handling in code):
@@ -327,6 +378,16 @@ Note: `privkey.pem` in `/etc/letsencrypt/live/` is owned by `root:root`
 with mode `0600`, so ser2tcp needs to either run as root or use an LE
 `--deploy-hook` to copy files into the bundle dir with appropriate
 ownership/permissions on renewal.
+
+Symlinks make the renewed files visible on disk, but a running server is
+still serving the old certificate — have the deploy hook finish the job:
+
+```bash
+#!/bin/sh
+# /etc/letsencrypt/renewal-hooks/deploy/ser2tcp.sh
+curl -fsS -X POST https://localhost:8443/api/certs/elhome.sk/reload \
+    -H "Authorization: Bearer $SER2TCP_TOKEN"
+```
 
 ##### Creating self-signed certificates
 
@@ -509,7 +570,8 @@ With IP filtering:
 | POST | `/api/certs` | admin | Create empty bundle |
 | GET | `/api/certs/<bundle>` | yes | Bundle detail (files, mtime, symlink target) |
 | DELETE | `/api/certs/<bundle>` | admin | Delete bundle and all its files |
-| POST | `/api/certs/<bundle>/files` | admin | Upload/paste a file into bundle |
+| POST | `/api/certs/<bundle>/files` | admin | Upload one file, or a set via `{"files": [...]}` |
+| POST | `/api/certs/<bundle>/reload` | admin | Re-read bundle into running servers' SSL contexts |
 | GET | `/api/certs/<bundle>/files/<filename>` | yes | Download public file (cert.pem / ca.pem) |
 | DELETE | `/api/certs/<bundle>/files/<filename>` | admin | Delete single file from bundle |
 | POST | `/api/certs/<bundle>/generate` | admin | Generate cert+key into bundle (modes: self_signed / ca / signed_by) |
