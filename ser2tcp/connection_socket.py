@@ -17,14 +17,6 @@ class ConnectionSocket(_connection.Connection):
         """Return formatted address string"""
         return self._addr[0]
 
-    def close(self):
-        """Close connection"""
-        if self._socket:
-            addr = self._addr[0]
-            self._socket.close()
-            self._socket = None
-            self._log.info("Client disconnected: %s", addr)
-
     def on_received(self, data):
         """Received data from client"""
         if data:

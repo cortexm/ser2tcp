@@ -5,13 +5,15 @@ from unittest.mock import patch, MagicMock
 
 import serial
 
-from ser2tcp.serial_proxy import SerialProxy
+from ser2tcp.serial_proxy import SerialProxy, _format_signals
 
 
 def _mock_init(self, config=None, log=None):
     """Mock init that sets required attributes for __del__"""
     self._servers = []
     self._serial = None
+    self._selector = None
+    self._serial_source = None
     self._reader_thread = None
     self._reader_sock_r = None
     self._reader_sock_w = None
@@ -422,24 +424,216 @@ class TestSerialReaderThread(unittest.TestCase):
         self.assertEqual(data, b'hello')
         proxy._stop_reader_thread()
 
-    def test_read_sockets_uses_socketpair(self):
-        """read_sockets() returns socketpair when reader thread is active"""
+    def test_registers_socketpair_when_thread_active(self):
+        """The loop watches the socketpair, not the port, when a reader
+        thread is feeding it"""
         proxy = self._make_proxy()
+        proxy._selector = MagicMock()
         proxy._serial = MagicMock()
         proxy._serial.in_waiting = 0
         proxy._serial.read.side_effect = OSError("closed")
         proxy._start_reader_thread()
-        sockets = proxy.read_sockets()
-        self.assertIn(proxy._reader_sock_r, sockets)
-        self.assertNotIn(proxy._serial, sockets)
+        proxy._register_serial()
+        self.assertIs(proxy._serial_source, proxy._reader_sock_r)
+        registered = proxy._selector.register.call_args[0][0]
+        self.assertIs(registered, proxy._reader_sock_r)
+        proxy._unregister_serial()
         proxy._stop_reader_thread()
 
-    def test_read_sockets_uses_serial_directly(self):
-        """read_sockets() returns serial when no reader thread"""
+    def test_registers_serial_directly(self):
+        """Without a reader thread the port itself is watched"""
+        proxy = self._make_proxy()
+        proxy._selector = MagicMock()
+        proxy._serial = MagicMock()
+        proxy._register_serial()
+        self.assertIs(proxy._serial_source, proxy._serial)
+        proxy._selector.register.assert_called_once()
+
+    def test_register_is_idempotent(self):
+        """connect() runs per client; the source is registered once"""
+        proxy = self._make_proxy()
+        proxy._selector = MagicMock()
+        proxy._serial = MagicMock()
+        proxy._register_serial()
+        proxy._register_serial()
+        proxy._selector.register.assert_called_once()
+
+    def test_unregister_clears_source(self):
+        proxy = self._make_proxy()
+        proxy._selector = MagicMock()
+        proxy._serial = MagicMock()
+        proxy._register_serial()
+        proxy._unregister_serial()
+        self.assertIsNone(proxy._serial_source)
+        proxy._selector.unregister.assert_called_once()
+
+    def test_register_survives_a_selector_refusal(self):
+        """A port the selector cannot watch is logged, not raised"""
+        proxy = self._make_proxy()
+        proxy._selector = MagicMock()
+        proxy._selector.register.side_effect = ValueError('bad fd')
+        proxy._serial = MagicMock()
+        proxy._register_serial()
+        self.assertIsNone(proxy._serial_source)
+
+    def test_handle_event_ignores_a_stale_source(self):
+        """An event for a source already disconnected does nothing"""
         proxy = self._make_proxy()
         proxy._serial = MagicMock()
-        sockets = proxy.read_sockets()
-        self.assertIn(proxy._serial, sockets)
+        proxy._process_serial_data = MagicMock()
+        proxy.handle_event(object(), 1)
+        proxy._process_serial_data.assert_not_called()
+
+
+class TestSerialErrorsAreContained(unittest.TestCase):
+    """A device that refuses an operation must not kill the loop.
+
+    set_rts/set_dtr are driven by clients and write() by whatever they
+    send, so any of them can be aimed at a port that has no modem
+    control lines or has just been unplugged.
+    """
+
+    def _make_proxy(self):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._serial_config = {'port': '/dev/ttyUSB0'}
+        proxy._monitors = []
+        proxy._last_signals = 0
+        return proxy
+
+    def test_set_rts_survives_an_unsupported_device(self):
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        type(proxy._serial).rts = property(
+            lambda self: True,
+            lambda self, value: (_ for _ in ()).throw(
+                OSError(25, 'Inappropriate ioctl for device')))
+        proxy.set_rts(False)  # must not raise
+        proxy._log.warning.assert_called_once()
+
+    def test_set_dtr_survives_an_unsupported_device(self):
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        type(proxy._serial).dtr = property(
+            lambda self: True,
+            lambda self, value: (_ for _ in ()).throw(
+                OSError(25, 'Inappropriate ioctl for device')))
+        proxy.set_dtr(False)
+        proxy._log.warning.assert_called_once()
+
+    def test_setters_are_noops_without_a_port(self):
+        proxy = self._make_proxy()
+        proxy._serial = None
+        proxy.set_rts(True)
+        proxy.set_dtr(True)
+        proxy._log.warning.assert_not_called()
+
+    def test_write_failure_drops_clients_and_closes_the_port(self):
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        proxy._serial.write.side_effect = OSError('device gone')
+        server = MagicMock()
+        proxy._servers = [server]
+        proxy.disconnect = MagicMock()
+        proxy.send(b'data')  # must not raise
+        server.close_connections.assert_called_once()
+        proxy.disconnect.assert_called_once()
+
+    def test_successful_write_notifies_monitors(self):
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        seen = []
+        proxy._monitors = [lambda direction, data: seen.append((direction, data))]
+        proxy.send(b'data')
+        self.assertEqual(seen, [(1, b'data')])
+
+
+class TestSignalLogging(unittest.TestCase):
+    """Signal transitions have to be visible with -v.
+
+    Without this the log shows serial data but says nothing about RTS,
+    DTR or the input lines, which is exactly what you want to see when
+    a device is not responding.
+    """
+
+    def _make_proxy(self, debug=True, control=False):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._log.isEnabledFor.return_value = debug
+        proxy._serial_config = {'port': '/dev/ttyUSB0'}
+        proxy._monitors = []
+        proxy._last_signals = None
+        proxy._last_signal_poll = 0
+        proxy._signal_poll_interval = 0
+        proxy._has_control_servers = control
+        proxy._serial = MagicMock()
+        return proxy
+
+    def _debug_lines(self, proxy):
+        return [call[0][0] % call[0][1:]
+            for call in proxy._log.debug.call_args_list]
+
+    def test_format_covers_every_signal(self):
+        self.assertEqual(
+            _format_signals(0), 'RTS=0 DTR=0 CTS=0 DSR=0 RI=0 CD=0')
+        self.assertEqual(
+            _format_signals(0b111111), 'RTS=1 DTR=1 CTS=1 DSR=1 RI=1 CD=1')
+
+    def test_set_rts_is_logged(self):
+        proxy = self._make_proxy()
+        proxy.get_signals = MagicMock(return_value=1)
+        proxy.set_rts(True)
+        self.assertIn(
+            '(/dev/ttyUSB0): set RTS=1', self._debug_lines(proxy))
+
+    def test_set_dtr_is_logged(self):
+        proxy = self._make_proxy()
+        proxy.get_signals = MagicMock(return_value=2)
+        proxy.set_dtr(False)
+        self.assertIn(
+            '(/dev/ttyUSB0): set DTR=0', self._debug_lines(proxy))
+
+    def test_first_reading_is_logged_even_when_all_low(self):
+        proxy = self._make_proxy()
+        proxy.get_signals = MagicMock(return_value=0)
+        proxy.process_signals()
+        self.assertIn(
+            '(/dev/ttyUSB0): signals RTS=0 DTR=0 CTS=0 DSR=0 RI=0 CD=0 '
+            '(initial)', self._debug_lines(proxy))
+
+    def test_input_signal_change_is_logged(self):
+        """CTS moving is the case that had nothing sampling it."""
+        proxy = self._make_proxy()
+        proxy.get_signals = MagicMock(return_value=0)
+        proxy.process_signals()
+        proxy.get_signals.return_value = 1 << 2  # CTS high
+        proxy.process_signals()
+        self.assertIn(
+            '(/dev/ttyUSB0): signals RTS=0 DTR=0 CTS=1 DSR=0 RI=0 CD=0',
+            self._debug_lines(proxy))
+
+    def test_steady_signals_are_not_logged_again(self):
+        proxy = self._make_proxy()
+        proxy.get_signals = MagicMock(return_value=0b101)
+        for _ in range(5):
+            proxy.process_signals()
+        lines = [l for l in self._debug_lines(proxy) if 'signals' in l]
+        self.assertEqual(len(lines), 1)
+
+    def test_polling_is_skipped_without_debug_or_control(self):
+        """Sampling costs an ioctl per line; nobody asked for it here."""
+        proxy = self._make_proxy(debug=False, control=False)
+        proxy.get_signals = MagicMock(return_value=0)
+        proxy.process_signals()
+        proxy.get_signals.assert_not_called()
+
+    def test_control_servers_poll_without_debug(self):
+        proxy = self._make_proxy(debug=False, control=True)
+        proxy.get_signals = MagicMock(return_value=0)
+        proxy.process_signals()
+        proxy.get_signals.assert_called_once()
 
 
 if __name__ == "__main__":

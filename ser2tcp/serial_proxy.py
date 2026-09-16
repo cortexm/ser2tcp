@@ -2,6 +2,7 @@
 
 import fnmatch as _fnmatch
 import logging as _logging
+import selectors as _selectors
 import socket as _socket
 import threading as _threading
 import time as _time
@@ -12,6 +13,13 @@ import serial.tools.list_ports as _list_ports
 import ser2tcp.connection_control as _control
 import ser2tcp.server as _server
 import ser2tcp.server_websocket as _server_websocket
+
+
+def _format_signals(bitmask):
+    """Render a signal bitmask as 'RTS=1 DTR=0 CTS=1 ...' for the log."""
+    return ' '.join(
+        '%s=%d' % (name.upper(), bool(bitmask & (1 << bit)))
+        for bit, name in enumerate(_control.SIGNAL_NAMES))
 
 
 class SerialProxy():
@@ -37,17 +45,22 @@ class SerialProxy():
     MATCH_ATTRIBUTES = ('vid', 'pid', 'serial_number', 'manufacturer',
         'product', 'location', 'description', 'hwid')
 
-    def __init__(self, config, log=None, certs_dir=None):
+    def __init__(self, config, log=None, certs_dir=None, selector=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._serial = None
         self._certs_dir = certs_dir
+        self._selector = selector
+        # What the loop watches for incoming serial data: the port
+        # itself, or the socketpair a reader thread feeds for ports with
+        # no usable fileno(). None while disconnected.
+        self._serial_source = None
         self._reader_thread = None
         self._reader_sock_r = None
         self._reader_sock_w = None
         self._reader_running = False
         self._servers = []
         self._monitors = []
-        self._last_signals = 0
+        self._last_signals = None
         self._last_signal_poll = 0
         self._signal_poll_interval = 0.1
         self._has_control_servers = False
@@ -72,7 +85,8 @@ class SerialProxy():
                 self._servers.append(
                     _server.Server(
                         server_config, self, log,
-                        certs_dir=self._certs_dir))
+                        certs_dir=self._certs_dir,
+                        selector=self._selector))
         # Detect control-enabled servers and set poll interval
         for server in self._servers:
             if server.control:
@@ -223,6 +237,7 @@ class SerialProxy():
             self._log.info(
                 "Serial %s connected", self._serial_config['port'])
             self._start_reader_thread_if_needed()
+            self._register_serial()
         return True
 
     def has_connections(self):
@@ -245,7 +260,11 @@ class SerialProxy():
     def disconnect(self):
         """Disconnect serial port, but if there are no active connections"""
         if self._serial and not self.has_connections():
+            # Must come first: the selector cannot unregister a source
+            # whose fileno() has already gone away.
+            self._unregister_serial()
             self._stop_reader_thread()
+            self._last_signals = None
             self._serial.close()
             self._serial = None
             self._log.info(
@@ -259,24 +278,27 @@ class SerialProxy():
             self._servers.pop().close()
         self.disconnect()
 
-    def read_sockets(self):
-        """Return all sockets for reading"""
-        sockets = []
-        for server in self._servers:
-            sockets += server.read_sockets()
-        if self._serial:
-            if self._reader_sock_r:
-                sockets.append(self._reader_sock_r)
-            else:
-                sockets.append(self._serial)
-        return sockets
+    def _register_serial(self):
+        """Watch the open port (or its reader socketpair) for input"""
+        if self._selector is None or self._serial_source is not None:
+            return
+        source = self._reader_sock_r or self._serial
+        try:
+            self._selector.register(source, _selectors.EVENT_READ, self)
+        except (KeyError, ValueError, OSError) as err:
+            self._log.warning("Cannot watch serial port: %s", err)
+            return
+        self._serial_source = source
 
-    def write_sockets(self):
-        """Return all sockets for writing (with pending data)"""
-        sockets = []
-        for server in self._servers:
-            sockets += server.write_sockets()
-        return sockets
+    def _unregister_serial(self):
+        """Stop watching the port before it is closed"""
+        if self._serial_source is None:
+            return
+        try:
+            self._selector.unregister(self._serial_source)
+        except (KeyError, ValueError, OSError):
+            pass
+        self._serial_source = None
 
     def send_to_connections(self, data):
         """Send data to all connections"""
@@ -298,22 +320,25 @@ class SerialProxy():
                 raise OSError("Serial reader closed")
         except (OSError, _serial.SerialException) as err:
             self._log.warning(err)
-            for server in self._servers:
-                server.close_connections()
-            self.disconnect()
+            self._serial_failed()
 
-    def process_read(self, read_sockets):
-        """Process sockets with read event"""
-        for server in self._servers:
-            server.process_read(read_sockets)
-        serial_sock = self._reader_sock_r or self._serial
-        if self._serial and serial_sock in read_sockets:
-            self._process_serial_data()
+    def _serial_failed(self):
+        """Drop every client and close the port after an I/O error.
 
-    def process_write(self, write_sockets):
-        """Process sockets with write event"""
+        The clients are told by the disconnect; holding them open on a
+        port that is gone would only feed them silence.
+        """
         for server in self._servers:
-            server.process_write(write_sockets)
+            server.close_connections()
+        self.disconnect()
+
+    def handle_event(self, fileobj, mask):
+        """Owner dispatch for the serial read source"""
+        if self._serial is None or fileobj is not self._serial_source:
+            # Disconnected between the select() and this event.
+            return None
+        self._process_serial_data()
+        return None
 
     def process_stale(self):
         """Remove stale connections"""
@@ -322,16 +347,42 @@ class SerialProxy():
         self.process_signals()
 
     def set_rts(self, value):
-        """Set RTS signal and broadcast report to all clients"""
-        if self._serial:
+        """Set RTS signal and broadcast report to all clients.
+
+        Plenty of devices have no modem control lines — a pty or a CDC
+        gadget answers the ioctl with ENOTTY — and the request arrives
+        from a client, so a refusal is logged rather than raised. Left
+        unhandled it would take the whole process down.
+        """
+        if not self._serial:
+            return
+        try:
             self._serial.rts = value
-            self._broadcast_signals()
+        except (OSError, _serial.SerialException) as err:
+            self._log.warning("Cannot set RTS on %s: %s",
+                self._serial_config.get('port'), err)
+            return
+        self._log.debug(
+            "(%s): set RTS=%d", self._serial_config.get('port'), bool(value))
+        self._broadcast_signals()
 
     def set_dtr(self, value):
-        """Set DTR signal and broadcast report to all clients"""
-        if self._serial:
+        """Set DTR signal and broadcast report to all clients.
+
+        Same caveat as set_rts(): unsupported by many devices, asked for
+        by clients, so a failure is logged and dropped.
+        """
+        if not self._serial:
+            return
+        try:
             self._serial.dtr = value
-            self._broadcast_signals()
+        except (OSError, _serial.SerialException) as err:
+            self._log.warning("Cannot set DTR on %s: %s",
+                self._serial_config.get('port'), err)
+            return
+        self._log.debug(
+            "(%s): set DTR=%d", self._serial_config.get('port'), bool(value))
+        self._broadcast_signals()
 
     def get_signals(self):
         """Get current signal states as bitmask"""
@@ -358,13 +409,38 @@ class SerialProxy():
     def _broadcast_signals(self):
         """Broadcast signal report to all control-enabled servers"""
         bitmask = self.get_signals()
+        self._log_signal_change(bitmask)
         for server in self._servers:
             server.send_signal_report(bitmask)
         self._last_signals = bitmask
 
+    def _log_signal_change(self, bitmask):
+        """Debug-log a signal transition; silent when nothing moved.
+
+        Input signals are sampled every poll interval, so logging each
+        sample would bury everything else — only the edges are worth a
+        line. Call before _last_signals is updated.
+        """
+        if bitmask == self._last_signals:
+            return
+        self._log.debug(
+            "(%s): signals %s%s", self._serial_config.get('port'),
+            _format_signals(bitmask),
+            ' (initial)' if self._last_signals is None else '')
+
     def process_signals(self):
-        """Poll serial signals and broadcast changes"""
-        if not self._serial or not self._has_control_servers:
+        """Poll serial signals, broadcast changes and log transitions.
+
+        Polling normally earns its ioctls only when some server has
+        control enabled and wants the reports. Debug logging is the
+        other reason to look: without this the input signals (CTS, DSR,
+        RI, CD) never change as far as the log is concerned, because
+        nothing was sampling them.
+        """
+        if not self._serial:
+            return
+        if not self._has_control_servers \
+                and not self._log.isEnabledFor(_logging.DEBUG):
             return
         now = _time.time()
         if now - self._last_signal_poll < self._signal_poll_interval:
@@ -372,15 +448,27 @@ class SerialProxy():
         self._last_signal_poll = now
         bitmask = self.get_signals()
         if bitmask != self._last_signals:
+            self._log_signal_change(bitmask)
             self._last_signals = bitmask
-            for server in self._servers:
-                server.send_signal_report(bitmask)
+            # Sampling for the log alone stays observational: a port
+            # with no control server has nobody to report to.
+            if self._has_control_servers:
+                for server in self._servers:
+                    server.send_signal_report(bitmask)
 
     def send(self, data):
         """Send data to serial port"""
-        if self._serial:
+        if not self._serial:
+            return
+        try:
             self._serial.write(data)
-            self._notify_monitors(1, data)  # TX
+        except (OSError, _serial.SerialException) as err:
+            # A device unplugged mid-write reaches us here rather than
+            # on the read side; same response either way.
+            self._log.warning(err)
+            self._serial_failed()
+            return
+        self._notify_monitors(1, data)  # TX
 
     def add_monitor(self, callback):
         """Register monitor callback - receives (direction, data)"""

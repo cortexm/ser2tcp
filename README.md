@@ -665,7 +665,7 @@ For system service, use `sudo systemctl` instead of `systemctl --user`.
 
 - Python 3.8+
 - pyserial 3.0+
-- uhttp-server 2.3.2+ (for HTTP/API and WebSocket)
+- uhttp-server 3.0+ (for HTTP/API and WebSocket)
 
 ### Running on
 

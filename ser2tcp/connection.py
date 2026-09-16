@@ -1,6 +1,7 @@
 """Connection"""
 
 import logging as _logging
+import selectors as _selectors
 import time as _time
 
 
@@ -15,6 +16,9 @@ class Connection():
             log=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._socket, self._addr = connection
+        self._selector = None
+        self._owner = None
+        self._interest = None
         self._out_buffer = bytearray()
         self._last_write_time = _time.time()
         if send_timeout is not None:
@@ -33,9 +37,63 @@ class Connection():
         """Return reference to socket"""
         return self._socket
 
+    def attach(self, selector, owner):
+        """Register this connection's socket in the event loop.
+
+        `owner` is what the loop calls handle_event() on — the Server,
+        which is the only thing that can drop the connection when the
+        read or the flush fails.
+        """
+        if selector is None or self._socket is None:
+            return
+        self._selector = selector
+        self._owner = owner
+        self._interest = _selectors.EVENT_READ
+        selector.register(self._socket, self._interest, owner)
+
+    def update_interest(self):
+        """Arm EVENT_WRITE only while there is something to flush.
+
+        Left armed on an empty buffer the loop spins on a socket that is
+        always writable; never armed, buffered data never leaves.
+        """
+        if self._selector is None or self._socket is None:
+            return
+        want = _selectors.EVENT_READ
+        if self._out_buffer:
+            want |= _selectors.EVENT_WRITE
+        if want == self._interest:
+            return
+        try:
+            self._selector.modify(self._socket, want, self._owner)
+        except (KeyError, ValueError, OSError):
+            # Cannot be re-armed, so it would hang instead of failing.
+            self.close()
+            return
+        self._interest = want
+
+    def _unregister(self):
+        """Drop the socket from the selector before it is closed.
+
+        A closed fd left registered raises on the next select() for
+        everyone, not just this connection.
+        """
+        if self._selector is None or self._interest is None:
+            return
+        try:
+            self._selector.unregister(self._socket)
+        except (KeyError, ValueError, OSError):
+            pass
+        self._interest = None
+
+    def is_closed(self):
+        """Return True once the socket is gone"""
+        return self._socket is None
+
     def close(self):
         """Close connection"""
         if self._socket:
+            self._unregister()
             self._socket.close()
             self._socket = None
             self._log.info("Client disconnected: %s", self.address_str())

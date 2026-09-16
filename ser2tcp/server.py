@@ -4,6 +4,7 @@
 
 import logging as _logging
 import os as _os
+import selectors as _selectors
 import socket as _socket
 import ssl as _ssl
 
@@ -30,12 +31,17 @@ class Server():
         'SOCKET': _connection_socket.ConnectionSocket,
     }
 
-    def __init__(self, config, ser, log=None, certs_dir=None):
+    def __init__(
+            self, config, ser, log=None, certs_dir=None, selector=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._config = config
         self._serial = ser
         self._certs_dir = certs_dir
+        self._selector = selector
         self._connections = []
+        # Dispatch needs to get from a ready socket back to its
+        # connection; the listening socket is handled separately.
+        self._conn_by_socket = {}
         self._protocol = self._config['protocol'].upper()
         self._send_timeout = self._config.get('send_timeout')
         self._buffer_limit = self._config.get('buffer_limit')
@@ -88,6 +94,9 @@ class Server():
                     f"{self._protocol} {config['address']}:{config['port']}: "
                     f"failed to bind: {err.strerror or err}") from err
         self._socket.listen(1)
+        if self._selector is not None:
+            self._selector.register(
+                self._socket, _selectors.EVENT_READ, self)
 
     def __del__(self):
         self.close()
@@ -188,18 +197,27 @@ class Server():
             return
         if self._serial.connect():
             self._connections.append(connection)
+            self._conn_by_socket[connection.socket()] = connection
+            connection.attach(self._selector, self)
         else:
             connection.close()
 
     def close_connections(self):
         """close all clients"""
         while self._connections:
-            self._connections.pop().close()
+            con = self._connections.pop()
+            self._conn_by_socket.pop(con.socket(), None)
+            con.close()
 
     def close(self):
         """Close socket and all connections"""
         if self._socket is not None:
             self.close_connections()
+            if self._selector is not None:
+                try:
+                    self._selector.unregister(self._socket)
+                except (KeyError, ValueError, OSError):
+                    pass
             self._socket.close()
             self._socket = None
             if self._protocol == 'SOCKET':
@@ -211,59 +229,65 @@ class Server():
         """True if server has some connections"""
         return bool(self._connections)
 
-    def read_sockets(self):
-        """Return sockets for reading (server + all clients)"""
-        sockets = [self._socket]
-        for con in self._connections:
-            sockets.append(con.socket())
-        return sockets
-
-    def write_sockets(self):
-        """Return sockets for writing (clients with pending data)"""
-        sockets = []
-        for con in self._connections:
-            if con.has_pending_data():
-                sockets.append(con.socket())
-        return sockets
-
     def _remove_connection(self, con):
         """Remove connection and disconnect serial if no connections left"""
+        self._conn_by_socket.pop(con.socket(), None)
         con.close()
-        self._connections.remove(con)
+        if con in self._connections:
+            self._connections.remove(con)
         if not self._connections:
             self._serial.disconnect()
 
-    def process_read(self, read_sockets):
-        """Process sockets with read event"""
-        if self._socket in read_sockets:
-            self._client_connect()
-        for con in list(self._connections):
-            if con.socket() in read_sockets:
-                data = b''
-                try:
-                    data = con.socket().recv(4096)
-                    self._log.debug("(%s): %s", con.address_str(), data)
-                except (ConnectionResetError, _ssl.SSLError) as err:
-                    self._log.info("(%s): %s", con.address_str(), err)
-                if not data:
-                    self._remove_connection(con)
-                    continue
-                con.on_received(data)
+    def handle_event(self, fileobj, mask):
+        """Owner dispatch for one ready socket.
 
-    def process_write(self, write_sockets):
-        """Process sockets with write event, flush buffers"""
-        for con in list(self._connections):
-            if con.socket() in write_sockets:
-                result = con.flush()
-                if result is None:
-                    self._log.info(
-                        "(%s): write error", con.address_str())
-                    self._remove_connection(con)
+        Returns None: nothing here produces an object for the loop to
+        pass on, unlike uhttp whose connections carry requests.
+        """
+        if fileobj is self._socket:
+            self._client_connect()
+            return None
+        con = self._conn_by_socket.get(fileobj)
+        if con is None:
+            # Closed earlier in this same batch of events.
+            return None
+        if mask & _selectors.EVENT_WRITE and not self._flush(con):
+            return None
+        if mask & _selectors.EVENT_READ:
+            self._read(con)
+        return None
+
+    def _read(self, con):
+        """Read from a client and forward it, or drop the connection"""
+        data = b''
+        try:
+            data = con.socket().recv(4096)
+            self._log.debug("(%s): %s", con.address_str(), data)
+        except (ConnectionResetError, _ssl.SSLError) as err:
+            self._log.info("(%s): %s", con.address_str(), err)
+        if not data:
+            self._remove_connection(con)
+            return
+        # on_received may answer (a control protocol signal report), so
+        # the send buffer has to be re-checked afterwards.
+        con.on_received(data)
+        con.update_interest()
+
+    def _flush(self, con):
+        """Flush a client's buffer, return False if it was dropped"""
+        if con.flush() is None:
+            self._log.info("(%s): write error", con.address_str())
+            self._remove_connection(con)
+            return False
+        con.update_interest()
+        return True
 
     def process_stale(self):
-        """Remove stale connections (send timeout expired)"""
+        """Remove stale connections (send timeout expired, or closed)"""
         for con in list(self._connections):
-            if con.is_stale():
+            if con.is_closed():
+                self._remove_connection(con)
+            elif con.is_stale():
                 self._log.info(
                     "(%s): send timeout", con.address_str())
                 self._remove_connection(con)
@@ -274,6 +298,7 @@ class Server():
             return
         for con in self._connections:
             con.send(data)
+            con.update_interest()
 
     def send_signal_report(self, bitmask):
         """Send signal report to all control-enabled connections"""
@@ -281,3 +306,4 @@ class Server():
             return
         for con in self._connections:
             con.send_signal_report(bitmask)
+            con.update_interest()

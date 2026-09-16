@@ -153,21 +153,9 @@ class ServerWebSocket():
         if 'dtr' in data and self._ctl_dtr:
             self._serial.set_dtr(bool(data['dtr']))
 
-    # Socket interface - no-ops, uhttp owns these sockets
-
-    def read_sockets(self):
-        """Return empty list - uhttp manages WS sockets"""
-        return []
-
-    def write_sockets(self):
-        """Return empty list - uhttp manages WS buffering"""
-        return []
-
-    def process_read(self, read_sockets):
-        """No-op - uhttp handles WS reads"""
-
-    def process_write(self, write_sockets):
-        """No-op - uhttp handles WS writes"""
+    # uhttp owns these sockets: it registers them in the shared
+    # selector and drives their reads and writes. Nothing to do here
+    # but reap the ones it has closed.
 
     def process_stale(self):
         """Remove closed connections"""

@@ -43,10 +43,15 @@ class HttpServerWrapper():
 
     def __init__(self, configs, serial_proxies, log=None,
             config_path=None, configuration=None,
-            server_manager=None):
+            server_manager=None, selector=None):
         self._log = log if log else _logging.getLogger(__name__)
         self._serial_proxies = serial_proxies
         self._server_manager = server_manager
+        # uhttp registers its listening and client sockets here itself;
+        # we only hand it the selector the main loop runs on.
+        self._selector = selector
+        if selector is None and server_manager is not None:
+            self._selector = server_manager.selector
         self._config_path = config_path
         self._configuration = configuration if configuration else {}
         if isinstance(configs, dict):
@@ -115,7 +120,7 @@ class HttpServerWrapper():
         try:
             server = _uhttp_server.HttpServer(
                 address=address, port=port, ssl_context=ssl_context,
-                event_mode=True)
+                event_mode=True, selector=self._selector)
         except OSError as err:
             raise ValueError(
                 f"HTTP {address}:{port}: failed to bind: "
@@ -157,69 +162,66 @@ class HttpServerWrapper():
         """Schedule HTTP servers reload for next process_stale cycle"""
         self._pending_reload = True
 
-    def read_sockets(self):
-        """Return sockets for reading"""
-        sockets = []
-        for server, *_ in self._servers:
-            sockets.extend(server.read_sockets)
-        return sockets
+    def _ip_filter_for(self, client):
+        """The IP filter of the server that accepted this connection.
 
-    def write_sockets(self):
-        """Return sockets for writing"""
-        sockets = []
-        for server, *_ in self._servers:
-            sockets.extend(server.write_sockets)
-        return sockets
+        uhttp hands a ready connection straight to the loop, so which
+        server it belongs to has to be recovered from the local end of
+        its socket. Ports are unique across servers, addresses are not
+        (0.0.0.0 shows up as the real interface here).
+        """
+        try:
+            port = client.socket.getsockname()[1]
+        except (OSError, AttributeError, TypeError, IndexError):
+            return None
+        for _server, ip_flt, cfg, _ctx in self._servers:
+            if cfg.get('port', 8080) == port:
+                return ip_flt
+        return None
 
-    def process_read(self, read_sockets):
-        """Process read events - also handles writes for uhttp"""
-        self._process_uhttp(read_sockets, [])
-
-    def process_write(self, write_sockets):
-        """Process write events"""
-        self._process_uhttp([], write_sockets)
-
-    def _process_uhttp(self, read_sockets, write_sockets):
-        """Process uhttp events"""
-        for server, ip_flt, *_ in self._servers:
-            client = server.process_events(read_sockets, write_sockets)
-            if client:
-                # Check IP filter for new requests
-                if ip_flt and client.event in (
-                        _uhttp_server.EVENT_REQUEST,
-                        _uhttp_server.EVENT_HEADERS,
-                        _uhttp_server.EVENT_WS_REQUEST):
-                    client_ip = client.addr[0] \
-                        if isinstance(client.addr, tuple) else None
-                    if client_ip and not ip_flt.is_allowed(client_ip):
-                        self._log.info(
-                            "HTTP rejected (IP filter): %s", client_ip)
-                        client.respond({'error': 'Forbidden'}, status=403)
-                        continue
-                if client.event == _uhttp_server.EVENT_WS_REQUEST:
-                    self._handle_ws_upgrade(client)
-                elif client.event in (
-                        _uhttp_server.EVENT_WS_MESSAGE,
-                        _uhttp_server.EVENT_WS_CHUNK_FIRST,
-                        _uhttp_server.EVENT_WS_CHUNK_NEXT,
-                        _uhttp_server.EVENT_WS_CHUNK_LAST):
-                    ws_server = self._ws_clients.get(client)
-                    if ws_server:
-                        ws_server.process_message(client)
-                elif client.event == _uhttp_server.EVENT_WS_CLOSE:
-                    ws_server = self._ws_clients.pop(client, None)
-                    if ws_server:
-                        ws_server.remove_connection(client)
-                elif client.event == _uhttp_server.EVENT_HEADERS:
-                    client.accept_body()
-                elif client.event == _uhttp_server.EVENT_COMPLETE:
-                    self._handle_request(client)
-                elif client.event == _uhttp_server.EVENT_REQUEST:
-                    self._handle_request(client)
-
+    def handle_client(self, client):
+        """Handle one uhttp connection the event loop handed back"""
+        if not isinstance(client, _uhttp_server.HttpConnection):
+            return
+        # Filter on the events that start a request; a body chunk of an
+        # already-accepted request is not worth re-checking.
+        if client.event in (
+                _uhttp_server.EVENT_REQUEST,
+                _uhttp_server.EVENT_HEADERS,
+                _uhttp_server.EVENT_WS_REQUEST):
+            ip_flt = self._ip_filter_for(client)
+            client_ip = client.addr[0] \
+                if isinstance(client.addr, tuple) else None
+            if ip_flt and client_ip and not ip_flt.is_allowed(client_ip):
+                self._log.info("HTTP rejected (IP filter): %s", client_ip)
+                client.respond({'error': 'Forbidden'}, status=403)
+                return
+        if client.event == _uhttp_server.EVENT_WS_REQUEST:
+            self._handle_ws_upgrade(client)
+        elif client.event in (
+                _uhttp_server.EVENT_WS_MESSAGE,
+                _uhttp_server.EVENT_WS_CHUNK_FIRST,
+                _uhttp_server.EVENT_WS_CHUNK_NEXT,
+                _uhttp_server.EVENT_WS_CHUNK_LAST):
+            ws_server = self._ws_clients.get(client)
+            if ws_server:
+                ws_server.process_message(client)
+        elif client.event == _uhttp_server.EVENT_WS_CLOSE:
+            ws_server = self._ws_clients.pop(client, None)
+            if ws_server:
+                ws_server.remove_connection(client)
+        elif client.event == _uhttp_server.EVENT_HEADERS:
+            client.accept_body()
+        elif client.event in (
+                _uhttp_server.EVENT_COMPLETE, _uhttp_server.EVENT_REQUEST):
+            self._handle_request(client)
 
     def process_stale(self):
         """Cleanup expired sessions and handle pending reload"""
+        # Keep-alive and header timeouts have no event to ride on, so
+        # uhttp needs a tick every pass; it throttles its own scans.
+        for server, *_ in self._servers:
+            server.maintenance()
         if self._auth:
             self._auth.cleanup()
         for monitor in list(self._monitor_servers.values()):
@@ -1042,10 +1044,16 @@ class HttpServerWrapper():
         return None
 
     def _create_proxy(self, config):
-        """Create SerialProxy from config"""
-        proxy = _serial_proxy.SerialProxy(
-            config, self._log, certs_dir=self._cert_manager.certs_dir)
-        return proxy
+        """Create SerialProxy from config.
+
+        The selector must be passed on: a port rebuilt through the API
+        registers its listening sockets and its serial source itself,
+        and without them it accepts nothing and reads nothing while
+        still looking configured.
+        """
+        return _serial_proxy.SerialProxy(
+            config, self._log, certs_dir=self._cert_manager.certs_dir,
+            selector=self._selector)
 
     def _handle_api_ports_add(self, client, user):
         """Add new port configuration"""

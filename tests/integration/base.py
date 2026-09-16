@@ -214,6 +214,10 @@ class IntegrationTestCase(_unittest.TestCase):
         kwargs.setdefault('context', self.tls_context)
         return request(self.url + path, 'POST', data, **kwargs)
 
+    def put(self, path, data=None, **kwargs):
+        kwargs.setdefault('context', self.tls_context)
+        return request(self.url + path, 'PUT', data, **kwargs)
+
     def delete(self, path, **kwargs):
         kwargs.setdefault('context', self.tls_context)
         return request(self.url + path, 'DELETE', **kwargs)

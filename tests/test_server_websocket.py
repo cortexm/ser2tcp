@@ -306,21 +306,19 @@ class TestControl(unittest.TestCase):
         client.ws_send.assert_not_called()
 
 
-class TestSocketInterface(unittest.TestCase):
-    """Verify no-op socket methods for select loop compatibility"""
+class TestSocketOwnership(unittest.TestCase):
+    """A WebSocket server owns no sockets of its own.
 
-    def test_read_sockets_empty(self):
-        srv = make_ws_server()
-        self.assertEqual(srv.read_sockets(), [])
+    Its connections arrive already accepted by uhttp, which registers
+    them in the shared selector and drives their reads and writes. The
+    only thing the event loop asks of this class is the periodic tick.
+    """
 
-    def test_write_sockets_empty(self):
+    def test_is_not_a_selector_owner(self):
         srv = make_ws_server()
-        self.assertEqual(srv.write_sockets(), [])
+        self.assertFalse(hasattr(srv, 'handle_event'))
 
-    def test_process_read_noop(self):
+    def test_offers_the_periodic_hook(self):
         srv = make_ws_server()
-        srv.process_read([])  # should not raise
-
-    def test_process_write_noop(self):
-        srv = make_ws_server()
-        srv.process_write([])  # should not raise
+        srv.process_stale()  # should not raise
+        self.assertTrue(callable(srv.close))

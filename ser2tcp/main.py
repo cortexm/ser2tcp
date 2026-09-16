@@ -159,7 +159,9 @@ def main():
     serial_proxies = []
     for config in ports:
         try:
-            proxy = _serial_proxy.SerialProxy(config, log, certs_dir=certs_dir)
+            proxy = _serial_proxy.SerialProxy(
+                config, log, certs_dir=certs_dir,
+                selector=servers_manager.selector)
         except Exception as err:
             log.error("Failed to create port: %s", err)
             continue
@@ -171,8 +173,12 @@ def main():
         http_server = _http_server.HttpServerWrapper(
             configuration['http'], serial_proxies, log,
             config_path=args.config, configuration=configuration,
-            server_manager=servers_manager)
+            server_manager=servers_manager,
+            selector=servers_manager.selector)
         servers_manager.add_server(http_server)
+        # uhttp connections come out of the loop as return values, not
+        # through a server the manager knows about.
+        servers_manager.set_client_handler(http_server.handle_client)
 
     _signal.signal(_signal.SIGTERM, servers_manager.stop)
     _signal.signal(_signal.SIGINT, servers_manager.stop)
