@@ -119,6 +119,22 @@ class ServerWebSocket():
         else:
             client.ws_close(1011, 'Serial port unavailable')
 
+    def disconnect_client(self, client):
+        """Drop one client on request, return its address for logging.
+
+        Counterpart of Server.disconnect_client() - same job, but these
+        are uhttp connections, so they are closed with a WebSocket close
+        frame rather than by closing a socket we own.
+        """
+        addr = self._client_addr(client)
+        try:
+            client.ws_close(1000, 'Disconnected by administrator')
+        except OSError:
+            # Socket already gone; reaping it below is still right.
+            pass
+        self.remove_connection(client)
+        return addr
+
     def remove_connection(self, client):
         """Remove WebSocket connection"""
         if client in self._connections:

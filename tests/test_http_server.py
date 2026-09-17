@@ -9,6 +9,7 @@ from unittest.mock import Mock, MagicMock, patch
 from ser2tcp.cert_manager import CertManager, generate_certificate
 from ser2tcp.http_auth import hash_password
 from ser2tcp.http_server import HttpServerWrapper, _describe_detected
+from ser2tcp.server_websocket import ServerWebSocket
 
 
 class MockClient:
@@ -412,7 +413,7 @@ class TestApiDisconnect(unittest.TestCase):
             path='/api/ports/0/connections/0/0')
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 200)
-        server._remove_connection.assert_called_once_with(con)
+        server.disconnect_client.assert_called_once_with(con)
 
     def test_disconnect_port_not_found(self):
         wrapper = make_wrapper(serial_proxies=[])
@@ -1909,4 +1910,224 @@ class TestApiCertsReloadAndUpload(unittest.TestCase):
     def test_upload_without_filename_rejected(self):
         client = self._call(
             'admin', 'POST', '/api/certs/web/files', {'content': self.cert})
+        self.assertEqual(client.respond_status, 400)
+
+
+class TestApiDisconnectWebSocket(unittest.TestCase):
+    """Disconnecting a WebSocket client goes through a different object.
+
+    A WEBSOCKET server holds uhttp connections, which have none of the
+    Connection API the TCP path uses. The handler used to reach for
+    address_str() and take the whole process down with it.
+    """
+
+    def _make_ws_proxy(self):
+        serial = Mock()
+        serial.can_add_connection.return_value = True
+        serial.connect.return_value = True
+        ws_server = ServerWebSocket(
+            {'protocol': 'websocket', 'endpoint': 'dev'}, serial, log=Mock())
+        ws_client = Mock()
+        ws_client.addr = ('192.168.1.9', 4444)
+        ws_server.add_connection(ws_client)
+        proxy = Mock()
+        proxy.serial_config = {'port': '/dev/ttyUSB0'}
+        proxy.match = None
+        proxy.name = 'dev'
+        proxy.is_connected = False
+        proxy.servers = [ws_server]
+        return proxy, ws_server, ws_client
+
+    def test_disconnect_websocket_client(self):
+        """The client is closed and dropped, and the API answers 200"""
+        proxy, ws_server, ws_client = self._make_ws_proxy()
+        wrapper = make_wrapper(serial_proxies=[proxy])
+        client = MockClient(
+            method='DELETE', path='/api/ports/0/connections/0/0')
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 200)
+        self.assertEqual(ws_server.connections, [])
+        ws_client.ws_close.assert_called_once()
+
+    def test_disconnect_websocket_client_out_of_range(self):
+        """An index past the end is still a 404, not a crash"""
+        proxy, _, _ = self._make_ws_proxy()
+        wrapper = make_wrapper(serial_proxies=[proxy])
+        client = MockClient(
+            method='DELETE', path='/api/ports/0/connections/0/7')
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 404)
+
+    def test_disconnect_websocket_survives_a_dead_socket(self):
+        """A client whose socket already went away is still reaped"""
+        proxy, ws_server, ws_client = self._make_ws_proxy()
+        ws_client.ws_close.side_effect = OSError('gone')
+        wrapper = make_wrapper(serial_proxies=[proxy])
+        client = MockClient(
+            method='DELETE', path='/api/ports/0/connections/0/0')
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 200)
+        self.assertEqual(ws_server.connections, [])
+
+
+class TestPortConfigTypeValidation(unittest.TestCase):
+    """JSON of the wrong shape must come back as 400, never as a crash.
+
+    Everything here reached code that assumed a string or an int -
+    .upper(), a dict key, socket.bind() - and an uncaught TypeError in
+    an API handler used to kill every serial port in the process.
+    """
+
+    def _admin_token(self, wrapper):
+        client = MockClient(
+            method='POST', path='/api/login',
+            data={'login': 'admin', 'password': 'secret'})
+        wrapper._handle_request(client)
+        return client.responded['token']
+
+    def _make_wrapper(self):
+        configuration = {
+            'http': [{'address': '127.0.0.1', 'port': 0}],
+            'users': [{
+                'login': 'admin',
+                'password': hash_password('secret'),
+                'admin': True,
+            }],
+            'ports': [],
+        }
+        with patch('ser2tcp.http_server._uhttp_server.HttpServer'):
+            return HttpServerWrapper(
+                {'address': '127.0.0.1', 'port': 0}, [],
+                log=Mock(), configuration=configuration,
+                server_manager=Mock())
+
+    def _post(self, servers, serial=None):
+        """POST a port config and return the responding MockClient"""
+        wrapper = self._make_wrapper()
+        token = self._admin_token(wrapper)
+        cfg = {
+            'serial': serial if serial else {'port': '/dev/ttyUSB0'},
+            'servers': servers,
+        }
+        client = MockClient(
+            method='POST', path='/api/ports', data=cfg,
+            headers={'authorization': f'Bearer {token}'})
+        wrapper._handle_request(client)
+        return client
+
+    def _assert_rejected(self, servers, serial=None):
+        client = self._post(servers, serial=serial)
+        self.assertEqual(client.respond_status, 400)
+        return client.responded['error']
+
+    def test_protocol_must_be_a_string(self):
+        self._assert_rejected([{'protocol': 5}])
+
+    def test_protocol_may_not_be_a_list(self):
+        self._assert_rejected([{'protocol': ['tcp']}])
+
+    def test_server_address_must_be_a_string(self):
+        self._assert_rejected(
+            [{'protocol': 'tcp', 'address': 1234, 'port': 10001}])
+
+    def test_socket_path_must_be_a_string(self):
+        self._assert_rejected([{'protocol': 'socket', 'address': 7}])
+
+    def test_server_port_must_be_an_integer(self):
+        self._assert_rejected(
+            [{'protocol': 'tcp', 'address': '0.0.0.0', 'port': 'abc'}])
+
+    def test_server_port_must_be_in_range(self):
+        self._assert_rejected(
+            [{'protocol': 'tcp', 'address': '0.0.0.0', 'port': 99999}])
+
+    def test_server_port_may_not_be_a_bool(self):
+        self._assert_rejected(
+            [{'protocol': 'tcp', 'address': '0.0.0.0', 'port': True}])
+
+    def test_websocket_endpoint_must_be_a_string(self):
+        self._assert_rejected([{'protocol': 'websocket', 'endpoint': ['a']}])
+
+    def test_control_signal_entries_must_be_strings(self):
+        self._assert_rejected([{
+            'protocol': 'tcp', 'address': '0.0.0.0', 'port': 10001,
+            'control': {'signals': [7]}}])
+
+    def test_port_name_must_be_a_string(self):
+        wrapper = self._make_wrapper()
+        token = self._admin_token(wrapper)
+        client = MockClient(
+            method='POST', path='/api/ports',
+            data={
+                'name': ['dev'],
+                'serial': {'port': '/dev/ttyUSB0'},
+                'servers': [{
+                    'protocol': 'tcp', 'address': '0.0.0.0', 'port': 10001}],
+            },
+            headers={'authorization': f'Bearer {token}'})
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 400)
+
+    def test_serial_config_rejects_a_non_string_port(self):
+        self._assert_rejected(
+            [{'protocol': 'tcp', 'address': '0.0.0.0', 'port': 10001}],
+            serial={'port': 42})
+
+    def test_valid_config_is_still_accepted(self):
+        """The guards must not reject anything that used to work"""
+        wrapper = self._make_wrapper()
+        token = self._admin_token(wrapper)
+        cfg = {
+            'name': 'dev',
+            'serial': {'port': '/dev/ttyUSB0', 'baudrate': 115200},
+            'servers': [{
+                'protocol': 'tcp', 'address': '0.0.0.0', 'port': 10001,
+                'control': {'signals': ['rts', 'dtr']}}],
+        }
+        with patch.object(wrapper, '_create_proxy', return_value=Mock()):
+            client = MockClient(
+                method='POST', path='/api/ports', data=cfg,
+                headers={'authorization': f'Bearer {token}'})
+            wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 201)
+
+
+class TestHttpConfigTypeValidation(unittest.TestCase):
+    """Same class of bug on the HTTP server endpoints"""
+
+    def _make_wrapper(self):
+        configuration = {
+            'http': [{'address': '127.0.0.1', 'port': 0}],
+            'users': [{
+                'login': 'admin',
+                'password': hash_password('secret'),
+                'admin': True,
+            }],
+        }
+        with patch('ser2tcp.http_server._uhttp_server.HttpServer'):
+            return HttpServerWrapper(
+                {'address': '127.0.0.1', 'port': 0}, [],
+                log=Mock(), configuration=configuration,
+                server_manager=Mock())
+
+    def _post(self, data):
+        wrapper = self._make_wrapper()
+        login = MockClient(
+            method='POST', path='/api/login',
+            data={'login': 'admin', 'password': 'secret'})
+        wrapper._handle_request(login)
+        token = login.responded['token']
+        client = MockClient(
+            method='POST', path='/api/settings/http', data=data,
+            headers={'authorization': f'Bearer {token}'})
+        wrapper._handle_request(client)
+        return client
+
+    def test_address_must_be_a_string(self):
+        client = self._post({'address': 80, 'port': 8080})
+        self.assertEqual(client.respond_status, 400)
+
+    def test_name_must_be_a_string(self):
+        client = self._post({'address': '0.0.0.0', 'port': 8080,
+            'name': ['main']})
         self.assertEqual(client.respond_status, 400)

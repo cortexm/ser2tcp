@@ -944,10 +944,29 @@ class HttpServerWrapper():
         else:
             self._error(client, 'Not found', 404)
 
+    @staticmethod
+    def _is_port_number(value):
+        """True for a usable TCP port number.
+
+        bool is a subclass of int, and socket.bind() takes True as 1,
+        so it has to be excluded explicitly.
+        """
+        return isinstance(value, int) and not isinstance(value, bool) \
+            and 1 <= value <= 65535
+
     def _validate_port_config(self, data):
-        """Validate port configuration, return error string or None"""
+        """Validate port configuration, return error string or None.
+
+        Type checks are not pedantry here: past this point the values
+        reach .upper(), dict keys and socket.bind(), all of which raise
+        TypeError on the wrong type. Nothing between an API handler and
+        the event loop catches that, so a malformed request used to
+        take every serial port in the process down with it.
+        """
         if not isinstance(data, dict):
             return f'Expected JSON object, got {type(data).__name__}'
+        if 'name' in data and not isinstance(data['name'], str):
+            return 'name must be a string'
         if 'serial' not in data:
             return 'serial config required'
         serial = data['serial']
@@ -955,6 +974,10 @@ class HttpServerWrapper():
             return 'Invalid serial config'
         if 'port' not in serial and 'match' not in serial:
             return "serial config must have 'port' or 'match'"
+        if 'port' in serial and not isinstance(serial['port'], str):
+            return 'serial port must be a string'
+        if 'match' in serial and not isinstance(serial['match'], dict):
+            return 'serial match must be an object'
         # Validate port-level max_connections (0 = unlimited, default)
         if 'max_connections' in data:
             max_conn = data['max_connections']
@@ -969,6 +992,8 @@ class HttpServerWrapper():
                 return 'Invalid server config'
             if 'protocol' not in srv:
                 return 'Server protocol required'
+            if not isinstance(srv['protocol'], str):
+                return 'Server protocol must be a string'
             proto = srv['protocol'].upper()
             if proto not in ('TCP', 'TELNET', 'SSL', 'SOCKET', 'WEBSOCKET'):
                 return f'Unknown protocol: {srv["protocol"]}'
@@ -977,12 +1002,25 @@ class HttpServerWrapper():
             if proto == 'WEBSOCKET':
                 if 'endpoint' not in srv:
                     return 'WebSocket endpoint required'
+                # Endpoints are dict keys in the routing table, so a
+                # list here is an unhashable type, not just wrong.
+                if not isinstance(srv['endpoint'], str):
+                    return 'WebSocket endpoint must be a string'
+                if 'token' in srv and not isinstance(srv['token'], str):
+                    return 'WebSocket token must be a string'
             elif proto == 'SOCKET':
                 if 'address' not in srv:
                     return 'Socket path (address) required'
+                if not isinstance(srv['address'], str):
+                    return 'Socket path (address) must be a string'
             else:
                 if 'port' not in srv:
                     return 'Server port required'
+                if not self._is_port_number(srv['port']):
+                    return 'Server port must be an integer 1-65535'
+                if 'address' in srv \
+                        and not isinstance(srv['address'], str):
+                    return 'Server address must be a string'
             if proto == 'SSL':
                 if 'ssl' not in srv:
                     return 'SSL protocol requires ssl config'
@@ -999,6 +1037,8 @@ class HttpServerWrapper():
                     if not isinstance(ctl['signals'], list):
                         return 'control.signals must be a list'
                     for sig in ctl['signals']:
+                        if not isinstance(sig, str):
+                            return 'control.signals entries must be strings'
                         if sig.lower() not in _control.SIGNAL_BITS:
                             return f'Unknown signal: {sig}'
             # Validate IP filter config
@@ -1178,8 +1218,7 @@ class HttpServerWrapper():
             self._error(client, 'Connection not found', 404)
             return
         con = server.connections[con_idx]
-        addr = con.address_str()
-        server._remove_connection(con)
+        addr = server.disconnect_client(con)
         self._log.info("Disconnected: %s", addr)
         client.respond({'ok': True})
 
@@ -1440,8 +1479,12 @@ class HttpServerWrapper():
             return f'Expected JSON object, got {type(data).__name__}'
         if 'port' not in data:
             return 'port is required'
-        if not isinstance(data['port'], int) or data['port'] < 1 or data['port'] > 65535:
+        if not self._is_port_number(data['port']):
             return 'port must be 1-65535'
+        if 'address' in data and not isinstance(data['address'], str):
+            return 'address must be a string'
+        if 'name' in data and not isinstance(data['name'], str):
+            return 'name must be a string'
         if 'ssl' in data:
             err = self._validate_ssl_config(data['ssl'])
             if err:

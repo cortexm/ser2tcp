@@ -229,6 +229,17 @@ class Server():
         """True if server has some connections"""
         return bool(self._connections)
 
+    def disconnect_client(self, con):
+        """Drop one client on request, return its address for logging.
+
+        The API needs one way to say "drop this client" that works for
+        every server kind; ServerWebSocket holds uhttp connections with
+        a completely different interface and implements this too.
+        """
+        addr = con.address_str()
+        self._remove_connection(con)
+        return addr
+
     def _remove_connection(self, con):
         """Remove connection and disconnect serial if no connections left"""
         self._conn_by_socket.pop(con.socket(), None)
