@@ -621,15 +621,25 @@ class TestReadingASessionWithoutRenewingIt(unittest.TestCase):
         mgr.delete_user('ann')
         self.assertIsNone(mgr.session_state(token))
 
-    def test_an_expired_session_reports_nothing(self):
-        mgr = self._manager(session_timeout=0)
+    def _lapsed(self):
+        """A session that is definitely past its expiry.
+
+        A timeout of 0 is not enough on its own: expires is
+        time.time() + 0, and the check is a strict `>`, so whether it
+        has lapsed depends on the clock having ticked since.
+        """
+        mgr = self._manager()
         token = mgr.login('ann', 'pass')
+        mgr._sessions[token]['expires'] = time.time() - 1
+        return mgr, token
+
+    def test_an_expired_session_reports_nothing(self):
+        mgr, token = self._lapsed()
         self.assertIsNone(mgr.session_state(token))
 
     def test_an_expired_session_is_not_thrown_away_here(self):
         """Reaping belongs to cleanup(), which runs every pass anyway"""
-        mgr = self._manager(session_timeout=0)
-        token = mgr.login('ann', 'pass')
+        mgr, token = self._lapsed()
         mgr.session_state(token)
         self.assertIn(token, mgr._sessions)
 

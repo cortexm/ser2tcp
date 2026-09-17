@@ -286,11 +286,21 @@ certificate bundles without shell access. A bundle is a directory under
 
 - Bundle names: letters, digits, dot, underscore, dash (no leading dot)
 - Directory mode `0700`, key file `0600`
-- PEM format validated on upload (BEGIN/END markers must match the file type)
+- PEM format validated on upload: **every** block in the file must belong
+  there, not just the first. `cert.pem` and `ca.pem` hold certificates and
+  nothing else, so a combined file — the certificate with the private key
+  concatenated, which is what several tools hand you — is refused and has
+  to be split. `key.pem` takes a key, optionally preceded by the
+  `EC PARAMETERS` block `openssl ecparam -genkey` writes
 - `cert.pem` and `key.pem` are checked against each other on upload — a key
   that belongs to a different certificate is rejected instead of failing
   later at the TLS handshake
 - `key.pem` is never downloadable via API — only filesystem access
+- A bundle is a directory, so files also arrive by `scp`, by symlink or
+  from an editor, without passing the upload checks. `cert.pem` and
+  `ca.pem` are therefore checked again when served: one found to contain
+  a private key is refused (403) and flagged in the Certificates tab,
+  rather than handed to any signed-in user from a `0644` file
 - Bundles are referenced from SSL config via `"bundle": "<name>"` (both
   port SSL servers and HTTPS servers); a bundle cannot be deleted while
   any server still references it

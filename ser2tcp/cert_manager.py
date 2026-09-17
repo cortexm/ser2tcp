@@ -35,7 +35,10 @@ PRIVATE_FILES = ('key.pem',)  # never readable via API
 # Bundle names: alnum, dot, underscore, dash. Reject `.`, `..`, leading dot.
 _NAME_RE = _re.compile(r'^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$')
 
-# Accepted PEM block headers per file kind.
+# What each file has to be. Every block in it is checked against this,
+# not just the first: a certificate concatenated with a private key is
+# what most tools hand you, and as cert.pem it would be written 0644 and
+# served to any authenticated user.
 _PEM_TYPES = {
     'cert.pem': ('CERTIFICATE',),
     'ca.pem': ('CERTIFICATE',),
@@ -43,6 +46,35 @@ _PEM_TYPES = {
         'PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY',
         'DSA PRIVATE KEY', 'ENCRYPTED PRIVATE KEY'),
 }
+
+# Blocks allowed to sit alongside without being what the file is for.
+# `openssl ecparam -genkey` writes the curve ahead of the key, and the
+# result is an ordinary key.pem.
+_PEM_COMPANIONS = {
+    'key.pem': ('EC PARAMETERS',),
+}
+
+# Any of these in a file that gets handed out is a leak, however it got
+# there. The encrypted form counts: a passphrase is not a reason to
+# publish the key it protects.
+_PRIVATE_KEY_BLOCKS = _PEM_TYPES['key.pem']
+
+
+def _holds_private_key(content):
+    """True if this PEM text carries a private key block"""
+    return any(block in _PRIVATE_KEY_BLOCKS for block
+               in _re.findall(r'-----BEGIN ([A-Z ]+)-----', content))
+
+
+def _wrong_block_message(filename, block, expected_types):
+    """Why this block cannot be in this file, and what to do about it"""
+    message = (f"{filename} may only contain "
+               f"{' or '.join(expected_types)} blocks, "
+               f"found '{block}'")
+    if block in _PRIVATE_KEY_BLOCKS:
+        message += " - upload the private key on its own as key.pem"
+    return message
+
 
 _DIR_MODE = 0o700
 _KEY_MODE = 0o600
@@ -522,11 +554,15 @@ class CertManager():
         if begins != ends:
             raise CertManagerError(
                 'PEM BEGIN/END markers do not match')
-        # First block must be acceptable for this file kind.
-        first = begins[0]
-        if first not in expected_types:
+        allowed = expected_types + _PEM_COMPANIONS.get(filename, ())
+        for block in begins:
+            if block not in allowed:
+                raise CertManagerError(_wrong_block_message(
+                    filename, block, expected_types))
+        if not any(block in expected_types for block in begins):
             raise CertManagerError(
-                f"Expected PEM type one of {expected_types}, got '{first}'")
+                f"Expected PEM type one of {expected_types}, "
+                f"got '{begins[0]}'")
 
     def _bundle_path(self, name):
         self._validate_name(name)
@@ -590,6 +626,11 @@ class CertManager():
                         with open(fpath, 'r', encoding='utf-8') as f:
                             content = f.read()
                         info['cert_info'] = inspect_certificate(content)
+                        # A key in a file meant to be public. The
+                        # download refuses to serve it, but without
+                        # this the only symptom is a download that
+                        # stopped working for no visible reason.
+                        info['private_key'] = _holds_private_key(content)
                     except (OSError, UnicodeDecodeError) as err:
                         info['cert_info'] = {'error': str(err)}
             files[fname] = info
@@ -773,10 +814,19 @@ class CertManager():
                 f"File '{filename}' not found in bundle '{name}'")
         try:
             with open(fpath, 'r', encoding='utf-8') as f:
-                return f.read()
+                content = f.read()
         except (OSError, UnicodeDecodeError) as err:
             # Nothing guarantees what is on disk is text: this endpoint
             # is reachable by any authenticated user, so a binary file
             # dropped in by hand must not be fatal.
             raise CertManagerError(
                 f"Cannot read {name}/{filename}: {err}") from err
+        # A bundle is a directory, and save_file() is not the only way
+        # into it - an scp, a symlink into a Let's Encrypt live/ tree or
+        # an editor all bypass the upload check. This is the last place
+        # to look at what is actually there before handing it out.
+        if _holds_private_key(content):
+            raise CertManagerError(
+                f"{name}/{filename} contains a private key and will "
+                f"not be served - keep the key in key.pem")
+        return content

@@ -956,6 +956,163 @@ class TestAFailedReloadLeavesTheServerServing(unittest.TestCase):
         self.assertEqual(self._still_serving(), 'renewed.local')
 
 
+
+class TestACombinedPemIsNotACertificate(unittest.TestCase):
+    """A file holding a certificate *and* a private key.
+
+    Plenty of tools write one - LE's own naming aside, "just paste the
+    pem" usually means a concatenation - and only the first block used
+    to be checked. So it passed as cert.pem, was written 0644, and
+    GET /api/certs/<bundle>/files/cert.pem handed the private key to
+    any authenticated user: only the *filename* key.pem was refused.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = CertManager(self.tmp)
+        self.cert, self.key = generate_certificate(
+            'combined.local', key_type='ec_p256', days=30)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _save(self, filename, content):
+        with self.assertRaises(CertManagerError) as caught:
+            self.mgr.save_file('x', filename, content)
+        return str(caught.exception)
+
+    def test_cert_first_is_refused(self):
+        self._save('cert.pem', self.cert + self.key)
+
+    def test_key_first_is_refused_too(self):
+        """Checking only the first block missed one order, not both"""
+        self._save('cert.pem', self.key + self.cert)
+
+    def test_the_message_says_what_is_wrong_with_it(self):
+        message = self._save('cert.pem', self.cert + self.key)
+        self.assertIn('PRIVATE KEY', message)
+
+    def test_the_message_says_where_the_key_belongs(self):
+        self.assertIn('key.pem', self._save('cert.pem',
+                                            self.cert + self.key))
+
+    def test_ca_pem_is_guarded_the_same_way(self):
+        self._save('ca.pem', self.cert + self.key)
+
+    def test_nothing_was_written(self):
+        self._save('cert.pem', self.cert + self.key)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tmp, 'certs', 'x', 'cert.pem')))
+
+    def test_a_multi_file_upload_is_refused_as_a_whole(self):
+        with self.assertRaises(CertManagerError):
+            self.mgr.save_files('x', [
+                ('cert.pem', self.cert + self.key),
+                ('key.pem', self.key)])
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tmp, 'certs', 'x', 'key.pem')))
+
+
+class TestTheOrdinaryFilesStillGoThrough(unittest.TestCase):
+    """The check has to let real files in, including the awkward ones."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = CertManager(self.tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_fullchain_is_several_certificates(self):
+        leaf, _ = generate_certificate('leaf', key_type='ec_p256', days=30)
+        root, _ = generate_certificate(
+            'root', key_type='ec_p256', days=30, is_ca=True)
+        self.mgr.save_file('x', 'cert.pem', leaf + root)
+        self.assertIn('BEGIN CERTIFICATE',
+                      self.mgr.read_public_file('x', 'cert.pem'))
+
+    def test_a_key_with_its_ec_parameters_is_an_ordinary_key(self):
+        """What `openssl ecparam -genkey` writes, and it is a key.pem"""
+        _cert, key = generate_certificate(
+            'ec', key_type='ec_p256', days=30)
+        params = ('-----BEGIN EC PARAMETERS-----\n'
+                  'BggqhkjOPQMBBw==\n'
+                  '-----END EC PARAMETERS-----\n')
+        self.mgr.save_file('x', 'key.pem', params + key)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.tmp, 'certs', 'x', 'key.pem')))
+
+    def test_parameters_on_their_own_are_not_a_key(self):
+        params = ('-----BEGIN EC PARAMETERS-----\n'
+                  'BggqhkjOPQMBBw==\n'
+                  '-----END EC PARAMETERS-----\n')
+        with self.assertRaises(CertManagerError):
+            self.mgr.save_file('x', 'key.pem', params)
+
+    def test_a_certificate_is_not_a_key(self):
+        cert, _ = generate_certificate('c', key_type='ec_p256', days=30)
+        with self.assertRaises(CertManagerError):
+            self.mgr.save_file('x', 'key.pem', cert)
+
+
+class TestDownloadRefusesAFileHoldingAKey(unittest.TestCase):
+    """The upload check is not the only way a file gets into a bundle.
+
+    Bundles are a directory: an scp, a symlink into a Let's Encrypt
+    live/ directory, an editor - none of them go past save_file(). The
+    endpoint that hands the file out is the last place to notice, and
+    the only one that sees what is actually on disk.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = CertManager(self.tmp)
+        cert, self.key = generate_certificate(
+            'combined.local', key_type='ec_p256', days=30)
+        self.mgr.save_file('x', 'cert.pem', cert)
+        self.path = os.path.join(self.tmp, 'certs', 'x', 'cert.pem')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, content):
+        with open(self.path, 'w', encoding='utf-8') as file:
+            file.write(content)
+
+    def test_the_plain_certificate_downloads(self):
+        self.assertIn('BEGIN CERTIFICATE',
+                      self.mgr.read_public_file('x', 'cert.pem'))
+
+    def test_a_key_appended_on_disk_is_not_handed_out(self):
+        self._write(open(self.path, encoding='utf-8').read() + self.key)
+        with self.assertRaises(CertManagerError):
+            self.mgr.read_public_file('x', 'cert.pem')
+
+    def test_the_refusal_names_the_file(self):
+        self._write(open(self.path, encoding='utf-8').read() + self.key)
+        with self.assertRaises(CertManagerError) as caught:
+            self.mgr.read_public_file('x', 'cert.pem')
+        self.assertIn('cert.pem', str(caught.exception))
+
+    def test_the_listing_says_so_without_being_asked(self):
+        """Otherwise the only symptom is a download that will not work"""
+        self._write(open(self.path, encoding='utf-8').read() + self.key)
+        info = self.mgr.get_bundle('x')['files']['cert.pem']
+        self.assertTrue(info['private_key'])
+
+    def test_a_clean_file_is_not_flagged(self):
+        info = self.mgr.get_bundle('x')['files']['cert.pem']
+        self.assertFalse(info.get('private_key'))
+
+    def test_key_pem_is_not_flagged_for_holding_a_key(self):
+        self.mgr.save_file('x', 'key.pem', self.key)
+        info = self.mgr.get_bundle('x')['files']['key.pem']
+        self.assertFalse(info.get('private_key'))
+
+
 if __name__ == '__main__':
     unittest.main()
 

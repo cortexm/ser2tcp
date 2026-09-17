@@ -2365,6 +2365,9 @@ function confirmDeleteHttp(id) {
 let currentCerts = null;  // {certs_dir, bundles: [...]}
 
 const CERT_FILES = ['cert.pem', 'key.pem', 'ca.pem'];
+// The ones served over the API, and so the ones a private key must
+// never end up in.
+const PUBLIC_CERT_FILES = ['cert.pem', 'ca.pem'];
 
 function showCertificates() {
   if (!isAdmin) { navigate('/ports'); return; }
@@ -2424,6 +2427,7 @@ function renderCertCard(bundle) {
   // A complete-looking bundle whose key belongs to another cert fails
   // only at handshake time — flag it here instead.
   if (bundle.key_match === false) cls = 'card card-warning';
+  if (_holdsPrivateKey(bundle)) cls = 'card card-error';
   const card = el('div', { class: cls });
   const headerRow = el('div', { class: 'card-header-row' },
     el('span', { class: 'card-title' }, bundle.name));
@@ -2458,7 +2462,22 @@ function renderCertCard(bundle) {
       el('span', { style: 'color:var(--error)' }, 'cert/key mismatch')));
   }
   card.appendChild(meta);
+  if (_holdsPrivateKey(bundle)) {
+    card.appendChild(el('div', { class: 'card-failure' },
+      'A public file holds a private key — it will not be served'));
+  }
   return card;
+}
+
+// A private key inside cert.pem or ca.pem. Those files are written
+// world-readable and any authenticated user may download them, so the
+// download refuses — and this is what says why, rather than leaving a
+// download that stopped working for no visible reason.
+function _holdsPrivateKey(bundle) {
+  return PUBLIC_CERT_FILES.some(fname => {
+    const f = bundle.files && bundle.files[fname];
+    return f && typeof f === 'object' && f.private_key;
+  });
 }
 
 function confirmDeleteCertBundle(name) {
@@ -2538,6 +2557,18 @@ function _showBundleEditor(info) {
     }, 'cert.pem and key.pem do not match — TLS handshakes will fail. '
        + 'Use "Replace cert + key" to upload a matching pair.'));
   }
+
+  PUBLIC_CERT_FILES.forEach(fname => {
+    const f = info.files && info.files[fname];
+    if (!(f && typeof f === 'object' && f.private_key)) return;
+    body.appendChild(el('div', {
+      class: 'card-subtitle',
+      style: 'margin-bottom:12px;color:var(--error)',
+    }, fname + ' contains a private key. It is world-readable and this '
+       + 'endpoint serves it to any signed-in user, so downloading it '
+       + 'is refused. Split the file: the certificate here, the key in '
+       + 'key.pem.'));
+  });
 
   body.appendChild(el('div', { style: 'margin-bottom:16px' },
     btn('Replace cert + key', 'btn-small btn-accent',
