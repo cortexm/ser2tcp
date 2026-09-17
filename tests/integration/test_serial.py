@@ -331,6 +331,30 @@ class TestTelnetPath(SerialPtyTestCase):
         self.assertEqual(read_client(plain, 4), b'both')
         self.assertIn(b'both', read_client(telnet, 4, timeout=3))
 
+    def test_a_client_that_answers_the_negotiation_still_works(self):
+        """The reply a real telnet client sends is a subnegotiation.
+
+        ser2tcp opens with IAC DO LINEMODE, so this is the first thing
+        most clients say back. Mishandled it left the connection stuck
+        in the SB state and killed the process on the next keystroke.
+        """
+        sock = self.connect(self.telnet_port)
+        read_client(sock, 1, timeout=1)
+        self.drain_device()
+        # IAC SB LINEMODE ... IAC SE, then an ordinary keystroke.
+        sock.sendall(bytes((0xff, 0xfa, 0x22, 0x03, 0x01, 0xff, 0xf0)))
+        sock.sendall(b'typed')
+        self.assertEqual(read_device(self.master_fd, 5), b'typed')
+        self.assertEqual(self.get('/api/status')[0], 200)
+
+    def test_subnegotiation_contents_never_reach_the_device(self):
+        """Negotiation is for the server, not for the wire"""
+        sock = self.connect(self.telnet_port)
+        read_client(sock, 1, timeout=1)
+        self.drain_device()
+        sock.sendall(bytes((0xff, 0xfa, 0x22, 0x03, 0x01, 0xff, 0xf0)))
+        self.assertEqual(read_device(self.master_fd, 1, timeout=1), b'')
+
 
 class TestUnixSocketPath(SerialPtyTestCase):
     """AF_UNIX shares the connection machinery with TCP.

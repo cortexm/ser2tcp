@@ -73,9 +73,21 @@ class ConnectionTelnet(_connection.Connection):
             self._telnet_state = state
             self._subnegotiation_frame = bytearray()
         elif state == self.TELNET_SE:
-            self._telnet_subnegotiation(self._subnegotiation_frame)
-            self._subnegotiation_frame = None
-            state = None
+            # Clearing _telnet_state is what lets the data after the
+            # subnegotiation reach the device again: _send_data() routes
+            # into the frame buffer while SB is set, and that buffer is
+            # gone by then. Assigning to `state` here only touched the
+            # local name, so the next byte raised AttributeError - and
+            # a client answering the LINEMODE request this server opens
+            # with gets there on its very first reply.
+            if self._subnegotiation_frame is not None:
+                self._telnet_subnegotiation(self._subnegotiation_frame)
+                self._subnegotiation_frame = None
+            else:
+                # SE with no SB before it: a broken peer, not our problem
+                self._log.warning(
+                    "(%s:%d) received TELNET SE without SB", *self._addr)
+            self._telnet_state = None
         elif state == self.TELNET_IAC:
             self._send_data(bytes((state, )))
         else:

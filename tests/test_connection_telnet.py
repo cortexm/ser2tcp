@@ -1,6 +1,7 @@
 """Tests for ConnectionTelnet class"""
 
 import unittest
+import unittest.mock
 from unittest.mock import Mock
 
 from ser2tcp.connection_telnet import ConnectionTelnet
@@ -110,6 +111,80 @@ class TestConnectionTelnet(unittest.TestCase):
         # IAC SB 0x22 (some data) IAC SE
         conn.on_received(bytes((0xff, 0xfa, 0x22, 0x01, 0x02, 0xff, 0xf0)))
         serial.send.assert_not_called()
+
+    def test_data_after_subnegotiation_reaches_the_device(self):
+        """The SB state has to end at IAC SE.
+
+        Left set, the next data byte lands in a subnegotiation buffer
+        that was already dropped - which used to raise AttributeError
+        and, unhandled, take the whole process down. A client that
+        answers the LINEMODE request this server opens with (IAC DO
+        0x22) gets there on its first reply.
+        """
+        conn, serial = self._make_connection()
+        conn.on_received(bytes((0xff, 0xfa, 0x22, 0x01, 0xff, 0xf0)))
+        conn.on_received(b'hello')
+        serial.send.assert_called_once_with(bytearray(b'hello'))
+
+    def test_data_after_subnegotiation_in_the_same_packet(self):
+        """The end of a subnegotiation and data can share one recv()"""
+        conn, serial = self._make_connection()
+        conn.on_received(
+            bytes((0xff, 0xfa, 0x22, 0x01, 0xff, 0xf0)) + b'hello')
+        serial.send.assert_called_once_with(bytearray(b'hello'))
+
+    def test_subnegotiation_payload_is_collected(self):
+        """Everything between SB and SE is handed over, and only that"""
+        conn, serial = self._make_connection()
+        with unittest.mock.patch.object(
+                conn, '_telnet_subnegotiation') as handler:
+            conn.on_received(
+                bytes((0xff, 0xfa, 0x22, 0x01, 0x02, 0x03, 0xff, 0xf0)))
+        handler.assert_called_once_with(bytearray((0x22, 0x01, 0x02, 0x03)))
+        serial.send.assert_not_called()
+
+    def test_subnegotiation_split_across_packets(self):
+        """A subnegotiation may arrive in as many pieces as TCP likes"""
+        conn, serial = self._make_connection()
+        with unittest.mock.patch.object(
+                conn, '_telnet_subnegotiation') as handler:
+            conn.on_received(bytes((0xff, 0xfa, 0x22)))
+            conn.on_received(bytes((0x01, 0x02)))
+            conn.on_received(bytes((0xff, 0xf0)))
+        handler.assert_called_once_with(bytearray((0x22, 0x01, 0x02)))
+        serial.send.assert_not_called()
+        conn.on_received(b'after')
+        serial.send.assert_called_once_with(bytearray(b'after'))
+
+    def test_escaped_iac_inside_subnegotiation_is_a_literal_byte(self):
+        """IAC IAC inside SB is data, not the start of a command"""
+        conn, serial = self._make_connection()
+        with unittest.mock.patch.object(
+                conn, '_telnet_subnegotiation') as handler:
+            conn.on_received(
+                bytes((0xff, 0xfa, 0x22, 0xff, 0xff, 0x01, 0xff, 0xf0)))
+        handler.assert_called_once_with(bytearray((0x22, 0xff, 0x01)))
+        serial.send.assert_not_called()
+
+    def test_subnegotiation_end_without_a_start_is_survivable(self):
+        """A stray IAC SE is a protocol error, not a reason to die"""
+        conn, serial = self._make_connection()
+        conn.on_received(bytes((0xff, 0xf0)))
+        conn.on_received(b'hello')
+        serial.send.assert_called_once_with(bytearray(b'hello'))
+
+    def test_two_subnegotiations_in_a_row(self):
+        """State from the first must not leak into the second"""
+        conn, serial = self._make_connection()
+        with unittest.mock.patch.object(
+                conn, '_telnet_subnegotiation') as handler:
+            conn.on_received(bytes((0xff, 0xfa, 0x22, 0x01, 0xff, 0xf0)))
+            conn.on_received(bytes((0xff, 0xfa, 0x18, 0x02, 0xff, 0xf0)))
+        self.assertEqual(
+            [call.args[0] for call in handler.call_args_list],
+            [bytearray((0x22, 0x01)), bytearray((0x18, 0x02))])
+        conn.on_received(b'ok')
+        serial.send.assert_called_once_with(bytearray(b'ok'))
 
     def test_initial_negotiation_sent(self):
         """Initial TELNET negotiation should be sent on connect"""
