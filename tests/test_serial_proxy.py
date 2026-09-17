@@ -1,6 +1,7 @@
 """Tests for SerialProxy config parsing"""
 
 import selectors
+import socket
 import threading
 import time
 import unittest
@@ -1053,3 +1054,79 @@ class TestReadTimeoutIsForced(unittest.TestCase):
     def test_a_configured_read_timeout_is_overridden(self):
         self.assertEqual(
             self._config(timeout=None)['timeout'], SerialProxy.READ_TIMEOUT)
+
+
+class TestHalfBuiltProxyLeavesNothingBehind(unittest.TestCase):
+    """A port whose second server fails must not leave the first running.
+
+    __init__ raises, so the caller never gets the object and has nothing
+    to close - but the servers already built are listening and
+    registered in the selector. The result answers connections, opens
+    the device a second time, and appears nowhere in the status.
+    """
+
+    def _config(self, servers):
+        return {
+            'name': 'dev',
+            'serial': {'port': '/dev/ttyUSB-nowhere'},
+            'servers': servers,
+        }
+
+    def _free_port(self):
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            return sock.getsockname()[1]
+
+    def test_a_good_config_still_builds(self):
+        port = self._free_port()
+        proxy = SerialProxy(self._config([
+            {'protocol': 'tcp', 'address': '127.0.0.1', 'port': port}]),
+            log=MagicMock())
+        try:
+            self.assertEqual(len(proxy.servers), 1)
+        finally:
+            proxy.close()
+
+    def test_the_first_server_is_closed_when_a_later_one_fails(self):
+        first, blocked = self._free_port(), self._free_port()
+        keep = socket.socket()
+        keep.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        keep.bind(('127.0.0.1', blocked))
+        keep.listen(1)
+        try:
+            with self.assertRaises(Exception):
+                SerialProxy(self._config([
+                    {'protocol': 'tcp', 'address': '127.0.0.1',
+                     'port': first},
+                    {'protocol': 'tcp', 'address': '127.0.0.1',
+                     'port': blocked},
+                ]), log=MagicMock())
+            # The first port must be free again: nothing is listening.
+            probe = socket.socket()
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(('127.0.0.1', first))
+            finally:
+                probe.close()
+        finally:
+            keep.close()
+
+    def test_the_selector_is_left_clean(self):
+        first, blocked = self._free_port(), self._free_port()
+        keep = socket.socket()
+        keep.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        keep.bind(('127.0.0.1', blocked))
+        keep.listen(1)
+        selector = selectors.DefaultSelector()
+        try:
+            with self.assertRaises(Exception):
+                SerialProxy(self._config([
+                    {'protocol': 'tcp', 'address': '127.0.0.1',
+                     'port': first},
+                    {'protocol': 'tcp', 'address': '127.0.0.1',
+                     'port': blocked},
+                ]), log=MagicMock(), selector=selector)
+            self.assertEqual(len(selector.get_map()), 0)
+        finally:
+            selector.close()
+            keep.close()

@@ -515,6 +515,8 @@ class HttpServerWrapper():
         open and carry data fine. A configured path that exists is
         therefore taken as present, whoever put it there.
         """
+        if proxy.error:
+            return 'error'
         if proxy.is_connected:
             return 'online'
         match = proxy.match
@@ -612,6 +614,10 @@ class HttpServerWrapper():
                     signals[name] = bool(bitmask & (1 << bit))
                 port_info['signals'] = signals
             port_info['state'] = self._compute_port_state(proxy, detected)
+            if proxy.error:
+                # A port that never started. Say why, where the person
+                # who has to fix it will see it.
+                port_info['error'] = proxy.error
             ports.append(port_info)
         return ports
 

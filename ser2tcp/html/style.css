@@ -460,6 +460,13 @@ body.stream-down .card-detected.card-detected-configured {
 .card-header-row > .tag,
 .card-header-row > .kebab-menu { flex: none; }
 .card-subtitle { font-size: 13px; color: var(--text-muted); }
+.card-failure {
+  font-size: 13px;
+  color: var(--error);
+  background: rgba(220, 38, 38, 0.10);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
 .card-meta {
   display: flex;
   flex-direction: column;

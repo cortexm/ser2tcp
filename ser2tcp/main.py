@@ -163,8 +163,12 @@ def main():
                 config, log, certs_dir=certs_dir,
                 selector=servers_manager.selector)
         except Exception as err:
+            # Keep its place in the list. Ports are addressed by index,
+            # so dropping one renumbers the rest - and the port would
+            # disappear from the UI rather than showing what is wrong
+            # with it.
             log.error("Failed to create port: %s", err)
-            continue
+            proxy = _serial_proxy.FailedProxy(config, err)
         serial_proxies.append(proxy)
         servers_manager.add_server(proxy)
 

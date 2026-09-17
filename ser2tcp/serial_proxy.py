@@ -23,6 +23,91 @@ def _format_signals(bitmask):
         for bit, name in enumerate(_control.SIGNAL_NAMES))
 
 
+class FailedProxy():
+    """Stands in the list for a port that could not be started.
+
+    Ports are addressed by their position in the configuration, so a
+    port left out of the runtime list renumbers every port after it:
+    an edit meant for one rewrites another, and a delete removes the
+    wrong entry. It also gives the port somewhere to appear, with the
+    reason it failed, rather than vanishing from the UI as though it
+    had never been configured - which is the state you most want to
+    see, since it is the one you have to fix.
+
+    Read-only and inert: it serves nothing and owns nothing.
+    """
+
+    def __init__(self, config, error):
+        self._config = config if isinstance(config, dict) else {}
+        serial = self._config.get('serial')
+        self._serial_config = serial if isinstance(serial, dict) else {}
+        self._error = str(error)
+
+    @property
+    def name(self):
+        """Return port name"""
+        return self._config.get('name', '')
+
+    @property
+    def serial_config(self):
+        """Return the configured serial settings"""
+        return self._serial_config
+
+    @property
+    def match(self):
+        """Return match criteria"""
+        return self._serial_config.get('match')
+
+    @property
+    def is_connected(self):
+        """Never: there is no port to be connected to"""
+        return False
+
+    @property
+    def servers(self):
+        """Nothing was built, so nothing is served"""
+        return []
+
+    @property
+    def max_connections(self):
+        """Return max connections limit (0 = unlimited)"""
+        return self._config.get('max_connections', 0)
+
+    @property
+    def error(self):
+        """Why this port could not be started"""
+        return self._error
+
+    def get_signals(self):
+        """No port, no signals"""
+        return 0
+
+    def can_add_connection(self):
+        """Nothing can connect to a port that does not exist"""
+        return False
+
+    def has_connections(self):
+        """Never"""
+        return False
+
+    def total_connections(self):
+        """Always none"""
+        return 0
+
+    def connect(self):
+        """Cannot be opened; the config has to be fixed first"""
+        return False
+
+    def disconnect(self):
+        """Nothing to disconnect"""
+
+    def process_stale(self):
+        """Nothing ages here"""
+
+    def close(self):
+        """Nothing to close"""
+
+
 class SerialProxy():
     """Serial connection manager"""
     PARITY_CONFIG = {
@@ -108,7 +193,27 @@ class SerialProxy():
             self._log.info("Serial: %s %d", name, baudrate)
         else:
             self._log.info("Serial: %s", name)
-        for server_config in config['servers']:
+        try:
+            self._build_servers(config['servers'], log)
+        except Exception:
+            # __init__ is about to raise, so the caller never sees this
+            # object and has nothing to close - but the servers built so
+            # far are already listening and registered in the selector.
+            # Left there they answer connections, open the device a
+            # second time, and appear in no status anywhere.
+            self.close()
+            raise
+        # Detect control-enabled servers and set poll interval
+        for server in self._servers:
+            if server.control:
+                self._has_control_servers = True
+                interval = server.control.get('poll_interval')
+                if interval is not None:
+                    self._signal_poll_interval = interval
+
+    def _build_servers(self, server_configs, log):
+        """Create every server this port serves"""
+        for server_config in server_configs:
             proto = server_config.get('protocol', '').upper()
             if proto == 'WEBSOCKET':
                 self._servers.append(
@@ -120,13 +225,6 @@ class SerialProxy():
                         server_config, self, log,
                         certs_dir=self._certs_dir,
                         selector=self._selector))
-        # Detect control-enabled servers and set poll interval
-        for server in self._servers:
-            if server.control:
-                self._has_control_servers = True
-                interval = server.control.get('poll_interval')
-                if interval is not None:
-                    self._signal_poll_interval = interval
 
     def _init_serial_config(self, config):
         """Initialize serial configuration - validate and convert enum values"""
@@ -282,6 +380,16 @@ class SerialProxy():
     def is_connected(self):
         """Return True if serial port is connected"""
         return self._serial is not None
+
+    @property
+    def error(self):
+        """Why this port could not be started, or None if it did.
+
+        Always None here - a SerialProxy that exists started. Its
+        counterpart FailedProxy answers with the reason, and callers
+        ask both the same question.
+        """
+        return None
 
     @property
     def servers(self):

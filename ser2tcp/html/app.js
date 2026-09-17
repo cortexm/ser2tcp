@@ -805,6 +805,14 @@ function renderPortCard(port, index) {
       el('div', { class: 'card-subtitle' }, subParts.join(' — ')));
   }
 
+  // A port that never started. Its servers do not exist and there is
+  // nothing to link to, so the reason is all the card can offer - and
+  // it is the one thing worth reading.
+  if (port.error) {
+    card.appendChild(el('div', { class: 'card-failure' },
+      'Did not start: ' + port.error));
+  }
+
   // Match attributes (if used)
   if (ser.match) {
     const dl = el('dl', { class: 'detect-attrs' });

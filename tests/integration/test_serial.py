@@ -557,3 +557,128 @@ class TestSlowDeviceBackpressure(SerialPtyTestCase):
             os.read(self.master_fd, 65536)
         sock.sendall(b'resumed')
         self.assertIn(b'resumed', read_device(self.master_fd, 7, timeout=10))
+
+
+class FailedPortTestCase(base.IntegrationTestCase):
+    """A config whose first port cannot bind, followed by one that can.
+
+    Every port API path addresses a port by its position in the config.
+    Dropping a failed one renumbers the rest, so an edit aimed at one
+    rewrites another - and the failed port vanishes from the UI with no
+    hint that it was ever configured.
+    """
+
+    good_port = None
+    blocked_port = None
+    blocker = None
+    master_fd = None
+    slave_fd = None
+
+    @classmethod
+    def build_config(cls):
+        return {
+            'ports': [
+                {'name': 'wont-start',
+                 'serial': {'port': '/dev/tty.not-a-real-device'},
+                 'servers': [{'protocol': 'tcp', 'address': '127.0.0.1',
+                              'port': cls.blocked_port}]},
+                {'name': 'healthy',
+                 'serial': {'port': cls.pty_path},
+                 'servers': [{'protocol': 'tcp', 'address': '127.0.0.1',
+                              'port': cls.good_port}]},
+            ],
+            'http': [{'address': '127.0.0.1', 'port': cls.port}],
+        }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.good_port = base.free_port()
+        cls.blocked_port = base.free_port()
+        # The healthy port needs a device it can actually open, or
+        # ser2tcp drops its clients as soon as it accepts them.
+        cls.master_fd, cls.slave_fd = os.openpty()
+        cls.pty_path = os.ttyname(cls.slave_fd)
+        # Hold the first port's address so its server cannot bind.
+        cls.blocker = socket.socket()
+        cls.blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        cls.blocker.bind(('127.0.0.1', cls.blocked_port))
+        cls.blocker.listen(1)
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        if cls.blocker is not None:
+            cls.blocker.close()
+        for fd in (cls.master_fd, cls.slave_fd):
+            try:
+                os.close(fd)
+            except (OSError, TypeError):
+                pass
+
+
+class TestFailedPortIsStillListed(FailedPortTestCase):
+    """What the status says about a port that never started"""
+
+    def test_both_ports_are_listed(self):
+        status, body = self.get('/api/status')
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [p.get('name') for p in body['ports']], ['wont-start', 'healthy'])
+
+    def test_the_failed_port_says_why(self):
+        body = self.get('/api/status')[1]
+        failed = body['ports'][0]
+        self.assertEqual(failed['state'], 'error')
+        self.assertTrue(failed.get('error'))
+
+    def test_the_failed_port_serves_nothing(self):
+        body = self.get('/api/status')[1]
+        self.assertEqual(body['ports'][0]['servers'], [])
+
+    def test_the_healthy_port_still_serves(self):
+        sock = socket.create_connection(('127.0.0.1', self.good_port), 5)
+        self.addCleanup(sock.close)
+        body = self.get('/api/status')[1]
+        self.assertEqual(len(body['ports'][1]['servers'][0]['connections']), 1)
+
+
+class TestEditingAroundAFailedPort(FailedPortTestCase):
+    """Editing by index, with a failed port in the list.
+
+    Separate from the read-only checks: these rewrite the config, and
+    the whole class shares one process.
+    """
+
+    def test_an_edit_reaches_the_port_it_names(self):
+        """Index 1 is 'healthy' in the config and must be there too"""
+        status, body = self.put('/api/ports/1', {
+            'name': 'healthy-renamed',
+            'serial': {'port': self.pty_path},
+            'servers': [{'protocol': 'tcp', 'address': '127.0.0.1',
+                         'port': self.good_port}],
+        })
+        self.assertEqual(status, 200, body)
+        on_disk = self.proc.read_config()['ports']
+        self.assertEqual(
+            [p.get('name') for p in on_disk],
+            ['wont-start', 'healthy-renamed'])
+
+    def test_zz_a_failed_port_can_be_repaired_in_place(self):
+        """It is visible, so it can be fixed without editing the file.
+
+        Named to sort last: it rewrites port 0, and the class shares
+        one process with the test above.
+        """
+        fresh = base.free_port()
+        status, body = self.put('/api/ports/0', {
+            'name': 'wont-start',
+            'serial': {'port': '/dev/tty.not-a-real-device'},
+            'servers': [{'protocol': 'tcp', 'address': '127.0.0.1',
+                         'port': fresh}],
+        })
+        self.assertEqual(status, 200, body)
+        listing = self.get('/api/status')[1]['ports']
+        self.assertNotIn('error', listing[0])
+        sock = socket.create_connection(('127.0.0.1', fresh), 5)
+        self.addCleanup(sock.close)

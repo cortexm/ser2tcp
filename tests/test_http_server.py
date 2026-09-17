@@ -1292,8 +1292,10 @@ class TestMaxConnectionsValidation(unittest.TestCase):
 # ===========================================================================
 
 def _proxy(port=None, baudrate=None, match=None, connected=False,
-        servers=None, name='', signals=0):
+        servers=None, name='', signals=0, error=None):
     proxy = Mock()
+    # A started port answers None here; FailedProxy answers with why.
+    proxy.error = error
     cfg = {}
     if port:
         cfg['port'] = port
@@ -2290,3 +2292,35 @@ class TestAuthFieldTypeValidation(unittest.TestCase):
             data={'login': ['admin'], 'password': 'secret'})
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 401)
+
+
+class TestFailedPortInStatus(unittest.TestCase):
+    """A port that never started still has to be reported"""
+
+    def setUp(self):
+        self.wrapper = make_wrapper()
+
+    def test_it_is_marked_as_an_error(self):
+        proxy = _proxy(port='/dev/ttyUSB0', error='failed to bind')
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, []), 'error')
+
+    def test_the_reason_reaches_the_payload(self):
+        proxy = _proxy(port='/dev/ttyUSB0', name='dev',
+            error='failed to bind')
+        wrapper = make_wrapper(serial_proxies=[proxy])
+        payload = wrapper._build_ports_payload(detected=[])
+        self.assertEqual(payload[0]['error'], 'failed to bind')
+
+    def test_a_started_port_carries_no_reason(self):
+        proxy = _proxy(port='/dev/ttyUSB0', name='dev', connected=True)
+        wrapper = make_wrapper(serial_proxies=[proxy])
+        payload = wrapper._build_ports_payload(detected=[])
+        self.assertNotIn('error', payload[0])
+
+    def test_a_present_device_does_not_excuse_the_failure(self):
+        """The device being there says nothing about the port starting"""
+        proxy = _proxy(port='/dev/ttyUSB0', error='failed to bind')
+        detected = [{'device': '/dev/ttyUSB0'}]
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, detected), 'error')
