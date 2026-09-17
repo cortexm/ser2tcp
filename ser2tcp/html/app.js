@@ -594,6 +594,10 @@ function setServerReachable(reachable) {
   logo.classList.toggle('server-online', reachable === true);
   logo.classList.toggle('server-offline', reachable === false);
   logo.title = reachable === false ? 'Server unreachable' : '';
+  // And everything the page is showing is now a memory, not a state.
+  document.body.classList.toggle('stream-down', reachable === false);
+  const banner = $('stream-banner');
+  if (banner) banner.hidden = reachable !== false;
 }
 
 function startStatusStream() {

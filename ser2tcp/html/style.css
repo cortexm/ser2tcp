@@ -404,6 +404,29 @@ body {
 .card-offline { border-left-color: var(--ready); }
 .card-error   { border-left-color: var(--error); }
 .card-warning { border-left-color: var(--warning); }
+/* Nothing on screen can be vouched for once the status stream stops:
+   every card is the last thing the server said, not what is true. Say
+   so by draining the colour out of them - grey is "we do not know",
+   where leaving them green or red would be a claim. */
+.stream-banner {
+  background: rgba(220, 38, 38, 0.12);
+  border-bottom: 1px solid var(--error);
+  color: var(--error);
+  padding: 8px 20px;
+  font-size: 13px;
+  text-align: center;
+}
+body.stream-down .card { opacity: 0.5; }
+body.stream-down .card-title { color: var(--text-muted); }
+body.stream-down .card-online,
+body.stream-down .card-offline,
+body.stream-down .card-error,
+body.stream-down .card-warning,
+body.stream-down .card-detected,
+body.stream-down .card-detected.card-detected-configured {
+  border-left-color: var(--text-faint);
+}
+
 /* The title carries the state as well, so the answer is legible
    without tracing a thin stripe back to the edge of the card. Every
    card kind reuses these classes, and the meaning travels with them. */
