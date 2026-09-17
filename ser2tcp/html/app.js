@@ -578,6 +578,10 @@ const FORM_OWNED_SERVER_KEYS = [
   'allow', 'deny', 'max_connections',
 ];
 
+// The same idea for an HTTP server: these come from the form, the rest
+// of the entry - an IP filter, anything added later - is carried over.
+const FORM_OWNED_HTTP_KEYS = ['address', 'port', 'name', 'ssl'];
+
 // The same shape the server generates, so a pre-filled field is a real
 // id rather than a placeholder that turns into something else on save.
 function suggestId() {
@@ -2280,16 +2284,20 @@ function _showHttpEditorWithBundles(id, bundles) {
       btn('Cancel', '', () => backToList()),
       btn('Save', 'btn-primary',
         () => _saveHttpServer(isNew ? null : id,
-          { idInput, nameInput, addrInput, portInput, ssl })),
+          { idInput, nameInput, addrInput, portInput, ssl },
+          isNew ? {} : srv)),
     ].filter(Boolean),
   });
 }
 
-function _saveHttpServer(id, fields) {
-  const data = {
-    address: fields.addrInput.value.trim() || '0.0.0.0',
-    port: parseInt(fields.portInput.value) || 8080,
-  };
+function _saveHttpServer(id, fields, original) {
+  // Start from the stored entry so settings with no field here - an IP
+  // filter, most of all - are not dropped by an edit that never
+  // mentioned them.
+  const data = { ...(original || {}) };
+  FORM_OWNED_HTTP_KEYS.forEach(key => delete data[key]);
+  data.address = fields.addrInput.value.trim() || '0.0.0.0';
+  data.port = parseInt(fields.portInput.value) || 8080;
   const chosenId = fields.idInput.value.trim();
   if (chosenId) {
     if (!ID_PATTERN.test(chosenId)) {

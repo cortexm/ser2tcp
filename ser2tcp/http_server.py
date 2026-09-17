@@ -1619,7 +1619,10 @@ class HttpServerWrapper():
     def _handle_api_settings_get(self, client):
         """Return settings (http servers, session_timeout)"""
         settings = {
-            'http': self._configuration.get('http', []),
+            # Normalised to a list: the config allows a single object,
+            # and a client that got one had to special-case it or
+            # conclude there were no servers at all.
+            'http': self._http_list(),
             'session_timeout': self._configuration.get('session_timeout'),
         }
         client.respond(settings)
@@ -1683,6 +1686,39 @@ class HttpServerWrapper():
             return str(err)
         return None
 
+    def _http_list(self, create=False):
+        """The HTTP server entries, as a list.
+
+        The config allows a single object instead of a list; normalise
+        it once here, and put the list back so everything downstream -
+        including appending to it - works on the same object.
+        """
+        servers = self._configuration.get('http')
+        if isinstance(servers, dict):
+            servers = [servers]
+            self._configuration['http'] = servers
+        elif servers is None:
+            servers = []
+            if create:
+                self._configuration['http'] = servers
+        return servers
+
+    @staticmethod
+    def _http_entry(data, entry_id):
+        """The entry to store for an HTTP server.
+
+        Everything the request carries is kept apart from the id, which
+        belongs to the entry rather than to what is in it. Rebuilding
+        from a list of known keys instead is how an IP filter used to
+        disappear from a server whose name was edited.
+        """
+        entry = {key: value for key, value in data.items() if key != 'id'}
+        entry['id'] = entry_id
+        if not entry.get('name'):
+            entry.pop('name', None)
+        entry.setdefault('address', '0.0.0.0')
+        return entry
+
     def _handle_api_http_add(self, client, user):
         """Add new HTTP server"""
         if not self._require_admin(client, user):
@@ -1692,19 +1728,13 @@ class HttpServerWrapper():
         if error:
             self._error(client, error, 400)
             return
-        http_list = self._configuration.setdefault('http', [])
+        http_list = self._http_list(create=True)
         new_id, id_error = self._claim_id(data)
         if id_error:
             self._error(client, id_error, 400)
             return
-        srv = {'id': new_id,
-               'address': data.get('address', '0.0.0.0'),
-               'port': data['port']}
-        if data.get('name'):
-            srv['name'] = data['name']
-        if 'ssl' in data:
-            srv['ssl'] = data['ssl']
-        # Try to create server before saving config
+        srv = self._http_entry(data, new_id)
+        # Only write it down once it is actually running.
         try:
             srv_tuple = self._create_http_server(srv)
         except ValueError as e:
@@ -1720,7 +1750,7 @@ class HttpServerWrapper():
         """Update HTTP server"""
         if not self._require_admin(client, user):
             return
-        http_list = self._configuration.get('http', [])
+        http_list = self._http_list()
         if index < 0 or index >= len(http_list):
             self._error(client, 'HTTP server not found', 404)
             return
@@ -1734,28 +1764,29 @@ class HttpServerWrapper():
         if id_error:
             self._error(client, id_error, 400)
             return
-        srv = {'id': new_id,
-               'address': data.get('address', '0.0.0.0'),
-               'port': data['port']}
-        if data.get('name'):
-            srv['name'] = data['name']
-        if 'ssl' in data:
-            srv['ssl'] = data['ssl']
-        http_list[index] = srv
-        self._save_config()
-        # Check if restart needed (address/port/ssl changed)
+        srv = self._http_entry(data, new_id)
         needs_restart = (
             old.get('address', '0.0.0.0') != srv.get('address', '0.0.0.0') or
             old.get('port') != srv.get('port') or
-            old.get('ssl') != srv.get('ssl'))
+            old.get('ssl') != srv.get('ssl') or
+            old.get('allow') != srv.get('allow') or
+            old.get('deny') != srv.get('deny'))
         if needs_restart and index < len(self._servers):
-            # Restart only this server
             self._servers[index][0].close()
             try:
                 self._servers[index] = self._create_http_server(srv)
-            except ValueError as e:
-                self._error(client, str(e), 400)
+            except ValueError as err:
+                # Put back what was running, and leave the file alone:
+                # it must not describe a server this process is not.
+                try:
+                    self._servers[index] = self._create_http_server(old)
+                except ValueError as back_err:
+                    self._log.error(
+                        "HTTP server could not be restored: %s", back_err)
+                self._error(client, str(err), 400)
                 return
+        http_list[index] = srv
+        self._save_config()
         self._log.info("HTTP server updated")
         client.respond({'ok': True})
 
@@ -1763,7 +1794,7 @@ class HttpServerWrapper():
         """Delete HTTP server"""
         if not self._require_admin(client, user):
             return
-        http_list = self._configuration.get('http', [])
+        http_list = self._http_list()
         if index < 0 or index >= len(http_list):
             self._error(client, 'HTTP server not found', 404)
             return

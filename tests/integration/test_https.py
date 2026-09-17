@@ -7,6 +7,7 @@ a restart.
 """
 
 import os
+import socket
 import ssl
 import unittest
 
@@ -298,3 +299,91 @@ class TestPortSslBundleUsage(base.IntegrationTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestEditingAnHttpServer(base.IntegrationTestCase):
+    """What an edit through the API does to an HTTP server entry.
+
+    The entry was rebuilt from a handful of known keys, so anything else
+    it carried - an IP filter, most of all - was dropped by an edit that
+    never mentioned it. And the config file was written before the
+    server was rebuilt, so a rebuild that failed left the file already
+    saying something the process was not doing.
+    """
+
+    second_port = None
+
+    @classmethod
+    def build_config(cls):
+        return {
+            'ports': [],
+            'http': [
+                {'id': 'main', 'name': 'main',
+                 'address': '127.0.0.1', 'port': cls.port},
+                {'id': 'guarded', 'name': 'guarded',
+                 'address': '127.0.0.1', 'port': cls.second_port,
+                 'allow': ['127.0.0.0/8'], 'deny': ['127.0.0.9']},
+            ],
+        }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.second_port = base.free_port()
+        super().setUpClass()
+
+    def _entry(self, server_id):
+        servers = self.get('/api/settings')[1]['http']
+        if isinstance(servers, dict):
+            servers = [servers]
+        for server in servers:
+            if server.get('id') == server_id:
+                return server
+        raise AssertionError(f'no HTTP server {server_id!r}')
+
+    # Numbered: the class shares one process and the later tests
+    # rewrite the entry the earlier ones read.
+    def test_1_the_filter_is_reported(self):
+        self.assertEqual(self._entry('guarded')['allow'], ['127.0.0.0/8'])
+
+    def test_2_a_rename_keeps_the_filter(self):
+        entry = dict(self._entry('guarded'))
+        entry['name'] = 'guarded-renamed'
+        status, body = self.put('/api/settings/http/guarded', entry)
+        self.assertEqual(status, 200, body)
+        after = self._entry('guarded')
+        self.assertEqual(after['name'], 'guarded-renamed')
+        self.assertEqual(after['allow'], ['127.0.0.0/8'])
+        self.assertEqual(after['deny'], ['127.0.0.9'])
+
+    def test_4_a_filter_can_be_removed_on_purpose(self):
+        """Carrying settings over must not make them impossible to drop"""
+        entry = dict(self._entry('guarded'))
+        entry.pop('allow', None)
+        entry.pop('deny', None)
+        status, body = self.put('/api/settings/http/guarded', entry)
+        self.assertEqual(status, 200, body)
+        after = self._entry('guarded')
+        self.assertNotIn('allow', after)
+        self.assertNotIn('deny', after)
+
+    def test_3_a_rebuild_that_fails_does_not_get_written(self):
+        """The file must not promise what the process could not do"""
+        blocker = socket.socket()
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(('127.0.0.1', 0))
+        blocker.listen(1)
+        taken = blocker.getsockname()[1]
+        try:
+            entry = dict(self._entry('guarded'))
+            entry['port'] = taken
+            status, _body = self.put('/api/settings/http/guarded', entry)
+            self.assertEqual(status, 400)
+            on_disk = [s for s in self.proc.read_config()['http']
+                       if s.get('id') == 'guarded'][0]
+            self.assertEqual(on_disk['port'], self.second_port)
+            # And the server it had is still answering.
+            probe = socket.create_connection(
+                ('127.0.0.1', self.second_port), 5)
+            probe.close()
+        finally:
+            blocker.close()
