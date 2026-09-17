@@ -270,6 +270,23 @@ Filter logic:
 
 Works on TCP, TELNET, SSL, WebSocket and HTTP servers. Not applicable to Unix socket (no IP addresses). Rejected connections are logged.
 
+**A rule that cannot be read stops the server it belongs to.** `allow`
+and `deny` must be lists, and every entry must parse as an address or a
+network — a typo is refused rather than dropped with a warning, because
+a filter that silently enforces less than it says is worse than one that
+refuses to start. The server is not lost: it keeps its place in the
+configuration, reports the reason through the API and shows up as a red
+card in the web UI, so fixing the rule and saving starts it. The same
+check runs on the API, so a bad rule is answered with 400 instead of
+being written to `config.json`.
+
+**IPv4 and IPv6 rules match whichever form the client arrives in.** A
+server listening on an address containing a colon (`"::"`) accepts IPv4
+clients too, and they arrive as IPv4-mapped addresses like
+`::ffff:192.168.1.100`. Rules written the ordinary way (`192.168.1.100`,
+`192.168.1.0/24`) apply to them; so does a rule written in the mapped
+form. Real IPv6 clients are matched against IPv6 rules as usual.
+
 ##### Managing certificates via web UI
 
 The web UI has a **Certificates** tab (admin only) for managing SSL

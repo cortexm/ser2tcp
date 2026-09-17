@@ -1246,13 +1246,9 @@ class HttpServerWrapper():
                         if sig.lower() not in _control.SIGNAL_BITS:
                             return f'Unknown signal: {sig}'
             # Validate IP filter config
-            for key in ('allow', 'deny'):
-                if key in srv:
-                    if not isinstance(srv[key], list):
-                        return f'{key} must be a list'
-                    for network in srv[key]:
-                        if not isinstance(network, str):
-                            return f'{key} entries must be strings'
+            error = self._validate_ip_rules(srv)
+            if error:
+                return error
             # Validate max_connections (0 = unlimited)
             if 'max_connections' in srv:
                 max_conn = srv['max_connections']
@@ -1763,6 +1759,24 @@ class HttpServerWrapper():
         self._log.info("Settings updated")
         client.respond({'ok': True})
 
+    @staticmethod
+    def _validate_ip_rules(config):
+        """Check allow/deny with the parser the filter itself uses.
+
+        Building the filter would refuse a bad rule anyway, but only
+        after the server has been closed to be rebuilt - so a typo cost
+        a working server a bounce and a rollback. Asking the same
+        question first turns that into a plain 400.
+        """
+        if not isinstance(config, dict):
+            return None
+        try:
+            _ip_filter.IpFilter(
+                allow=config.get('allow'), deny=config.get('deny'))
+        except ValueError as err:
+            return str(err)
+        return None
+
     def _validate_http_config(self, data):
         """Validate HTTP server config, return error string or None"""
         if not isinstance(data, dict):
@@ -1782,7 +1796,7 @@ class HttpServerWrapper():
             err = self._validate_ssl_config(data['ssl'])
             if err:
                 return err
-        return None
+        return self._validate_ip_rules(data)
 
     def _validate_ssl_config(self, ssl):
         """Validate {"bundle": "...", "require_client_cert": bool} block.

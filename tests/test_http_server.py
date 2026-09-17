@@ -1144,7 +1144,7 @@ class TestIpFilterValidation(unittest.TestCase):
                 'allow': '192.168.1.0/24',
             }]
         })
-        self.assertEqual(result, 'allow must be a list')
+        self.assertIn('allow must be a list', result)
 
     def test_deny_not_list(self):
         wrapper = make_wrapper()
@@ -1156,7 +1156,7 @@ class TestIpFilterValidation(unittest.TestCase):
                 'deny': '10.0.0.0/8',
             }]
         })
-        self.assertEqual(result, 'deny must be a list')
+        self.assertIn('deny must be a list', result)
 
     def test_allow_entry_not_string(self):
         wrapper = make_wrapper()
@@ -1168,7 +1168,34 @@ class TestIpFilterValidation(unittest.TestCase):
                 'allow': [123],
             }]
         })
-        self.assertEqual(result, 'allow entries must be strings')
+        self.assertIn('allow entries must be strings', result)
+
+    def test_a_rule_that_is_not_an_address_is_refused(self):
+        """It used to pass here and be dropped when the filter was built,
+        so the server came up enforcing less than the config said."""
+        wrapper = make_wrapper()
+        result = wrapper._validate_port_config({
+            'serial': {'port': '/dev/ttyUSB0'},
+            'servers': [{
+                'protocol': 'tcp',
+                'port': 10001,
+                'deny': ['192.168.1.1OO'],
+            }]
+        })
+        self.assertIn('192.168.1.1OO', result)
+
+    def test_an_http_server_rule_is_checked_too(self):
+        wrapper = make_wrapper()
+        result = wrapper._validate_http_config({
+            'address': '127.0.0.1', 'port': 8080, 'allow': 'not-a-list'})
+        self.assertIn('allow must be a list', result)
+
+    def test_a_valid_http_server_rule_passes(self):
+        wrapper = make_wrapper()
+        result = wrapper._validate_http_config({
+            'address': '127.0.0.1', 'port': 8080,
+            'allow': ['192.168.0.0/16']})
+        self.assertIsNone(result)
 
     def test_websocket_with_ip_filter(self):
         wrapper = make_wrapper()
