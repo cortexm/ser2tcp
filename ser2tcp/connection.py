@@ -164,11 +164,26 @@ class Connection():
         return "%s:%d" % self._addr
 
     def send(self, data):
-        """Add data to output buffer, return number of bytes added"""
+        """Add data to output buffer, return number of bytes added.
+
+        A client that cannot keep up with the device is dropped once
+        the buffer is full. Nothing can slow a serial port down, so the
+        only other option is to discard what will not fit - and a
+        stream with silent holes in it is worse than no stream for
+        anything framed or checksummed, which serial protocols are.
+        Doing it silently was worse again: the connection looked
+        healthy while its data was going nowhere.
+        """
         if not self._socket:
             return None
         new_size = len(self._out_buffer) + len(data)
         if self._buffer_limit and new_size > self._buffer_limit:
+            self._log.warning(
+                "(%s): output buffer full (%d bytes, limit %d), "
+                "dropping client - it cannot keep up with the device",
+                self.address_str(), len(self._out_buffer),
+                self._buffer_limit)
+            self.close()
             return None
         if not self._out_buffer:
             # Reset timeout when buffer becomes non-empty

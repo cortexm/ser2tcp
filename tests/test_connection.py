@@ -214,3 +214,63 @@ class TestReadBackpressure(unittest.TestCase):
         conn.set_read_paused(True)
         conn._last_write_time = time.time() - 3600
         self.assertTrue(conn.is_stale())
+
+
+class TestBufferLimit(unittest.TestCase):
+    """A client that cannot keep up with the device.
+
+    Nothing can slow a serial port down, so there is no backpressure to
+    apply in this direction - only a choice between handing the client a
+    stream with silent holes in it and telling it to go away. For a
+    serial protocol the holes are worse, and the silence is worse still:
+    the connection looked healthy while its data was being discarded.
+    """
+
+    def _conn(self, limit=100):
+        conn = Connection(
+            (MockSocket(), ('127.0.0.1', 5555)), buffer_limit=limit,
+            log=Mock())
+        selector = Mock()
+        conn.attach(selector, owner='server')
+        return conn
+
+    def test_what_fits_is_accepted(self):
+        conn = self._conn()
+        self.assertEqual(conn.send(b'x' * 50), 50)
+        self.assertFalse(conn.is_closed())
+
+    def test_overflowing_drops_the_client(self):
+        conn = self._conn()
+        conn.send(b'x' * 80)
+        conn.send(b'x' * 80)
+        self.assertTrue(conn.is_closed())
+
+    def test_overflowing_says_so(self):
+        conn = self._conn()
+        conn.send(b'x' * 80)
+        conn.send(b'x' * 80)
+        self.assertTrue(conn._log.warning.called)
+        message = str(conn._log.warning.call_args)
+        self.assertIn('buffer', message.lower())
+
+    def test_nothing_half_written_is_left_behind(self):
+        """The buffer keeps what it had; the rest was never accepted"""
+        conn = self._conn()
+        conn.send(b'a' * 80)
+        before = bytes(conn._out_buffer)
+        conn.send(b'b' * 80)
+        self.assertEqual(bytes(conn._out_buffer), before)
+
+    def test_a_reaped_connection_is_visible_to_the_server(self):
+        conn = self._conn()
+        conn.send(b'x' * 80)
+        conn.send(b'x' * 80)
+        # process_stale() looks for exactly this.
+        self.assertTrue(conn.is_closed())
+
+    def test_without_a_limit_nothing_is_dropped(self):
+        conn = self._conn(limit=None)
+        for _ in range(10):
+            conn.send(b'x' * 1000)
+        self.assertFalse(conn.is_closed())
+        self.assertEqual(len(conn._out_buffer), 10000)
