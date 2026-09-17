@@ -547,6 +547,22 @@ Generate password hash:
 ser2tcp --hash-password mysecretpassword
 ```
 
+A password given to the API in plain text is hashed before it is stored,
+so `users` in `config.json` never holds one. Whether a value is already
+a hash is decided on its whole shape — `sha256:<salt>:<digest>` — not on
+the `sha256:` prefix, so a password that happens to start with those
+characters is hashed like any other rather than stored verbatim.
+
+> **The hash is salted SHA-256, single pass.** That stops rainbow tables
+> and stops one leaked password from unlocking the other accounts, but
+> it is fast to compute — so anyone who gets hold of `config.json` (a
+> backup, a shared machine) can run a dictionary attack against it at
+> speed. Keep the file readable only by the user running ser2tcp, and
+> treat a leaked config as a reason to change every password in it.
+
+A failed login takes the same work whether the account exists or not, so
+the response time does not say which logins are real.
+
 HTTPS with SSL — uses the same bundle-based config as port SSL servers:
 
 ```json

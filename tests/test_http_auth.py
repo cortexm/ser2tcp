@@ -2,7 +2,9 @@
 
 import time
 import unittest
+from unittest.mock import patch
 
+import ser2tcp.http_auth as http_auth
 from ser2tcp.http_auth import (
     hash_password, verify_password, ensure_hashed, SessionManager)
 
@@ -650,3 +652,104 @@ class TestReadingASessionWithoutRenewingIt(unittest.TestCase):
 
     def test_an_unknown_token_reports_nothing(self):
         self.assertIsNone(self._manager().session_state('nonsense'))
+
+
+class TestAHashIsRecognisedByItsShape(unittest.TestCase):
+    """`sha256:` at the front is not proof of anything.
+
+    A password that happens to start with it was stored verbatim as
+    though it were already hashed. Nothing complained: the account was
+    simply created with a password nobody could ever log in with, since
+    verify_password() hashes what it is given and compares.
+    """
+
+    def test_a_password_starting_with_the_prefix_gets_hashed(self):
+        stored = ensure_hashed('sha256:hunter2')
+        self.assertNotEqual(stored, 'sha256:hunter2')
+
+    def test_and_that_password_still_works(self):
+        self.assertTrue(
+            verify_password('sha256:hunter2', ensure_hashed('sha256:hunter2')))
+
+    def test_a_real_hash_is_left_alone(self):
+        digest = hash_password('secret')
+        self.assertEqual(ensure_hashed(digest), digest)
+
+    def test_too_few_parts_is_not_a_hash(self):
+        self.assertNotEqual(ensure_hashed('sha256:nocolon'), 'sha256:nocolon')
+
+    def test_too_many_parts_is_not_a_hash(self):
+        value = 'sha256:aa:bb:cc'
+        self.assertNotEqual(ensure_hashed(value), value)
+
+    def test_a_salt_that_is_not_hex_is_not_a_hash(self):
+        value = 'sha256:' + ('z' * 32) + ':' + ('a' * 64)
+        self.assertNotEqual(ensure_hashed(value), value)
+
+    def test_a_digest_of_the_wrong_length_is_not_a_hash(self):
+        value = 'sha256:' + ('a' * 32) + ':' + ('b' * 63)
+        self.assertNotEqual(ensure_hashed(value), value)
+
+    def test_a_digest_that_is_not_hex_is_not_a_hash(self):
+        value = 'sha256:' + ('a' * 32) + ':' + ('z' * 64)
+        self.assertNotEqual(ensure_hashed(value), value)
+
+    def test_verify_refuses_a_stored_value_of_the_wrong_shape(self):
+        self.assertFalse(verify_password('hunter2', 'sha256:hunter2:x'))
+
+    def test_a_user_added_with_such_a_password_can_sign_in(self):
+        mgr = SessionManager({'session_timeout': 3600})
+        mgr.add_user('ann', 'sha256:looks-like-a-hash')
+        self.assertIsNotNone(mgr.login('ann', 'sha256:looks-like-a-hash'))
+
+    def test_and_the_same_after_a_password_change(self):
+        mgr = SessionManager({'session_timeout': 3600, 'users': [
+            {'login': 'ann', 'password': hash_password('old')}]})
+        mgr.update_user('ann', password='sha256:looks-like-a-hash')
+        self.assertIsNotNone(mgr.login('ann', 'sha256:looks-like-a-hash'))
+
+
+class TestAnUnknownLoginCostsTheSame(unittest.TestCase):
+    """Whether a login exists must not be readable off the clock.
+
+    An unknown login returned before hashing anything, so it answered
+    measurably faster than a known one with the wrong password - enough
+    to enumerate accounts.
+
+    Asserted through the work done rather than the time taken: a wall
+    clock test would have to pick a threshold, and would fail on a busy
+    machine for reasons that have nothing to do with the code.
+    """
+
+    def _manager(self):
+        return SessionManager({'session_timeout': 3600, 'users': [
+            {'login': 'ann', 'password': hash_password('secret')}]})
+
+    def _verifications(self, login, password):
+        mgr = self._manager()
+        with patch('ser2tcp.http_auth.verify_password',
+                   wraps=verify_password) as spy:
+            result = mgr.login(login, password)
+        return result, spy.call_count
+
+    def test_a_known_login_with_a_wrong_password_hashes_once(self):
+        result, calls = self._verifications('ann', 'wrong')
+        self.assertIsNone(result)
+        self.assertEqual(calls, 1)
+
+    def test_an_unknown_login_hashes_too(self):
+        result, calls = self._verifications('nobody', 'wrong')
+        self.assertIsNone(result)
+        self.assertEqual(calls, 1)
+
+    def test_it_is_hashed_against_something_no_password_matches(self):
+        """The stand-in must not be a hash of anything guessable"""
+        mgr = self._manager()
+        for candidate in ('', 'password', 'secret', http_auth.DUMMY_HASH):
+            self.assertIsNone(mgr.login('nobody', candidate))
+
+    def test_a_real_login_still_works(self):
+        self.assertIsNotNone(self._manager().login('ann', 'secret'))
+
+    def test_a_login_that_is_not_a_string_is_still_refused(self):
+        self.assertIsNone(self._manager().login(None, 'secret'))

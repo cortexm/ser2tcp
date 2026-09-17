@@ -1,11 +1,30 @@
 """Authentication and session management"""
 
 import hashlib as _hashlib
+import re as _re
 import secrets as _secrets
 import time as _time
 
 
 DEFAULT_SESSION_TIMEOUT = 3600
+
+# sha256:<salt hex>:<digest hex>, exactly as hash_password() writes it.
+# The digest length is fixed by the algorithm; the salt is left open
+# because an older config may carry one of a different length. Lower
+# case only - an upper-case digest never verified anyway, since the
+# comparison is against a freshly computed lower-case one.
+_HASH_RE = _re.compile(r'^sha256:[0-9a-f]+:[0-9a-f]{64}$')
+
+
+def is_password_hash(value):
+    """True if `value` is a stored password hash rather than a password.
+
+    The prefix alone is not an answer: a password may start with
+    "sha256:" like any other string. Deciding on the whole shape leaves
+    only passwords that are a well-formed digest, which is a far smaller
+    thing to be unlucky about.
+    """
+    return isinstance(value, str) and bool(_HASH_RE.match(value))
 
 
 def hash_password(password):
@@ -18,10 +37,16 @@ def hash_password(password):
 
 
 def ensure_hashed(password):
-    """Return password as hash - hash if plain, keep if already hashed"""
+    """Return password as hash - hash if plain, keep if already hashed.
+
+    Trusting the prefix stored a password that merely began with
+    "sha256:" as though it were already hashed. Nothing complained, and
+    the account was created with a password nobody could ever sign in
+    with: verify_password() hashes what it is given and compares.
+    """
     if not isinstance(password, str):
         raise TypeError('password must be a string')
-    if password.startswith('sha256:'):
+    if is_password_hash(password):
         return password
     return hash_password(password)
 
@@ -33,17 +58,17 @@ def verify_password(password, stored):
     file, so neither is guaranteed to be a string. A wrong type is an
     answer to this question - "no" - not a reason to raise.
     """
-    if not isinstance(password, str) or not isinstance(stored, str):
+    if not isinstance(password, str) or not is_password_hash(stored):
         return False
-    if not stored.startswith('sha256:'):
-        return False
-    parts = stored.split(':')
-    if len(parts) != 3:
-        return False
-    salt = parts[1]
-    expected = parts[2]
+    _, salt, expected = stored.split(':')
     h = _hashlib.sha256((salt + password).encode()).hexdigest()
     return _secrets.compare_digest(h, expected)
+
+
+# Something to hash against when the login does not exist, so that the
+# answer takes the same work either way. Built from a random secret at
+# import: no password matches it, and none can be constructed to.
+DUMMY_HASH = hash_password(_secrets.token_hex(32))
 
 
 def _check_timeout(value, where):
@@ -115,13 +140,18 @@ class SessionManager():
         needs no authentication, so neither is guaranteed to be a
         string - and an unhashable one would raise out of the lookup
         below rather than simply failing to match.
+
+        A login that does not exist is hashed against a stand-in rather
+        than answered straight away. Returning early made "no such
+        user" measurably quicker than "wrong password", which is enough
+        to read a list of accounts off the clock.
         """
         if not isinstance(login, str):
             return None
         user = self._users.get(login)
-        if not user:
-            return None
-        if not verify_password(password, user['password']):
+        matched = verify_password(
+            password, user['password'] if user else DUMMY_HASH)
+        if not user or not matched:
             return None
         return self.create_session(login)
 
