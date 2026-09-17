@@ -322,3 +322,89 @@ class TestSocketOwnership(unittest.TestCase):
         srv = make_ws_server()
         srv.process_stale()  # should not raise
         self.assertTrue(callable(srv.close))
+
+
+class TestWebSocketBackpressure(unittest.TestCase):
+    """WebSocket clients can be held back like any other, since uhttp 3.1.
+
+    Before that there was no handle on these sockets - uhttp owns them
+    and their selector registration - so a WebSocket client feeding a
+    slow device was capped by the serial write buffer's hard limit and
+    had its data dropped once it filled. pause_reading() stops the
+    socket being read, its kernel buffer fills, and TCP stalls the peer
+    instead.
+    """
+
+    def _server(self):
+        serial = Mock()
+        serial.can_add_connection.return_value = True
+        serial.connect.return_value = True
+        return ServerWebSocket(
+            {'protocol': 'websocket', 'endpoint': 'dev'}, serial, log=Mock())
+
+    def _client(self):
+        client = Mock()
+        client.addr = ('10.0.0.1', 4444)
+        return client
+
+    def test_pausing_stops_the_socket_being_read(self):
+        server = self._server()
+        client = self._client()
+        server.add_connection(client)
+        server.set_read_paused(True)
+        client.pause_reading.assert_called_once()
+
+    def test_resuming_starts_it_again(self):
+        server = self._server()
+        client = self._client()
+        server.add_connection(client)
+        server.set_read_paused(True)
+        server.set_read_paused(False)
+        client.resume_reading.assert_called_once()
+
+    def test_every_client_on_the_endpoint_is_held_back(self):
+        server = self._server()
+        clients = [self._client() for _ in range(3)]
+        for client in clients:
+            server.add_connection(client)
+        server.set_read_paused(True)
+        for client in clients:
+            client.pause_reading.assert_called_once()
+
+    def test_asking_twice_changes_nothing(self):
+        server = self._server()
+        client = self._client()
+        server.add_connection(client)
+        server.set_read_paused(True)
+        server.set_read_paused(True)
+        client.pause_reading.assert_called_once()
+
+    def test_a_client_that_joins_while_paused_waits_like_the_others(self):
+        server = self._server()
+        server.set_read_paused(True)
+        client = self._client()
+        server.add_connection(client)
+        client.pause_reading.assert_called_once()
+
+    def test_sending_to_a_paused_client_is_untouched(self):
+        """Backpressure is about the direction that is backed up"""
+        server = self._server()
+        client = self._client()
+        server.add_connection(client)
+        server.set_read_paused(True)
+        server.send(b'from the device')
+        client.ws_send.assert_called_once_with(b'from the device')
+
+    def test_a_socket_that_went_away_is_not_a_problem(self):
+        server = self._server()
+        client = self._client()
+        client.pause_reading.side_effect = OSError('gone')
+        server.add_connection(client)
+        server.set_read_paused(True)  # must not raise
+
+    def test_an_older_uhttp_without_the_call_is_survivable(self):
+        server = self._server()
+        client = self._client()
+        del client.pause_reading
+        server.add_connection(client)
+        server.set_read_paused(True)  # must not raise

@@ -8,6 +8,9 @@ end-to-end frame exchange worth having rather than assumed.
 """
 
 import json
+import select
+import ssl
+import time
 import os
 import unittest
 
@@ -194,6 +197,81 @@ class TestWebSocketAfterReconfiguration(WebSocketTestCase):
         self.assertEqual(read_device(self.master_fd, 9), b'keystroke')
         os.write(self.master_fd, b'echo')
         self.assertEqual(recv_binary(conn), b'echo')
+
+
+
+class TestWebSocketBackpressure(WebSocketTestCase):
+    """A WebSocket client feeding a device slower than itself.
+
+    uhttp owns these sockets, so until it grew pause_reading() there was
+    no way to hold such a client back: it was capped by the serial write
+    buffer's hard limit and had its data dropped once that filled.
+    """
+
+    def _push(self, conn, payload, chunk=8192, seconds=3):
+        """Send whole frames until the socket stops taking them.
+
+        A non-blocking send takes what it can, which may be part of a
+        frame - so each frame is finished before the next one starts.
+        Counting a partial send as a whole frame corrupts the stream,
+        and everything after it is unparseable.
+        """
+        sock = conn.sock
+        sock.setblocking(False)
+        sent = 0
+        deadline = time.time() + seconds
+        try:
+            while sent < len(payload) and time.time() < deadline:
+                piece = payload[sent:sent + chunk]
+                frame = websocket.ABNF.create_frame(
+                    piece, websocket.ABNF.OPCODE_BINARY).format()
+                off = 0
+                while off < len(frame) and time.time() < deadline:
+                    try:
+                        off += sock.send(frame[off:])
+                    except (BlockingIOError, ssl.SSLWantWriteError):
+                        time.sleep(0.01)
+                if off < len(frame):
+                    # Out of time mid-frame: finish it so the stream
+                    # stays valid, then stop.
+                    sock.setblocking(True)
+                    sock.sendall(frame[off:])
+                    sock.setblocking(False)
+                sent += len(piece)
+        finally:
+            sock.setblocking(True)
+        return sent
+
+    def test_the_api_answers_while_the_device_is_behind(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        self._push(conn, b'x' * (512 * 1024))
+        started = time.time()
+        status, _ = self.get('/api/status', timeout=5)
+        self.assertEqual(status, 200)
+        self.assertLess(time.time() - started, 3)
+
+    def test_the_client_stays_connected_rather_than_being_dropped(self):
+        """Stalling the peer beats closing it or losing its bytes"""
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        self._push(conn, b'y' * (512 * 1024))
+        self.assertEqual(self.get('/api/status')[0], 200)
+        # Let the device drain, then check the connection still works.
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            if not select.select([self.master_fd], [], [], 0.5)[0]:
+                break
+            os.read(self.master_fd, 65536)
+        conn.send_binary(b'still here')
+        self.assertEqual(
+            read_device(self.master_fd, 10, timeout=10), b'still here')
+
+    def test_what_it_sent_first_reaches_the_device_in_order(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        payload = bytes(range(256)) * 128  # 32 KB, every byte distinct
+        sent = self._push(conn, payload, chunk=4096)
+        self.assertGreater(sent, 0)
+        got = read_device(self.master_fd, sent, timeout=25)
+        self.assertEqual(got[:len(got)], payload[:len(got)])
 
 
 if __name__ == '__main__':

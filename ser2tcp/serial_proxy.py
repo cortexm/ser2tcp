@@ -51,8 +51,9 @@ class SerialProxy():
     # it. Past the high water mark their sockets stop being read, which
     # closes the TCP window and makes the sender wait; reading starts
     # again below the low mark, so a busy port does not flap on every
-    # byte. The hard limit is the last line of defence, for clients that
-    # cannot be paused (uhttp owns the WebSocket sockets) or a device
+    # byte. That covers WebSocket clients too, through uhttp's
+    # pause_reading(). The hard limit is the last line of defence, for
+    # a burst that lands before the pause takes effect, or a device
     # that has stopped draining altogether.
     WRITE_HIGH_WATER = 64 * 1024
     WRITE_LOW_WATER = 16 * 1024

@@ -42,6 +42,8 @@ class ServerWebSocket():
             self._ctl_signals = set(s.lower() for s in signals)
         self._ip_filter = _ip_filter.create_filter(config, log=log)
         self._connections = []
+        # Set while the serial port is behind and clients must wait.
+        self._read_paused = False
         self._log.info(
             "  Server: /ws/%s WEBSOCKET", self._endpoint)
 
@@ -114,19 +116,48 @@ class ServerWebSocket():
             self._log.info(
                 "Client connected: %s WEBSOCKET /ws/%s",
                 addr, self._endpoint)
+            if self._read_paused:
+                # Joined while the port is behind: wait like the others.
+                self._apply_read_paused(client)
             if self._control:
                 self._send_signals_to(client)
         else:
             client.ws_close(1011, 'Serial port unavailable')
 
     def set_read_paused(self, paused):
-        """Backpressure has no handle here.
+        """Stop or resume reading every client on this endpoint.
 
-        uhttp owns these sockets and their selector registration, so
-        there is nothing to un-arm. WebSocket clients are held back by
-        the serial write buffer's hard limit instead - see
-        SerialProxy.WRITE_BUFFER_LIMIT.
+        uhttp owns these sockets, so it does the work: pause_reading()
+        drops the socket's read interest, its kernel buffer fills and
+        TCP stalls the peer. Sending is untouched, so what the device
+        says still reaches them.
+
+        Before uhttp grew this there was no handle here at all, and a
+        WebSocket client feeding a slow device was held back only by
+        the serial write buffer's hard limit - which means having its
+        data dropped once that filled.
         """
+        if self._read_paused == bool(paused):
+            return
+        self._read_paused = bool(paused)
+        for client in list(self._connections):
+            self._apply_read_paused(client)
+
+    def _apply_read_paused(self, client):
+        """Put one client into the endpoint's current read state"""
+        try:
+            if self._read_paused:
+                client.pause_reading()
+            else:
+                client.resume_reading()
+        except AttributeError:
+            # uhttp older than 3.1 has no handle for this.
+            self._log.debug(
+                "uhttp has no pause_reading(); cannot hold back %s",
+                self._client_addr(client))
+        except OSError:
+            # Socket already gone; process_stale() will reap it.
+            pass
 
     def disconnect_client(self, client):
         """Drop one client on request, return its address for logging.
