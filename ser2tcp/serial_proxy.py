@@ -44,6 +44,11 @@ class FailedProxy():
         self._error = str(error)
 
     @property
+    def id(self):
+        """Stable identifier from the configuration"""
+        return self._config.get('id')
+
+    @property
     def name(self):
         """Return port name"""
         return self._config.get('name', '')
@@ -182,6 +187,7 @@ class SerialProxy():
         self._last_signal_poll = 0
         self._signal_poll_interval = 0.1
         self._has_control_servers = False
+        self._id = config.get('id')
         self._name = config.get('name', '')
         self._max_connections = config.get('max_connections', 0)
         self._match = config['serial'].get('match')
@@ -360,6 +366,15 @@ class SerialProxy():
         self._reader_thread = None
         self._reader_sock_r = None
         self._reader_sock_w = None
+
+    @property
+    def id(self):
+        """Stable identifier from the configuration.
+
+        Positions renumber; this does not. The API addresses ports by
+        it, so the UI has to be told what it is.
+        """
+        return self._id
 
     @property
     def name(self):

@@ -424,7 +424,8 @@ function _parseQuery(s) {
 const routes = [
   [/^\/ports$/,                    () => showPorts()],
   [/^\/ports\/new$/,               m => showPortEditor(null, m._q)],
-  [/^\/ports\/(\d+)\/edit$/,       m => showPortEditor(parseInt(m[1]), m._q)],
+  [/^\/ports\/([^/]+)\/edit$/,      m => showPortEditor(
+      decodeURIComponent(m[1]), m._q)],
   [/^\/detected$/,                 () => showDetected()],
   [/^\/users$/,                    () => showUsers()],
   [/^\/users\/new$/,               () => showUserEditor(null)],
@@ -434,7 +435,8 @@ const routes = [
   [/^\/settings$/,                 () => showSettings()],
   [/^\/settings\/session$/,        () => showSessionEditor()],
   [/^\/settings\/http\/new$/,      () => showHttpEditor(null)],
-  [/^\/settings\/http\/(\d+)\/edit$/, m => showHttpEditor(parseInt(m[1]))],
+  [/^\/settings\/http\/([^/]+)\/edit$/, m => showHttpEditor(
+      decodeURIComponent(m[1]))],
   [/^\/certificates$/,             () => showCertificates()],
   [/^\/certificates\/new$/,        () => showCertEditor(null)],
   [/^\/certificates\/generate$/,   () => showCertGenerator()],
@@ -554,15 +556,61 @@ function showDetected() {
   renderDetectedSection();
 }
 
+// Every id in use, so the editor can offer one that is not and warn
+// before the server has to.
+function knownIds() {
+  const ids = new Set();
+  ((portsStatus && portsStatus.ports) || []).forEach(p => {
+    if (p.id) ids.add(p.id);
+  });
+  let http = (currentSettings && currentSettings.http) || [];
+  if (!Array.isArray(http)) http = [http];
+  http.forEach(srv => { if (srv && srv.id) ids.add(srv.id); });
+  return ids;
+}
+
+const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+// Every server setting the editor has a field for. These are rebuilt
+// from the form on save; anything else is carried over untouched.
+const FORM_OWNED_SERVER_KEYS = [
+  'address', 'port', 'endpoint', 'token', 'ssl', 'data', 'control',
+  'allow', 'deny', 'max_connections',
+];
+
+// The same shape the server generates, so a pre-filled field is a real
+// id rather than a placeholder that turns into something else on save.
+function suggestId() {
+  const taken = knownIds();
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const bytes = new Uint8Array(4);
+    crypto.getRandomValues(bytes);
+    const candidate = [...bytes]
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+    if (!taken.has(candidate)) return candidate;
+  }
+  return '';
+}
+
 // Recompute usedPorts/usedEndpoints — used by editor for conflict checks.
 function _rebuildUsedSets() {
   usedPorts = [];
   usedEndpoints = [];
   if (!portsStatus) return;
   portsStatus.ports.forEach((p, i) => {
+    // Carry the id to tell the port being edited apart from the rest,
+    // and the label to say which port the clash is with.
+    const owner = { id: p.id, label: p.name || ('Port ' + (i + 1)) };
     (p.servers || []).forEach(s => {
-      if (s.port) usedPorts.push({address: s.address, port: s.port, index: i});
-      if (s.endpoint) usedEndpoints.push({endpoint: s.endpoint, index: i});
+      if (s.port) {
+        usedPorts.push({
+          address: s.address, port: s.port,
+          id: owner.id, label: owner.label});
+      }
+      if (s.endpoint) {
+        usedEndpoints.push({
+          endpoint: s.endpoint, id: owner.id, label: owner.label});
+      }
     });
   });
 }
@@ -769,18 +817,23 @@ function renderPortCard(port, index) {
   const ser = port.serial || {};
   const state = _portState(port);
   const card = el('div', { class: 'card card-' + state });
-  card.dataset.portIndex = index;
+  // Ports are addressed by id, not by where they sit in the list: an
+  // entry added or removed elsewhere would otherwise renumber the rest
+  // and send an edit to the wrong port.
+  const id = port.id;
+  card.dataset.portId = id;
 
   // Header row: title + kebab
-  const titleText = port.name || ser.port || ('Port ' + index);
+  const titleText = port.name || ser.port || ('Port ' + (index + 1));
   const titleSpan = el('span', { class: 'card-title' }, titleText);
   const headerRow = el('div', { class: 'card-header-row' }, titleSpan);
   if (isAdmin) {
     headerRow.appendChild(kebabMenu([
       { label: 'Edit', cls: 'btn-accent',
-        onclick: () => navigate('/ports/' + index + '/edit') },
+        onclick: () => navigate('/ports/' + encodeURIComponent(id)
+          + '/edit') },
       { label: 'Delete', cls: 'btn-danger',
-        onclick: () => confirmDeletePort(index, titleText) },
+        onclick: () => confirmDeletePort(id, titleText) },
     ]));
   }
   card.appendChild(headerRow);
@@ -844,14 +897,14 @@ function renderPortCard(port, index) {
   // system, since opening them would just immediately fail).
   const serverUl = el('ul', { class: 'server-list' });
   (port.servers || []).forEach((s, si) => {
-    serverUl.appendChild(renderServerRow(s, index, si, state));
+    serverUl.appendChild(renderServerRow(s, id, si, state));
   });
   card.appendChild(serverUl);
 
   return card;
 }
 
-function renderServerRow(srv, portIdx, srvIdx, portState) {
+function renderServerRow(srv, portId, srvIdx, portState) {
   const proto = (srv.protocol || 'tcp').toUpperCase();
   const li = el('li', { class: 'server-row' });
 
@@ -924,7 +977,7 @@ function renderServerRow(srv, portIdx, srvIdx, portState) {
         type: 'button',
         class: 'client-disconnect',
         title: 'Disconnect ' + c.address,
-        onclick: () => disconnectClient(portIdx, srvIdx, ci),
+        onclick: () => disconnectClient(portId, c.id),
       });
       dcBtn.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12">'
         + '<path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"'
@@ -1030,56 +1083,25 @@ function renderDetectedCard(p, configured) {
   return card;
 }
 
-function confirmDeletePort(index, name) {
+function confirmDeletePort(id, name) {
   if (!confirm('Delete port "' + name + '"?')) return;
-  api('DELETE', '/api/ports/' + index)
+  api('DELETE', '/api/ports/' + encodeURIComponent(id))
     .then(() => navigate('/ports'))
     .catch(e => { if (e !== 'unauthorized') alert(e); });
 }
 
-function disconnectClient(portIdx, srvIdx, conIdx) {
+function disconnectClient(portId, connId) {
+  // The connection is named, not counted: a client hanging up shifts
+  // every position after it, so a click would land on someone else.
   // Stream auto-refreshes the connections list — no explicit reload here.
-  api('DELETE', '/api/ports/' + portIdx + '/connections/' + srvIdx + '/' + conIdx)
+  api('DELETE', '/api/ports/' + encodeURIComponent(portId)
+      + '/connections/' + encodeURIComponent(connId))
     .catch(e => { if (e !== 'unauthorized') alert(e); });
 }
 
 // ===========================================================================
 // Port editor (modal)
 // ===========================================================================
-function _buildConfigFromStatus(port) {
-  const ser = port.serial || {};
-  const cfg = { serial: {} };
-  if (port.name) cfg.name = port.name;
-  if (port.max_connections !== undefined) cfg.max_connections = port.max_connections;
-  if (ser.match) cfg.serial.match = { ...ser.match };
-  if (ser.port) cfg.serial.port = ser.port;
-  if (ser.baudrate) cfg.serial.baudrate = ser.baudrate;
-  if (ser.bytesize) cfg.serial.bytesize = ser.bytesize;
-  if (ser.parity) cfg.serial.parity = ser.parity;
-  if (ser.stopbits) cfg.serial.stopbits = ser.stopbits;
-  cfg.servers = (port.servers || []).map(s => {
-    const srv = { protocol: s.protocol.toLowerCase() };
-    if (s.data === false) srv.data = false;
-    if (s.protocol === 'WEBSOCKET') {
-      if (s.endpoint) srv.endpoint = s.endpoint;
-      if (s.token) srv.token = s.token;
-    } else {
-      srv.address = s.address;
-      if (s.port !== undefined) srv.port = s.port;
-      if (s.ssl) srv.ssl = s.ssl;
-    }
-    if (s.control) srv.control = s.control;
-    if (s.allow) srv.allow = s.allow;
-    if (s.deny) srv.deny = s.deny;
-    if (s.max_connections !== undefined) srv.max_connections = s.max_connections;
-    return srv;
-  });
-  if (!cfg.servers.length) {
-    cfg.servers = [{protocol: 'tcp', address: '0.0.0.0', port: _nextFreePort()}];
-  }
-  return cfg;
-}
-
 function _nextFreePort(start) {
   const used = new Set(usedPorts.map(u => u.port));
   let p = start || 10001;
@@ -1087,27 +1109,41 @@ function _nextFreePort(start) {
   return p;
 }
 
-function showPortEditor(index, query) {
-  // Wait for portsStatus from the stream (e.g. when arriving via direct
-  // hash like #/ports/3/edit before the snapshot lands).
+function showPortEditor(id, query) {
+  // Wait for portsStatus from the stream: the form needs the detected
+  // device list and the port/endpoint conflict sets, which come from it.
   if (!portsStatus) {
-    setTimeout(() => showPortEditor(index, query), 50);
+    setTimeout(() => showPortEditor(id, query), 50);
     return;
   }
-  // Load cert bundles fresh — needed for SSL server config.
-  api('GET', '/api/certs').then(data => {
-    _showPortEditorWithBundles(index, query, data.bundles || []);
+  // The configuration, not the status. The status says what is
+  // happening; the editor writes back what was configured, and the two
+  // are not the same document - it reports no IP filters, no WebSocket
+  // tokens, no timeouts, and serial settings already converted to what
+  // pyserial was handed. Editing that and saving it rewrote the port
+  // with different settings than it had.
+  const wanted = [api('GET', '/api/certs')];
+  if (id !== null) wanted.push(api('GET', '/api/ports/' + encodeURIComponent(id)));
+  Promise.all(wanted).then(([certs, cfg]) => {
+    _showPortEditorWithBundles(id, query, certs.bundles || [], cfg);
   }).catch(e => {
-    if (e !== 'unauthorized') alert(String(e));
+    if (e === 'unauthorized') return;
+    // A port somebody else removed while this was being opened.
+    navigate('/ports');
   });
 }
 
-function _showPortEditorWithBundles(index, query, bundles) {
+function _showPortEditorWithBundles(id, query, bundles, stored) {
   let cfg;
-  if (index !== null) {
-    const port = portsStatus.ports[index];
-    if (!port) return navigate('/ports');
-    cfg = _buildConfigFromStatus(port);
+  if (id !== null) {
+    if (!stored) return navigate('/ports');
+    cfg = JSON.parse(JSON.stringify(stored));
+    cfg.serial = cfg.serial || {};
+    cfg.servers = cfg.servers || [];
+    if (!cfg.servers.length) {
+      cfg.servers = [{
+        protocol: 'tcp', address: '0.0.0.0', port: _nextFreePort()}];
+    }
   } else {
     cfg = {
       serial: {},
@@ -1119,32 +1155,46 @@ function _showPortEditorWithBundles(index, query, bundles) {
     }
   }
 
-  const form = _buildPortForm(cfg, index, bundles);
+  const form = _buildPortForm(cfg, id, bundles);
   const saveBtn = btn('Save', 'btn-primary',
-    () => _savePortFromForm(form, index));
+    () => _savePortFromForm(form, id));
   const addSrvBtn = btn('+ Add Server', 'btn-accent btn-small',
     () => form.addServerBox());
   const cancelBtn = btn('Cancel', '', () => backToList());
   const footer = [];
   footer.push(addSrvBtn);
   footer.push(el('span', { class: 'footer-spacer' }));
-  if (index !== null) {
+  if (id !== null) {
     footer.push(btn('Delete', 'btn-danger',
-      () => confirmDeletePort(index, cfg.name || ('Port ' + index))));
+      () => confirmDeletePort(id, cfg.name || 'this port')));
   }
   footer.push(cancelBtn);
   footer.push(saveBtn);
 
   openModal({
-    title: index !== null ? 'Edit Port' : 'New Port',
+    title: id !== null ? 'Edit Port' : 'New Port',
     body: form.root,
     footer,
     wide: true,
   });
 }
 
-function _buildPortForm(cfg, editIndex, bundles) {
+function _buildPortForm(cfg, editId, bundles) {
   const root = el('div');
+
+  // Identifier. What the API and every link address this port by, so
+  // it is worth being able to choose something readable - and worth
+  // seeing what it is before following a link.
+  const idInput = el('input', {
+    type: 'text',
+    value: cfg.id || suggestId(),
+    placeholder: 'letters, digits, . - _',
+  });
+  const idHint = el('div', { class: 'field-hint' },
+    editId !== null
+      ? 'Changing this breaks existing links to this port.'
+      : 'Used in the API and in links. Change it to something you '
+        + 'will recognise.');
 
   // Name
   const nameInput = el('input', { type: 'text', value: cfg.name || '' });
@@ -1294,6 +1344,8 @@ function _buildPortForm(cfg, editIndex, bundles) {
 
   // ----- Compose form -----
   root.appendChild(el('div', { class: 'section-title' }, 'Identity'));
+  root.appendChild(formRow('ID', idInput));
+  root.appendChild(idHint);
   root.appendChild(formRow('Name', nameInput));
 
   root.appendChild(el('div', { class: 'section-title' }, 'Serial port'));
@@ -1332,7 +1384,7 @@ function _buildPortForm(cfg, editIndex, bundles) {
       if (idx >= 0) serverBoxes.splice(idx, 1);
       sb.box.remove();
       _refreshRemoveButtons();
-    }, editIndex, () => serverBoxes, bundles);
+    }, editId, () => serverBoxes, bundles);
     serverBoxes.push(sb);
     serversDiv.appendChild(sb.box);
     _refreshRemoveButtons();
@@ -1350,6 +1402,7 @@ function _buildPortForm(cfg, editIndex, bundles) {
   return {
     root,
     addServerBox,
+    idInput,
     nameInput,
     portInput,
     matchCheckboxes,
@@ -1369,7 +1422,7 @@ function _getDetectedAttr(device, attr) {
   return found ? (found[attr] || '') : '';
 }
 
-function _buildServerBox(srv, onRemove, editIndex, getAllBoxes, bundles) {
+function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const box = el('div', { class: 'server-box' });
   const removeBtn = el('button', {
     type: 'button', class: 'server-remove',
@@ -1553,7 +1606,7 @@ function _buildServerBox(srv, onRemove, editIndex, getAllBoxes, bundles) {
     const ep = wsEndpointInput.value.trim();
     if (proto === 'WEBSOCKET' && ep) {
       const epConflict = usedEndpoints.find(u =>
-        u.endpoint === ep && u.index !== editIndex);
+        u.endpoint === ep && u.id !== editId);
       let editorDup = false;
       const all = getAllBoxes();
       all.forEach(b => {
@@ -1564,7 +1617,7 @@ function _buildServerBox(srv, onRemove, editIndex, getAllBoxes, bundles) {
       const epErr = epConflict || editorDup;
       wsEndpointInput.classList.toggle('field-error', !!epErr);
       wsEndpointInput.title = epConflict
-        ? 'Endpoint used by Port ' + epConflict.index
+        ? 'Endpoint already used by ' + epConflict.label
         : (editorDup ? 'Duplicate endpoint' : '');
     } else {
       wsEndpointInput.classList.remove('field-error');
@@ -1579,10 +1632,10 @@ function _buildServerBox(srv, onRemove, editIndex, getAllBoxes, bundles) {
     const p = parseInt(portInput.value);
     if (!p) { portInput.classList.remove('field-error'); return; }
     const conflict = usedPorts.find(u =>
-      u.port === p && u.address === addr && u.index !== editIndex);
+      u.port === p && u.address === addr && u.id !== editId);
     portInput.classList.toggle('field-error', !!conflict);
     portInput.title = conflict
-      ? 'Port already used by Port ' + conflict.index : '';
+      ? 'Port already used by ' + conflict.label : '';
   }
 
   protoSel.onchange = () => { updateProtoFields(); recheckConflicts(); };
@@ -1600,12 +1653,25 @@ function _buildServerBox(srv, onRemove, editIndex, getAllBoxes, bundles) {
       tokenInput: wsTokenInput, ssl,
       ctlEnableCb, dataCb, writeRowCbs, reportCbs, pollSel,
       allowInput, denyInput, maxConnInput,
+      // What was configured before this box was opened. The form does
+      // not have a field for everything a server can carry, and
+      // rebuilding the entry from the fields alone silently dropped
+      // the rest - send_timeout and buffer_limit among them.
+      original: srv || {},
     },
   };
 }
 
 function _collectPortConfig(form) {
   const cfg = { serial: {}, servers: [] };
+  const id = form.idInput.value.trim();
+  if (id) {
+    if (!ID_PATTERN.test(id)) {
+      throw new Error('ID may only contain letters, digits, dot, dash '
+        + 'and underscore');
+    }
+    cfg.id = id;
+  }
   const name = form.nameInput.value.trim();
   if (name) cfg.name = name;
   const portMax = form.portMaxInput.value.trim();
@@ -1631,7 +1697,10 @@ function _collectPortConfig(form) {
   form.serverBoxes.forEach(sb => {
     const d = sb.boxData;
     const proto = d.proto.toLowerCase();
-    const srv = { protocol: proto };
+    // Start from what was there and let the form overwrite what it
+    // owns, so settings with no field here survive the round trip.
+    const srv = { ...d.original, protocol: proto };
+    FORM_OWNED_SERVER_KEYS.forEach(key => delete srv[key]);
     if (proto === 'websocket') {
       const ep = d.epInput.value.trim();
       if (ep) srv.endpoint = ep;
@@ -1677,12 +1746,13 @@ function _collectPortConfig(form) {
   return cfg;
 }
 
-function _savePortFromForm(form, index) {
+function _savePortFromForm(form, id) {
   let cfg;
   try { cfg = _collectPortConfig(form); }
   catch (e) { return modalError(e.message); }
-  const method = index !== null ? 'PUT' : 'POST';
-  const path = index !== null ? '/api/ports/' + index : '/api/ports';
+  const method = id !== null ? 'PUT' : 'POST';
+  const path = id !== null ? '/api/ports/' + encodeURIComponent(id)
+    : '/api/ports';
   api(method, path, cfg)
     .then(() => navigate('/ports'))
     .catch(e => { if (e !== 'unauthorized') modalError(String(e)); });
@@ -2027,6 +2097,7 @@ function renderSettingsList() {
 }
 
 function renderHttpCard(srv, index) {
+  const id = srv.id;
   const card = el('div', { class: 'card card-online' });
   const ssl = srv.ssl ? ' (SSL)' : '';
   const titleText = srv.name || `${srv.address || '0.0.0.0'}:${srv.port}${ssl}`;
@@ -2035,9 +2106,10 @@ function renderHttpCard(srv, index) {
   if (isAdmin) {
     headerRow.appendChild(kebabMenu([
       { label: 'Edit', cls: 'btn-accent',
-        onclick: () => navigate('/settings/http/' + index + '/edit') },
+        onclick: () => navigate('/settings/http/'
+          + encodeURIComponent(id) + '/edit') },
       { label: 'Delete', cls: 'btn-danger',
-        onclick: () => confirmDeleteHttp(index) },
+        onclick: () => confirmDeleteHttp(id, titleText) },
     ]));
   }
   card.appendChild(headerRow);
@@ -2148,26 +2220,34 @@ function _buildSslFields(currentSsl, bundles) {
   return { wrap: sslDiv, sslCb, getValue };
 }
 
-function showHttpEditor(index) {
+function showHttpEditor(id) {
   if (!isAdmin) { navigate('/settings'); return; }
   if (!currentSettings) {
     loadSettings();
-    setTimeout(() => showHttpEditor(index), 50);
+    setTimeout(() => showHttpEditor(id), 50);
     return;
   }
   // Fetch bundle list each time so newly created bundles show up.
   api('GET', '/api/certs').then(data => {
-    _showHttpEditorWithBundles(index, data.bundles || []);
+    _showHttpEditorWithBundles(id, data.bundles || []);
   }).catch(e => {
     if (e !== 'unauthorized') alert(String(e));
   });
 }
 
-function _showHttpEditorWithBundles(index, bundles) {
-  const isNew = index === null;
+function _showHttpEditorWithBundles(id, bundles) {
+  const isNew = id === null;
+  let servers = currentSettings.http || [];
+  if (!Array.isArray(servers)) servers = [servers];
   const srv = isNew ? { address: '0.0.0.0', port: 8080 }
-                    : (currentSettings.http || [])[index] || {};
+                    : servers.find(x => x.id === id);
+  if (!isNew && !srv) return navigate('/settings');
 
+  const idInput = el('input', {
+    type: 'text',
+    value: srv.id || suggestId(),
+    placeholder: 'letters, digits, . - _',
+  });
   const nameInput = el('input', { type: 'text', value: srv.name || '',
     placeholder: 'optional' });
   const addrInput = el('input', { type: 'text',
@@ -2178,6 +2258,10 @@ function _showHttpEditorWithBundles(index, bundles) {
 
   const body = el('div',
     {},
+    formRow('ID', idInput),
+    el('div', { class: 'field-hint' },
+      isNew ? 'Used in the API and in links.'
+        : 'Changing this breaks existing links to this server.'),
     formRow('Name', nameInput),
     formRow('Address', addrInput),
     formRow('Port', portInput),
@@ -2191,38 +2275,47 @@ function _showHttpEditorWithBundles(index, bundles) {
     body,
     footer: [
       !isNew ? btn('Delete', 'btn-danger',
-        () => confirmDeleteHttp(index)) : null,
+        () => confirmDeleteHttp(id)) : null,
       el('span', { class: 'footer-spacer' }),
       btn('Cancel', '', () => backToList()),
       btn('Save', 'btn-primary',
-        () => _saveHttpServer(isNew ? null : index,
-          { nameInput, addrInput, portInput, ssl })),
+        () => _saveHttpServer(isNew ? null : id,
+          { idInput, nameInput, addrInput, portInput, ssl })),
     ].filter(Boolean),
   });
 }
 
-function _saveHttpServer(index, fields) {
+function _saveHttpServer(id, fields) {
   const data = {
     address: fields.addrInput.value.trim() || '0.0.0.0',
     port: parseInt(fields.portInput.value) || 8080,
   };
+  const chosenId = fields.idInput.value.trim();
+  if (chosenId) {
+    if (!ID_PATTERN.test(chosenId)) {
+      return modalError('ID may only contain letters, digits, dot, dash '
+        + 'and underscore');
+    }
+    data.id = chosenId;
+  }
   const name = fields.nameInput.value.trim();
   if (name) data.name = name;
   let sslVal;
   try { sslVal = fields.ssl.getValue(); }
   catch (e) { return modalError(e.message); }
   if (sslVal) data.ssl = sslVal;
-  const method = index === null ? 'POST' : 'PUT';
-  const path = index === null
-    ? '/api/settings/http' : '/api/settings/http/' + index;
+  const method = id === null ? 'POST' : 'PUT';
+  const path = id === null
+    ? '/api/settings/http'
+    : '/api/settings/http/' + encodeURIComponent(id);
   api(method, path, data)
     .then(() => navigate('/settings'))
     .catch(e => modalError(String(e)));
 }
 
-function confirmDeleteHttp(index) {
+function confirmDeleteHttp(id) {
   if (!confirm('Delete this HTTP server?')) return;
-  api('DELETE', '/api/settings/http/' + index)
+  api('DELETE', '/api/settings/http/' + encodeURIComponent(id))
     .then(() => navigate('/settings'))
     .catch(e => { if (e !== 'unauthorized') alert(e); });
 }

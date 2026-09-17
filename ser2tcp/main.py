@@ -12,6 +12,7 @@ import socket as _socket
 
 import serial.tools.list_ports as _list_ports
 
+import ser2tcp.config_ids as _config_ids
 import ser2tcp.serial_proxy as _serial_proxy
 import ser2tcp.server_manager as _server_manager
 
@@ -154,6 +155,10 @@ def main():
     # Cert bundles live next to config.json. Pass to SerialProxy so SSL
     # servers can resolve bundle references.
     certs_dir = _os.path.join(_os.path.dirname(config_path) or '.', 'certs')
+
+    # Ports are addressed by id, and the proxies have to be built
+    # already carrying theirs.
+    _config_ids.assign_ids(configuration)
 
     servers_manager = _server_manager.ServersManager(log=log)
     serial_proxies = []

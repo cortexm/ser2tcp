@@ -206,6 +206,23 @@ class IntegrationTestCase(_unittest.TestCase):
         if cls.proc is not None:
             cls.proc.stop()
 
+    def port_id(self, index=0):
+        """The id of the port at this position in the config.
+
+        Ports are addressed by id, not by position; tests know where
+        they put a port in the file, so they look its id up here.
+        """
+        body = self.get('/api/status')[1]
+        return body['ports'][index]['id']
+
+    def http_id(self, index=0):
+        """The id of the HTTP server at this position in the config"""
+        body = self.get('/api/settings')[1]
+        servers = body['http']
+        if isinstance(servers, dict):
+            servers = [servers]
+        return servers[index]['id']
+
     def get(self, path, **kwargs):
         kwargs.setdefault('context', self.tls_context)
         return request(self.url + path, **kwargs)

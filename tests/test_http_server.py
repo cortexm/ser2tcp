@@ -8,7 +8,8 @@ from unittest.mock import Mock, MagicMock, patch
 
 from ser2tcp.cert_manager import CertManager, generate_certificate
 from ser2tcp.http_auth import hash_password
-from ser2tcp.http_server import HttpServerWrapper, _describe_detected
+from ser2tcp.http_server import (
+    HttpServerWrapper, _describe_detected, connection_id)
 from ser2tcp.server_websocket import ServerWebSocket
 
 
@@ -405,49 +406,47 @@ class TestApiDisconnect(unittest.TestCase):
         proxy.servers = [server]
         return proxy, server, con
 
+    def _wrapper_with(self, proxies, port_id='p1'):
+        configuration = {
+            'http': [{'address': '127.0.0.1', 'port': 0}],
+            'ports': [{'id': port_id, 'serial': {'port': '/dev/ttyUSB0'},
+                       'servers': []}],
+        }
+        with patch('ser2tcp.http_server._uhttp_server.HttpServer'):
+            return HttpServerWrapper(
+                {'address': '127.0.0.1', 'port': 0}, proxies,
+                log=Mock(), configuration=configuration)
+
     def test_disconnect_client(self):
         proxy, server, con = self._make_proxy_with_con()
-        wrapper = make_wrapper(serial_proxies=[proxy])
+        wrapper = self._wrapper_with([proxy])
+        conn_id = connection_id(con)
         client = MockClient(
             method='DELETE',
-            path='/api/ports/0/connections/0/0')
+            path='/api/ports/p1/connections/' + conn_id)
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 200)
         server.disconnect_client.assert_called_once_with(con)
 
     def test_disconnect_port_not_found(self):
-        wrapper = make_wrapper(serial_proxies=[])
+        wrapper = self._wrapper_with([])
         client = MockClient(
-            method='DELETE',
-            path='/api/ports/0/connections/0/0')
-        wrapper._handle_request(client)
-        self.assertEqual(client.respond_status, 404)
-
-    def test_disconnect_server_not_found(self):
-        proxy, _, _ = self._make_proxy_with_con()
-        wrapper = make_wrapper(serial_proxies=[proxy])
-        client = MockClient(
-            method='DELETE',
-            path='/api/ports/0/connections/5/0')
+            method='DELETE', path='/api/ports/nosuch/connections/1')
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 404)
 
     def test_disconnect_connection_not_found(self):
         proxy, _, _ = self._make_proxy_with_con()
-        wrapper = make_wrapper(serial_proxies=[proxy])
+        wrapper = self._wrapper_with([proxy])
         client = MockClient(
-            method='DELETE',
-            path='/api/ports/0/connections/0/5')
+            method='DELETE', path='/api/ports/p1/connections/nosuch')
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 404)
 
-    def test_disconnect_invalid_index(self):
-        wrapper = make_wrapper(serial_proxies=[])
-        client = MockClient(
-            method='DELETE',
-            path='/api/ports/0/connections/abc/0')
-        wrapper._handle_request(client)
-        self.assertEqual(client.respond_status, 400)
+    def test_a_connection_keeps_its_id(self):
+        """The whole point: it must not move when a neighbour leaves"""
+        proxy, _, con = self._make_proxy_with_con()
+        self.assertEqual(connection_id(con), connection_id(con))
 
 
 class TestApiDetect(unittest.TestCase):
@@ -738,8 +737,11 @@ class TestApiPortsCrud(unittest.TestCase):
         }
         proxies = []
         if port_configs:
-            for cfg in port_configs:
+            for number, cfg in enumerate(port_configs):
+                cfg.setdefault('id', 'port%d' % number)
                 proxy = Mock()
+                proxy.id = cfg['id']
+                proxy.error = None
                 proxy.serial_config = cfg['serial']
                 proxy.match = cfg['serial'].get('match')
                 proxy.is_connected = False
@@ -764,7 +766,7 @@ class TestApiPortsCrud(unittest.TestCase):
                 token, method='POST', path='/api/ports', data=cfg)
             wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 201)
-        self.assertEqual(client.responded['index'], 0)
+        self.assertTrue(client.responded['id'])
         manager.add_server.assert_called_once()
 
     def test_add_port_missing_serial(self):
@@ -838,7 +840,7 @@ class TestApiPortsCrud(unittest.TestCase):
         with patch.object(wrapper, '_create_proxy') as mock_create:
             mock_create.return_value = Mock()
             client = self._auth_client(
-                token, method='PUT', path='/api/ports/0', data=new_cfg)
+                token, method='PUT', path='/api/ports/port0', data=new_cfg)
             wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 200)
         manager.remove_server.assert_called_once()
@@ -849,24 +851,25 @@ class TestApiPortsCrud(unittest.TestCase):
         token = self._admin_token(wrapper)
         cfg = self._port_config()
         client = self._auth_client(
-            token, method='PUT', path='/api/ports/0', data=cfg)
+            token, method='PUT', path='/api/ports/port0', data=cfg)
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 404)
 
-    def test_update_port_invalid_index(self):
+    def test_update_an_unknown_port(self):
         wrapper, _ = self._make_wrapper_with_ports()
         token = self._admin_token(wrapper)
         client = self._auth_client(
-            token, method='PUT', path='/api/ports/abc', data={})
+            token, method='PUT', path='/api/ports/nosuch',
+            data=self._port_config())
         wrapper._handle_request(client)
-        self.assertEqual(client.respond_status, 400)
+        self.assertEqual(client.respond_status, 404)
 
     def test_delete_port(self):
         cfg = self._port_config()
         wrapper, manager = self._make_wrapper_with_ports([cfg])
         token = self._admin_token(wrapper)
         client = self._auth_client(
-            token, method='DELETE', path='/api/ports/0')
+            token, method='DELETE', path='/api/ports/port0')
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 200)
         manager.remove_server.assert_called_once()
@@ -876,7 +879,7 @@ class TestApiPortsCrud(unittest.TestCase):
         wrapper, _ = self._make_wrapper_with_ports()
         token = self._admin_token(wrapper)
         client = self._auth_client(
-            token, method='DELETE', path='/api/ports/0')
+            token, method='DELETE', path='/api/ports/port0')
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 404)
 
@@ -927,7 +930,7 @@ class TestApiPortsCrud(unittest.TestCase):
         token = self._admin_token(wrapper)
         with patch.object(wrapper, '_save_config') as mock_save:
             client = self._auth_client(
-                token, method='DELETE', path='/api/ports/0')
+                token, method='DELETE', path='/api/ports/port0')
             wrapper._handle_request(client)
         mock_save.assert_called_once()
 
@@ -940,7 +943,7 @@ class TestApiPortsCrud(unittest.TestCase):
         with patch.object(wrapper, '_create_proxy') as mock_create:
             mock_create.return_value = Mock()
             client = self._auth_client(
-                token, method='PUT', path='/api/ports/0', data=new_cfg)
+                token, method='PUT', path='/api/ports/port0', data=new_cfg)
             wrapper._handle_request(client)
         old_proxy.close.assert_called_once()
 
@@ -950,7 +953,7 @@ class TestApiPortsCrud(unittest.TestCase):
         old_proxy = wrapper._serial_proxies[0]
         token = self._admin_token(wrapper)
         client = self._auth_client(
-            token, method='DELETE', path='/api/ports/0')
+            token, method='DELETE', path='/api/ports/port0')
         wrapper._handle_request(client)
         old_proxy.close.assert_called_once()
 
@@ -1963,6 +1966,8 @@ class TestApiDisconnectWebSocket(unittest.TestCase):
         ws_client.addr = ('192.168.1.9', 4444)
         ws_server.add_connection(ws_client)
         proxy = Mock()
+        proxy.id = 'wsport'
+        proxy.error = None
         proxy.serial_config = {'port': '/dev/ttyUSB0'}
         proxy.match = None
         proxy.name = 'dev'
@@ -1970,12 +1975,25 @@ class TestApiDisconnectWebSocket(unittest.TestCase):
         proxy.servers = [ws_server]
         return proxy, ws_server, ws_client
 
+    def _wrapper_for(self, proxy):
+        configuration = {
+            'http': [{'address': '127.0.0.1', 'port': 0}],
+            'ports': [{'id': 'wsport', 'serial': {'port': '/dev/ttyUSB0'},
+                       'servers': [{'protocol': 'websocket',
+                                    'endpoint': 'dev'}]}],
+        }
+        with patch('ser2tcp.http_server._uhttp_server.HttpServer'):
+            return HttpServerWrapper(
+                {'address': '127.0.0.1', 'port': 0}, [proxy],
+                log=Mock(), configuration=configuration)
+
     def test_disconnect_websocket_client(self):
         """The client is closed and dropped, and the API answers 200"""
         proxy, ws_server, ws_client = self._make_ws_proxy()
-        wrapper = make_wrapper(serial_proxies=[proxy])
+        wrapper = self._wrapper_for(proxy)
         client = MockClient(
-            method='DELETE', path='/api/ports/0/connections/0/0')
+            method='DELETE',
+            path='/api/ports/wsport/connections/' + connection_id(ws_client))
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 200)
         self.assertEqual(ws_server.connections, [])
@@ -1984,9 +2002,9 @@ class TestApiDisconnectWebSocket(unittest.TestCase):
     def test_disconnect_websocket_client_out_of_range(self):
         """An index past the end is still a 404, not a crash"""
         proxy, _, _ = self._make_ws_proxy()
-        wrapper = make_wrapper(serial_proxies=[proxy])
+        wrapper = self._wrapper_for(proxy)
         client = MockClient(
-            method='DELETE', path='/api/ports/0/connections/0/7')
+            method='DELETE', path='/api/ports/wsport/connections/nosuch')
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 404)
 
@@ -1994,9 +2012,10 @@ class TestApiDisconnectWebSocket(unittest.TestCase):
         """A client whose socket already went away is still reaped"""
         proxy, ws_server, ws_client = self._make_ws_proxy()
         ws_client.ws_close.side_effect = OSError('gone')
-        wrapper = make_wrapper(serial_proxies=[proxy])
+        wrapper = self._wrapper_for(proxy)
         client = MockClient(
-            method='DELETE', path='/api/ports/0/connections/0/0')
+            method='DELETE',
+            path='/api/ports/wsport/connections/' + connection_id(ws_client))
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 200)
         self.assertEqual(ws_server.connections, [])

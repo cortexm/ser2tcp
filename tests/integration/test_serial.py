@@ -429,7 +429,7 @@ class TestPortReconfiguration(SerialPtyTestCase):
         return config
 
     def update_port(self, **extra):
-        status, body = self.put('/api/ports/0', self.port_config(**extra))
+        status, body = self.put('/api/ports/' + self.port_id(), self.port_config(**extra))
         self.assertEqual(status, 200, body)
 
     def assert_data_flows(self, marker):
@@ -652,7 +652,7 @@ class TestEditingAroundAFailedPort(FailedPortTestCase):
 
     def test_an_edit_reaches_the_port_it_names(self):
         """Index 1 is 'healthy' in the config and must be there too"""
-        status, body = self.put('/api/ports/1', {
+        status, body = self.put('/api/ports/' + self.port_id(1), {
             'name': 'healthy-renamed',
             'serial': {'port': self.pty_path},
             'servers': [{'protocol': 'tcp', 'address': '127.0.0.1',
@@ -671,7 +671,7 @@ class TestEditingAroundAFailedPort(FailedPortTestCase):
         one process with the test above.
         """
         fresh = base.free_port()
-        status, body = self.put('/api/ports/0', {
+        status, body = self.put('/api/ports/' + self.port_id(0), {
             'name': 'wont-start',
             'serial': {'port': '/dev/tty.not-a-real-device'},
             'servers': [{'protocol': 'tcp', 'address': '127.0.0.1',
@@ -682,3 +682,109 @@ class TestEditingAroundAFailedPort(FailedPortTestCase):
         self.assertNotIn('error', listing[0])
         sock = socket.create_connection(('127.0.0.1', fresh), 5)
         self.addCleanup(sock.close)
+
+
+class TestEditingKeepsEverySetting(base.IntegrationTestCase):
+    """What the editor reads back has to be what was configured.
+
+    It used to read /api/status, which is a different document: it
+    reports no IP filters, no WebSocket tokens and no timeouts, and it
+    reports serial settings as pyserial received them ('E', 7, 2) rather
+    than as they were written ('EVEN', 'SEVENBITS', 'TWO'). Saving that
+    back rewrote the port with defaults - 8N1, no filter - without
+    saying anything.
+    """
+
+    tcp_port = None
+    pty_path = None
+    master_fd = None
+    slave_fd = None
+
+    @classmethod
+    def build_config(cls):
+        return {
+            'ports': [{
+                'id': 'fussy',
+                'name': 'fussy-device',
+                'serial': {
+                    'port': cls.pty_path,
+                    'baudrate': 19200,
+                    'bytesize': 'SEVENBITS',
+                    'parity': 'EVEN',
+                    'stopbits': 'TWO',
+                },
+                'max_connections': 3,
+                'servers': [{
+                    'protocol': 'tcp',
+                    'address': '127.0.0.1',
+                    'port': cls.tcp_port,
+                    'allow': ['127.0.0.0/8'],
+                    'deny': ['127.0.0.9'],
+                    'send_timeout': 12.5,
+                    'buffer_limit': 65536,
+                    'max_connections': 2,
+                }]},
+            ],
+            'http': [{'address': '127.0.0.1', 'port': cls.port}],
+        }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.master_fd, cls.slave_fd = os.openpty()
+        cls.pty_path = os.ttyname(cls.slave_fd)
+        cls.tcp_port = base.free_port()
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        for fd in (cls.master_fd, cls.slave_fd):
+            try:
+                os.close(fd)
+            except (OSError, TypeError):
+                pass
+
+    def test_the_config_endpoint_returns_what_was_written(self):
+        status, cfg = self.get('/api/ports/fussy')
+        self.assertEqual(status, 200)
+        self.assertEqual(cfg['serial']['parity'], 'EVEN')
+        self.assertEqual(cfg['serial']['bytesize'], 'SEVENBITS')
+        self.assertEqual(cfg['serial']['stopbits'], 'TWO')
+        self.assertEqual(cfg['servers'][0]['allow'], ['127.0.0.0/8'])
+        self.assertEqual(cfg['servers'][0]['send_timeout'], 12.5)
+
+    def test_the_status_is_a_different_document(self):
+        """Why reading it for the editor was wrong in the first place"""
+        body = self.get('/api/status')[1]
+        serial = body['ports'][0]['serial']
+        # Converted for pyserial, not as configured.
+        self.assertEqual(serial['parity'], 'E')
+        self.assertEqual(serial['bytesize'], 7)
+        # And the filter is simply not reported.
+        self.assertNotIn('allow', body['ports'][0]['servers'][0])
+
+    def test_zz_a_rename_changes_the_name_and_nothing_else(self):
+        """The round trip the editor makes, named to run last"""
+        before = self.get('/api/ports/fussy')[1]
+        edited = dict(before)
+        edited['name'] = 'fussy-device-renamed'
+        status, body = self.put('/api/ports/fussy', edited)
+        self.assertEqual(status, 200, body)
+
+        after = self.get('/api/ports/fussy')[1]
+        self.assertEqual(after['name'], 'fussy-device-renamed')
+        self.assertEqual(after['serial']['parity'], 'EVEN')
+        self.assertEqual(after['serial']['bytesize'], 'SEVENBITS')
+        self.assertEqual(after['serial']['stopbits'], 'TWO')
+        self.assertEqual(after['serial']['baudrate'], 19200)
+        self.assertEqual(after['max_connections'], 3)
+        server = after['servers'][0]
+        self.assertEqual(server['allow'], ['127.0.0.0/8'])
+        self.assertEqual(server['deny'], ['127.0.0.9'])
+        self.assertEqual(server['send_timeout'], 12.5)
+        self.assertEqual(server['buffer_limit'], 65536)
+        self.assertEqual(server['max_connections'], 2)
+        # And on disk, which is what survives a restart.
+        on_disk = self.proc.read_config()['ports'][0]
+        self.assertEqual(on_disk['serial']['parity'], 'EVEN')
+        self.assertEqual(on_disk['servers'][0]['allow'], ['127.0.0.0/8'])

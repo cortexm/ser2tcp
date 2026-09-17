@@ -1,5 +1,6 @@
 """HTTP server integration with uhttp"""
 
+import itertools as _itertools
 import json as _json
 import logging as _logging
 import os as _os
@@ -13,6 +14,7 @@ import serial.tools.list_ports as _list_ports
 import uhttp.server as _uhttp_server
 
 import ser2tcp.cert_manager as _cert_manager
+import ser2tcp.config_ids as _config_ids
 import ser2tcp.http_auth as _http_auth
 import ser2tcp.connection_control as _control
 import ser2tcp.ip_filter as _ip_filter
@@ -21,6 +23,31 @@ import ser2tcp.server as _server
 import ser2tcp.server_monitor as _server_monitor
 
 HTML_DIR = _pathlib.Path(__file__).parent / 'html'
+
+_CONNECTION_IDS = _itertools.count(1)
+_CONNECTION_ID_ATTR = '_ser2tcp_conn_id'
+
+
+def connection_id(con):
+    """A stable id for one client connection, assigned on first sight.
+
+    Connections cannot be addressed by position: a client hanging up
+    shifts every connection after it, so a request to drop one lands on
+    another. The id is stuck to the object, which is why this works the
+    same for the connections we own and for the uhttp ones behind a
+    WebSocket.
+    """
+    existing = getattr(con, _CONNECTION_ID_ATTR, None)
+    if isinstance(existing, str) and existing:
+        return existing
+    assigned = str(next(_CONNECTION_IDS))
+    try:
+        setattr(con, _CONNECTION_ID_ATTR, assigned)
+    except (AttributeError, TypeError):
+        # Nothing to attach it to; it will not be addressable, but the
+        # listing still has to say something.
+        return ''
+    return assigned
 
 
 def _describe_detected(info):
@@ -91,11 +118,58 @@ class HttpServerWrapper():
         # without hitting the kernel on every 100 ms select tick.
         self._detect_cache = []
         self._detect_cache_at = 0.0
+        if _config_ids.assign_ids(self._configuration):
+            # Written back so they survive a restart; a bookmarked URL
+            # or an open editor would otherwise point somewhere else
+            # after every start.
+            self._save_config()
         for config in configs:
             try:
                 self._servers.append(self._create_http_server(config))
             except ValueError as err:
                 self._log.error("%s, skipping", err)
+
+    def _fresh_id(self):
+        """An id no entry in this configuration is using"""
+        return _config_ids.fresh_id(self._configuration)
+
+    def _claim_id(self, data, current=None):
+        """Settle the id for an entry being written.
+
+        Returns (id, error). A given one is honoured - a readable id is
+        worth having and is what the field in the editor is for - as
+        long as nothing else answers to it. Ports and HTTP servers share
+        one namespace: the URL says which kind is meant, but an id that
+        means two things is confusing whatever the URL says.
+        """
+        wanted = data.get('id')
+        if wanted is None or wanted == current:
+            return (current or self._fresh_id()), None
+        if wanted in _config_ids.taken_ids(self._configuration):
+            return None, f"id '{wanted}' is already in use"
+        return wanted, None
+
+    def _port_index(self, port_id):
+        """Position of the port with this id, or None.
+
+        Ids are resolved here at the edge; everything inside still
+        works by position, which is safe because the runtime list and
+        the config list are kept the same length.
+        """
+        for index, port in enumerate(self._get_ports_config()):
+            if isinstance(port, dict) and port.get('id') == port_id:
+                return index
+        return None
+
+    def _http_index(self, server_id):
+        """Position of the HTTP server with this id, or None"""
+        http_list = self._configuration.get('http', [])
+        if isinstance(http_list, dict):
+            http_list = [http_list]
+        for index, server in enumerate(http_list):
+            if isinstance(server, dict) and server.get('id') == server_id:
+                return index
+        return None
 
     def _create_http_server(self, config):
         """Create one HTTP server from config.
@@ -458,10 +532,9 @@ class HttpServerWrapper():
             else:
                 self._error(client, 'Method not allowed', 405)
         elif client.path.startswith('/api/settings/http/'):
-            try:
-                index = int(client.path[len('/api/settings/http/'):])
-            except ValueError:
-                self._error(client, 'Invalid index', 400)
+            index = self._http_index(client.path[len('/api/settings/http/'):])
+            if index is None:
+                self._error(client, 'HTTP server not found', 404)
                 return
             if client.method == 'PUT':
                 self._handle_api_http_update(client, user, index)
@@ -559,6 +632,8 @@ class HttpServerWrapper():
                 if key in serial_cfg:
                     serial_info[key] = serial_cfg[key]
             port_info = {'serial': serial_info}
+            if proxy.id:
+                port_info['id'] = proxy.id
             if proxy.name:
                 port_info['name'] = proxy.name
             if proxy.max_connections:
@@ -577,20 +652,20 @@ class HttpServerWrapper():
                         try:
                             addr = con.addr
                             if isinstance(addr, tuple) and len(addr) >= 2:
-                                srv_info['connections'].append(
-                                    {'address': '%s:%d' % (addr[0], addr[1])})
+                                shown = '%s:%d' % (addr[0], addr[1])
                             else:
-                                srv_info['connections'].append(
-                                    {'address': str(addr)})
+                                shown = str(addr)
                         except Exception:
-                            srv_info['connections'].append(
-                                {'address': 'unknown'})
+                            shown = 'unknown'
+                        srv_info['connections'].append(
+                            {'address': shown, 'id': connection_id(con)})
                 else:
                     srv_info = {
                         'protocol': server.protocol,
                         'address': server.config['address'],
                         'connections': [
-                            {'address': con.address_str()}
+                            {'address': con.address_str(),
+                             'id': connection_id(con)}
                             for con in server.connections
                         ],
                     }
@@ -932,16 +1007,21 @@ class HttpServerWrapper():
         return ports
 
     def _route_api_ports_item(self, client, user):
-        """Route /api/ports/<index>/... requests"""
+        """Route /api/ports/<id>/... requests.
+
+        The id is resolved to a position once, here; everything below
+        works by position.
+        """
         rest = client.path[len('/api/ports/'):]
         parts = rest.split('/')
-        try:
-            index = int(parts[0])
-        except ValueError:
-            self._error(client, 'Invalid port index', 400)
+        index = self._port_index(parts[0])
+        if index is None:
+            self._error(client, 'Port not found', 404)
             return
         if len(parts) == 1:
-            if client.method == 'PUT':
+            if client.method == 'GET':
+                self._handle_api_ports_get(client, index)
+            elif client.method == 'PUT':
                 self._handle_api_ports_update(client, user, index)
             elif client.method == 'DELETE':
                 self._handle_api_ports_delete(client, user, index)
@@ -950,18 +1030,24 @@ class HttpServerWrapper():
         elif len(parts) == 2 and parts[1] == 'signals' \
                 and client.method == 'PUT':
             self._handle_api_set_signals(client, user, index)
-        elif len(parts) == 4 and parts[1] == 'connections' \
+        elif len(parts) == 3 and parts[1] == 'connections' \
                 and client.method == 'DELETE':
-            try:
-                srv_idx = int(parts[2])
-                con_idx = int(parts[3])
-            except ValueError:
-                self._error(client, 'Invalid index', 400)
-                return
-            self._handle_api_disconnect(client, user, index,
-                srv_idx, con_idx)
+            self._handle_api_disconnect(client, user, index, parts[2])
         else:
             self._error(client, 'Not found', 404)
+
+    def _handle_api_ports_get(self, client, index):
+        """Return one port's stored configuration.
+
+        The configuration, not the runtime status: the editor needs
+        what was written down, and /api/status reports what is
+        happening instead. Reading the status for this dropped every
+        setting it does not report - IP filters, tokens, timeouts - and
+        handed back serial settings already converted for pyserial, so
+        saving the form rewrote the port with different ones.
+        """
+        ports = self._get_ports_config()
+        client.respond(ports[index])
 
     @staticmethod
     def _is_port_number(value):
@@ -986,6 +1072,9 @@ class HttpServerWrapper():
             return f'Expected JSON object, got {type(data).__name__}'
         if 'name' in data and not isinstance(data['name'], str):
             return 'name must be a string'
+        if 'id' in data and not _config_ids.is_valid_id(data['id']):
+            return ('id may only contain letters, digits, dot, dash and '
+                    'underscore')
         if 'serial' not in data:
             return 'serial config required'
         serial = data['serial']
@@ -1125,6 +1214,10 @@ class HttpServerWrapper():
         if error:
             self._error(client, error, 400)
             return
+        data['id'], id_error = self._claim_id(data)
+        if id_error:
+            self._error(client, id_error, 400)
+            return
         try:
             proxy = self._create_proxy(data)
         except (ValueError, KeyError, OSError, _server.ConfigError) as err:
@@ -1138,9 +1231,8 @@ class HttpServerWrapper():
         if 'ports' not in self._configuration:
             self._configuration['ports'] = ports
         self._save_config()
-        self._log.info("Port added: %d", len(self._serial_proxies) - 1)
-        client.respond({'ok': True, 'index': len(self._serial_proxies) - 1},
-            status=201)
+        self._log.info("Port added: %s", data.get('id'))
+        client.respond({'ok': True, 'id': data.get('id')}, status=201)
 
     def _handle_api_ports_update(self, client, user, index):
         """Update port configuration"""
@@ -1158,6 +1250,13 @@ class HttpServerWrapper():
             self._error(client, error, 400)
             return
         # Close old proxy first to release ports
+        # The id is settled before the proxy is built, so it carries
+        # it; left out of the request it stays as it was.
+        data['id'], id_error = self._claim_id(
+            data, ports[index].get('id'))
+        if id_error:
+            self._error(client, id_error, 400)
+            return
         old_proxy = self._serial_proxies[index]
         old_proxy.close()
         if self._server_manager:
@@ -1222,24 +1321,26 @@ class HttpServerWrapper():
             proxy.set_dtr(bool(data['dtr']))
         client.respond({'ok': True})
 
-    def _handle_api_disconnect(self, client, user, port_idx,
-            srv_idx, con_idx):
-        """Disconnect a specific client connection"""
+    def _handle_api_disconnect(self, client, user, port_idx, conn_id):
+        """Disconnect one client of this port, named by its id.
+
+        A position would not do: a connection index shifts every time
+        some other client on the same server hangs up, so the request
+        to drop one would land on another.
+        """
         if port_idx < 0 or port_idx >= len(self._serial_proxies):
             self._error(client, 'Port not found', 404)
             return
         proxy = self._serial_proxies[port_idx]
-        if srv_idx < 0 or srv_idx >= len(proxy.servers):
-            self._error(client, 'Server not found', 404)
-            return
-        server = proxy.servers[srv_idx]
-        if con_idx < 0 or con_idx >= len(server.connections):
-            self._error(client, 'Connection not found', 404)
-            return
-        con = server.connections[con_idx]
-        addr = server.disconnect_client(con)
-        self._log.info("Disconnected: %s", addr)
-        client.respond({'ok': True})
+        for server in proxy.servers:
+            for con in list(server.connections):
+                if connection_id(con) != conn_id:
+                    continue
+                addr = server.disconnect_client(con)
+                self._log.info("Disconnected: %s", addr)
+                client.respond({'ok': True})
+                return
+        self._error(client, 'Connection not found', 404)
 
     def _handle_api_login(self, client):
         """Authenticate user and return session token"""
@@ -1556,6 +1657,9 @@ class HttpServerWrapper():
             return 'address must be a string'
         if 'name' in data and not isinstance(data['name'], str):
             return 'name must be a string'
+        if 'id' in data and not _config_ids.is_valid_id(data['id']):
+            return ('id may only contain letters, digits, dot, dash and '
+                    'underscore')
         if 'ssl' in data:
             err = self._validate_ssl_config(data['ssl'])
             if err:
@@ -1589,7 +1693,13 @@ class HttpServerWrapper():
             self._error(client, error, 400)
             return
         http_list = self._configuration.setdefault('http', [])
-        srv = {'address': data.get('address', '0.0.0.0'), 'port': data['port']}
+        new_id, id_error = self._claim_id(data)
+        if id_error:
+            self._error(client, id_error, 400)
+            return
+        srv = {'id': new_id,
+               'address': data.get('address', '0.0.0.0'),
+               'port': data['port']}
         if data.get('name'):
             srv['name'] = data['name']
         if 'ssl' in data:
@@ -1604,7 +1714,7 @@ class HttpServerWrapper():
         self._servers.append(srv_tuple)
         self._save_config()
         self._log.info("HTTP server added")
-        client.respond({'ok': True})
+        client.respond({'ok': True, 'id': srv.get('id')})
 
     def _handle_api_http_update(self, client, user, index):
         """Update HTTP server"""
@@ -1620,7 +1730,13 @@ class HttpServerWrapper():
             self._error(client, error, 400)
             return
         old = http_list[index]
-        srv = {'address': data.get('address', '0.0.0.0'), 'port': data['port']}
+        new_id, id_error = self._claim_id(data, old.get('id'))
+        if id_error:
+            self._error(client, id_error, 400)
+            return
+        srv = {'id': new_id,
+               'address': data.get('address', '0.0.0.0'),
+               'port': data['port']}
         if data.get('name'):
             srv['name'] = data['name']
         if 'ssl' in data:

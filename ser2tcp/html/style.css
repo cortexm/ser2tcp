@@ -460,6 +460,11 @@ body.stream-down .card-detected.card-detected-configured {
 .card-header-row > .tag,
 .card-header-row > .kebab-menu { flex: none; }
 .card-subtitle { font-size: 13px; color: var(--text-muted); }
+.field-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin: -4px 0 10px 0;
+}
 .card-failure {
   font-size: 13px;
   color: var(--error);

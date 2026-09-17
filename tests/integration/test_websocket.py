@@ -189,7 +189,7 @@ class TestWebSocketAfterReconfiguration(WebSocketTestCase):
         self.assertEqual(recv_binary(conn), b'before')
         conn.close()
 
-        status, body = self.put('/api/ports/0', self.port_config())
+        status, body = self.put('/api/ports/' + self.port_id(), self.port_config())
         self.assertEqual(status, 200, body)
 
         conn = self.ws_connect('/ws/' + ENDPOINT)

@@ -550,11 +550,12 @@ With IP filtering:
 | GET | `/api/detect` | yes | Available serial ports with USB/device attributes |
 | GET | `/api/signals` | yes | Signal states for all ports |
 | GET | `/api/settings` | yes | Get settings (http servers, session_timeout) |
-| DELETE | `/api/ports/<p>/connections/<s>/<c>` | yes | Disconnect client |
+| GET | `/api/ports/<id>` | admin | Port configuration (what to edit) |
+| DELETE | `/api/ports/<id>/connections/<conn_id>` | yes | Disconnect client |
 | POST | `/api/ports` | admin | Add new port configuration |
-| PUT | `/api/ports/<index>` | admin | Update port configuration |
-| DELETE | `/api/ports/<index>` | admin | Delete port configuration |
-| PUT | `/api/ports/<index>/signals` | admin | Set RTS/DTR signals |
+| PUT | `/api/ports/<id>` | admin | Update port configuration |
+| DELETE | `/api/ports/<id>` | admin | Delete port configuration |
+| PUT | `/api/ports/<id>/signals` | admin | Set RTS/DTR signals |
 | GET | `/api/users` | admin | List users |
 | POST | `/api/users` | admin | Add user |
 | PUT | `/api/users/<login>` | admin | Update user |
@@ -565,8 +566,8 @@ With IP filtering:
 | DELETE | `/api/tokens/<token>` | admin | Delete API token |
 | PUT | `/api/settings` | admin | Update session_timeout |
 | POST | `/api/settings/http` | admin | Add HTTP server |
-| PUT | `/api/settings/http/<index>` | admin | Update HTTP server |
-| DELETE | `/api/settings/http/<index>` | admin | Delete HTTP server |
+| PUT | `/api/settings/http/<id>` | admin | Update HTTP server |
+| DELETE | `/api/settings/http/<id>` | admin | Delete HTTP server |
 | GET | `/api/certs` | yes | List certificate bundles |
 | POST | `/api/certs` | admin | Create empty bundle |
 | GET | `/api/certs/<bundle>` | yes | Bundle detail (files, mtime, symlink target) |
@@ -583,6 +584,37 @@ With IP filtering:
 Auth levels: `no` = public, `yes` = any authenticated user, `admin` = admin user/token only.
 
 Authentication: `Authorization: Bearer <token>` header or `?token=<token>` query parameter. Without users/tokens configured, all endpoints are accessible without authentication.
+
+### Identifiers
+
+Ports and HTTP servers are addressed by `id`, not by their position in
+the configuration. ser2tcp writes an `id` into every port and HTTP
+server entry the first time it reads a configuration that lacks one, so
+an existing config gains them on the next start and keeps them from
+then on:
+
+```json
+{
+  "ports": [
+    {"id": "9f3c1a20", "name": "my-device", "serial": {"port": "/dev/ttyUSB0"}, "servers": []}
+  ],
+  "http": [
+    {"id": "4b7e0d55", "address": "0.0.0.0", "port": 8080}
+  ]
+}
+```
+
+An id survives edits, so a bookmarked URL or an open editor keeps
+pointing at the same port. A position would not: adding or removing an
+entry renumbers everything after it, and a port that fails to start
+would shift the rest.
+
+Both are reported by the API — `id` in each entry of `/api/status` and
+of `/api/settings` — so a client never has to guess one.
+
+Connections carry an `id` too, in `/api/status`, and that is what
+`DELETE /api/ports/<id>/connections/<conn_id>` takes. Counting them
+would not work: a client hanging up moves every connection after it.
 
 ## Usage examples
 
