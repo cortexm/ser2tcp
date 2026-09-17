@@ -641,6 +641,23 @@ that writes a whole entry without reading it first keeps working. It is
 derived from the content rather than stored, so it never appears in
 `config.json` and an entry edited by hand is covered as well.
 
+### When something will not start
+
+A serial port whose device is missing, or an HTTP server whose address
+is already taken, does not stop ser2tcp and does not disappear. It stays
+in the list where it was configured and carries an `error` saying why —
+in `/api/status` for a port, in `/api/settings` for an HTTP server — and
+the web UI shows it as a red card with that reason on it:
+
+```json
+{"id": "4b7e0d55", "address": "0.0.0.0", "port": 8080,
+ "error": "HTTP 0.0.0.0:8080: failed to bind: Address already in use"}
+```
+
+Editing it is how you fix it: a save that succeeds starts it there and
+then, with no restart. Like `rev`, `error` is reported rather than
+configured and is never written to `config.json`.
+
 ## Usage examples
 
 ```

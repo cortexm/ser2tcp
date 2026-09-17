@@ -9,7 +9,7 @@ from unittest.mock import Mock, MagicMock, patch
 from ser2tcp.cert_manager import CertManager, generate_certificate
 from ser2tcp.http_auth import hash_password
 from ser2tcp.http_server import (
-    HttpServerWrapper, _describe_detected, connection_id)
+    FailedHttpServer, HttpServerWrapper, _describe_detected, connection_id)
 from ser2tcp.server_websocket import ServerWebSocket
 
 
@@ -1817,9 +1817,12 @@ class TestHttpBindError(unittest.TestCase):
             self.assertIn('failed to bind', str(ctx.exception))
             self.assertIn('20080', str(ctx.exception))
 
-    def test_init_skips_failed_binds_no_traceback(self):
-        # Two HTTP server configs — one fails to bind, the other succeeds.
-        # The wrapper should log + skip the failed one, not raise.
+    def test_init_keeps_the_place_of_a_failed_bind(self):
+        # Two HTTP server configs — one fails to bind, the other
+        # succeeds. Starting is not refused, and the failed one leaves a
+        # placeholder behind: the runtime list is matched to the config
+        # by position, so dropping it would point every entry after it
+        # at the wrong socket.
         configs = [
             {'address': '127.0.0.1', 'port': 20080},
             {'address': '127.0.0.1', 'port': 20081},
@@ -1830,8 +1833,9 @@ class TestHttpBindError(unittest.TestCase):
                 side_effect=[OSError(48, 'EADDRINUSE'), good]):
             wrapper = HttpServerWrapper(
                 configs, [], log=Mock(), configuration=configuration)
-        # Only the second server got created.
-        self.assertEqual(len(wrapper._servers), 1)
+        self.assertEqual(len(wrapper._servers), 2)
+        self.assertIsInstance(wrapper._servers[0][0], FailedHttpServer)
+        self.assertIs(wrapper._servers[1][0], good)
 
 
 if __name__ == '__main__':

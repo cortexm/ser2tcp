@@ -24,6 +24,10 @@ import ser2tcp.server_monitor as _server_monitor
 
 HTML_DIR = _pathlib.Path(__file__).parent / 'html'
 
+# Reported by the API alongside an entry, but derived rather than
+# configured - they must never find their way back into config.json.
+_REPORTED_ONLY_KEYS = ('id', 'rev', 'error')
+
 _CONNECTION_IDS = _itertools.count(1)
 _CONNECTION_ID_ATTR = '_ser2tcp_conn_id'
 
@@ -63,6 +67,35 @@ def _describe_detected(info):
     if extras:
         parts.append('(' + ' '.join(extras) + ')')
     return ' '.join(parts)
+
+
+class FailedHttpServer():
+    """Stands in the list for an HTTP server that could not be started.
+
+    A server left out of the runtime list makes it shorter than the
+    configuration it mirrors, and the two are matched up by position:
+    every entry after the failed one then edits, closes and rebuilds
+    the socket of its neighbour. It also gives the server somewhere to
+    appear with the reason it failed, instead of being listed as though
+    it were serving - the state you most need to see, since it is the
+    one you have to fix.
+
+    Inert: it owns no socket, so being driven costs nothing.
+    """
+
+    def __init__(self, error):
+        self._error = str(error)
+
+    @property
+    def error(self):
+        """Why this server could not be started"""
+        return self._error
+
+    def maintenance(self):
+        """Nothing to time out"""
+
+    def close(self):
+        """Nothing to close"""
 
 
 class HttpServerWrapper():
@@ -124,10 +157,7 @@ class HttpServerWrapper():
             # after every start.
             self._save_config()
         for config in configs:
-            try:
-                self._servers.append(self._create_http_server(config))
-            except ValueError as err:
-                self._log.error("%s, skipping", err)
+            self._servers.append(self._http_server_or_placeholder(config))
 
     def _fresh_id(self):
         """An id no entry in this configuration is using"""
@@ -223,6 +253,14 @@ class HttpServerWrapper():
                 f"{err.strerror or err}") from err
         return (server, ip_flt, config, ssl_context)
 
+    def _http_server_or_placeholder(self, config):
+        """Build one HTTP server, or a placeholder holding its place"""
+        try:
+            return self._create_http_server(config)
+        except ValueError as err:
+            self._log.error("%s", err)
+            return (FailedHttpServer(err), None, config, None)
+
     def add_http_server(self, config):
         """Add a new HTTP server dynamically"""
         srv_tuple = self._create_http_server(config)
@@ -248,11 +286,7 @@ class HttpServerWrapper():
         if isinstance(configs, dict):
             configs = [configs]
         for config in configs:
-            try:
-                srv_tuple = self._create_http_server(config)
-                self._servers.append(srv_tuple)
-            except ValueError as e:
-                self._log.error("Failed to create HTTP server: %s", e)
+            self._servers.append(self._http_server_or_placeholder(config))
 
     def schedule_reload(self):
         """Schedule HTTP servers reload for next process_stale cycle"""
@@ -270,7 +304,12 @@ class HttpServerWrapper():
             port = client.socket.getsockname()[1]
         except (OSError, AttributeError, TypeError, IndexError):
             return None
-        for _server, ip_flt, cfg, _ctx in self._servers:
+        for server, ip_flt, cfg, _ctx in self._servers:
+            if isinstance(server, FailedHttpServer):
+                # It never bound, so this connection is not its own -
+                # and answering with its (absent) filter would drop the
+                # filter of whichever server did bind this port.
+                continue
             if cfg.get('port', 8080) == port:
                 return ip_flt
         return None
@@ -1652,11 +1691,24 @@ class HttpServerWrapper():
             # Normalised to a list: the config allows a single object,
             # and a client that got one had to special-case it or
             # conclude there were no servers at all.
-            'http': [dict(srv, rev=_config_ids.entry_rev(srv))
-                     for srv in self._http_list()],
+            'http': [self._describe_http(index, srv)
+                     for index, srv in enumerate(self._http_list())],
             'session_timeout': self._configuration.get('session_timeout'),
         }
         client.respond(settings)
+
+    def _describe_http(self, index, entry):
+        """One HTTP server entry as the API reports it.
+
+        The stored configuration, plus what only the running process
+        knows: the revision to save against, and why it is not serving.
+        """
+        described = dict(entry, rev=_config_ids.entry_rev(entry))
+        if index < len(self._servers):
+            server = self._servers[index][0]
+            if isinstance(server, FailedHttpServer):
+                described['error'] = server.error
+        return described
 
     def _handle_api_settings_update(self, client, user):
         """Update settings"""
@@ -1744,7 +1796,7 @@ class HttpServerWrapper():
         disappear from a server whose name was edited.
         """
         entry = {key: value for key, value in data.items()
-                 if key not in ('id', 'rev')}
+                 if key not in _REPORTED_ONLY_KEYS}
         entry['id'] = entry_id
         if not entry.get('name'):
             entry.pop('name', None)
@@ -1805,18 +1857,18 @@ class HttpServerWrapper():
             old.get('ssl') != srv.get('ssl') or
             old.get('allow') != srv.get('allow') or
             old.get('deny') != srv.get('deny'))
-        if needs_restart and index < len(self._servers):
+        if needs_restart:
             self._servers[index][0].close()
             try:
                 self._servers[index] = self._create_http_server(srv)
             except ValueError as err:
                 # Put back what was running, and leave the file alone:
                 # it must not describe a server this process is not.
-                try:
-                    self._servers[index] = self._create_http_server(old)
-                except ValueError as back_err:
-                    self._log.error(
-                        "HTTP server could not be restored: %s", back_err)
+                # Putting it back can fail too - something may have
+                # taken the port in between - and then the entry stands
+                # in the list saying so, rather than being reported as
+                # serving from a socket that is closed.
+                self._servers[index] = self._http_server_or_placeholder(old)
                 self._error(client, str(err), 400)
                 return
         http_list[index] = srv
@@ -1836,9 +1888,8 @@ class HttpServerWrapper():
             self._error(client, 'Cannot delete last HTTP server', 400)
             return
         # Close server before removing from config
-        if index < len(self._servers):
-            self._servers[index][0].close()
-            del self._servers[index]
+        self._servers[index][0].close()
+        del self._servers[index]
         del http_list[index]
         self._save_config()
         self._log.info("HTTP server deleted")

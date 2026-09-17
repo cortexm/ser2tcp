@@ -2114,7 +2114,11 @@ function renderSettingsList() {
 
 function renderHttpCard(srv, index) {
   const id = srv.id;
-  const card = el('div', { class: 'card card-online' });
+  // A server that did not bind is still configured, so it still has a
+  // card - red, with the reason. Leaving it out of the list made a
+  // process that was not serving look exactly like one that was.
+  const card = el('div',
+    { class: 'card ' + (srv.error ? 'card-error' : 'card-online') });
   const ssl = srv.ssl ? ' (SSL)' : '';
   const titleText = srv.name || `${srv.address || '0.0.0.0'}:${srv.port}${ssl}`;
   const title = el('span', { class: 'card-title' }, titleText);
@@ -2129,6 +2133,10 @@ function renderHttpCard(srv, index) {
     ]));
   }
   card.appendChild(headerRow);
+  if (srv.error) {
+    card.appendChild(el('div', { class: 'card-failure' },
+      'Did not start: ' + srv.error));
+  }
   const meta = el('div', { class: 'card-meta' });
   meta.appendChild(el('div', { class: 'card-meta-row' },
     el('span', { class: 'card-meta-label' }, 'Listen'),
@@ -2313,6 +2321,8 @@ function _saveHttpServer(id, fields, original) {
   // mentioned them.
   const data = { ...(original || {}) };
   FORM_OWNED_HTTP_KEYS.forEach(key => delete data[key]);
+  // Reported by the API, not part of the configuration.
+  delete data.error;
   data.address = fields.addrInput.value.trim() || '0.0.0.0';
   data.port = parseInt(fields.portInput.value) || 8080;
   const chosenId = fields.idInput.value.trim();
