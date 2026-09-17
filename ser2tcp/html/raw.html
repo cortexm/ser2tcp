@@ -28,6 +28,8 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
 .toolbar .btn-connect:hover { background: #3b3; }
 .toolbar .btn-disconnect { background: #e55; color: #fff; border-color: #e55; }
 .toolbar .btn-disconnect:hover { background: #d44; }
+.toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+.toolbar .btn-connect:disabled:hover { background: #4c4; }
 .toolbar .spacer { flex: 1; }
 .toolbar .status { font-size: 0.85em; color: #aaa; }
 .toolbar a { color: #4a9eff; text-decoration: none; font-size: 0.85em; }
@@ -147,27 +149,82 @@ function disconnect() {
   if (ws) { ws.close(); ws = null; setStatus('offline'); }
 }
 
-// setStatus reflects this view's WS subscription only: the right-side
-// status text + Connect/Disconnect button. The colored endpoint name is
-// driven by the server-reported port.state via applyPortState().
+// Whether the status stream is actually delivering: 'connecting' until
+// the first response, 'live' while it runs, 'down' once it fails.
+// Without it the page keeps showing the last thing it heard - a green
+// endpoint, lit signal badges, an inviting Connect button - after the
+// server it heard it from has gone away. Declared here because
+// setStatus() runs before the stream section is reached.
+let streamState = 'connecting';
+// Last state of this view's own WebSocket, so the button can be
+// re-evaluated when either side of the picture changes.
+let wsState = 'offline';
+// Latest port payload from the status stream. Declared up here with the
+// rest of the view state because updateConnectButton() reads it and runs
+// before the stream section is reached.
+let portCache = null;
+
+// Why connecting is impossible right now, or null when it is not.
+// Both the status text and the button ask this, so the page never says
+// "Disconnected" - true but useless - when the real answer is that
+// there is nothing on the other end to connect to. Two ways that
+// happens: the server is gone, or the server is there and says the
+// device is not.
+function blockedReason() {
+  if (streamState === 'down') {
+    return { short: 'No server', long: 'Server unreachable' };
+  }
+  if (portCache && portCache.state === 'error') {
+    return { short: 'No device', long: 'Device not connected' };
+  }
+  return null;
+}
+
+// setStatus records this view's WS subscription; the text beside it
+// shows that, or the blocking reason when there is one. Endpoint-name
+// color is driven by the server-reported port.state via
+// applyPortState().
 function setStatus(state) {
+  wsState = state;
+  updateStatus();
+}
+
+function updateStatus() {
   const labels = {
     connecting: 'Connecting…',
     online: 'Connected',
     offline: 'Disconnected',
     error: 'Unavailable',
   };
-  $('status').textContent = labels[state] || state;
+  // A live connection is its own answer; only explain an absence.
+  const blocked = wsState === 'online' ? null : blockedReason();
+  const status = $('status');
+  status.textContent = blocked ? blocked.short
+    : (labels[wsState] || wsState);
+  status.title = blocked ? blocked.long : '';
+  updateConnectButton();
+}
+
+function updateConnectButton() {
   const btn = $('btn-connect');
-  if (state === 'online') {
+  if (wsState === 'online') {
+    // Disconnecting stays available whatever the server is doing -
+    // it only closes a socket on this side.
     btn.textContent = 'Disconnect';
     btn.className = 'btn-disconnect';
     btn.onclick = disconnect;
-  } else {
-    btn.textContent = 'Connect';
-    btn.className = 'btn-connect';
-    btn.onclick = connect;
+    btn.disabled = false;
+    btn.title = '';
+    return;
   }
+  btn.textContent = 'Connect';
+  btn.className = 'btn-connect';
+  btn.onclick = connect;
+  // Offering a click that can only fail is the same lie as a green
+  // endpoint.
+  const blocked = blockedReason();
+  btn.disabled = !!blocked;
+  btn.title = blocked ? blocked.long : '';
 }
 
 // Server-driven signal bar. Renders from portCache.signals (populated by
@@ -268,23 +325,28 @@ function send() {
 $('btn-send').onclick = send;
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
 $('btn-clear').onclick = () => { $('output').innerHTML = ''; };
-$('btn-connect').onclick = connect;
+updateStatus();
 $('input').focus();
 if (endpoint) connect();
 
 // --- Filtered status stream — server-authoritative port state + signals --
-let portCache = null;
 
 function applyPortState() {
   // Endpoint-name color reflects the actual port on the server, not our
   // WS subscription. Right-side status text still tracks our WS state.
-  const state = (portCache && portCache.state) || 'offline';
+  // A dead stream means we cannot vouch for anything: say so rather
+  // than leaving the last known state on screen looking current.
+  const state = streamState === 'down' ? 'error'
+    : (portCache && portCache.state) || 'offline';
   const ep = $('endpoint-name');
   ep.classList.remove('endpoint-online', 'endpoint-offline', 'endpoint-error');
   ep.classList.add(
     state === 'online' ? 'endpoint-online'
       : state === 'error' ? 'endpoint-error'
       : 'endpoint-offline');
+  ep.title = streamState === 'down'
+    ? 'Server unreachable' : 'Port state: ' + state;
+  updateStatus();
 }
 
 function applyStatusLine(line) {
@@ -313,6 +375,8 @@ function startStatusStream() {
   fetch(url, { headers, cache: 'no-store' })
     .then(async resp => {
       if (!resp.ok || !resp.body) throw new Error('stream HTTP ' + resp.status);
+      streamState = 'live';
+      applyPortState();
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -330,7 +394,15 @@ function startStatusStream() {
       }
       throw new Error('stream closed');
     })
-    .catch(() => setTimeout(startStatusStream, 2000));
+    .catch(() => {
+      // Drop what we were told: it describes a server we can no longer
+      // reach, and stale signal badges are worse than none.
+      streamState = 'down';
+      portCache = null;
+      renderSignals();
+      applyPortState();
+      setTimeout(startStatusStream, 2000);
+    });
 }
 startStatusStream();
 </script>

@@ -1444,6 +1444,36 @@ class TestComputePortState(unittest.TestCase):
         self.assertEqual(
             self.wrapper._compute_port_state(proxy, []), 'offline')
 
+    def test_a_device_that_exists_but_is_not_enumerated_is_offline(self):
+        """Enumeration is not the only evidence a device is there.
+
+        pyserial's comports() lists USB and built-in serial hardware; a
+        pty, a socat pair or a CDC gadget it does not recognise never
+        shows up, and those ports open and work perfectly well. Calling
+        them missing paints the UI red and - now that the state gates
+        the Connect button - would refuse a connection that works.
+        """
+        master, slave = os.openpty()
+        try:
+            proxy = _proxy(port=os.ttyname(slave), connected=False)
+            self.assertEqual(
+                self.wrapper._compute_port_state(proxy, []), 'offline')
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_a_device_that_is_really_gone_is_still_an_error(self):
+        proxy = _proxy(port='/dev/ttyUSB-definitely-not-here',
+            connected=False)
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, []), 'error')
+
+    def test_a_match_that_finds_nothing_is_still_an_error(self):
+        """A match can only ever be answered by enumeration"""
+        proxy = _proxy(match={'serial_number': 'abc'}, connected=False)
+        self.assertEqual(
+            self.wrapper._compute_port_state(proxy, []), 'error')
+
 
 # ===========================================================================
 # `state` field in /api/status payload

@@ -506,6 +506,14 @@ class HttpServerWrapper():
           'online'  — serial proxy is open and data is flowing
           'offline' — device is present on the system, just no active link
           'error'   — configured device is missing (USB unplugged?)
+
+        The UI colours the port by this and disables Connect on 'error',
+        so a false 'error' costs the user a connection that would have
+        worked. Enumeration alone is not enough evidence: comports()
+        lists USB and built-in serial hardware, and never sees a pty, a
+        socat pair or a CDC gadget it does not recognise — all of which
+        open and carry data fine. A configured path that exists is
+        therefore taken as present, whoever put it there.
         """
         if proxy.is_connected:
             return 'online'
@@ -520,6 +528,11 @@ class HttpServerWrapper():
             for d in detected:
                 if d.get('device') == device:
                     return 'offline'
+            try:
+                if _os.path.exists(device):
+                    return 'offline'
+            except (OSError, TypeError, ValueError):
+                pass
             return 'error'
         # No specific device configured — can't say it's missing.
         return 'offline'
