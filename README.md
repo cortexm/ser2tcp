@@ -508,6 +508,22 @@ With authentication (configured at root level, shared across all HTTP servers):
 - First user added (via CLI or web UI) is automatically admin
 - Cannot delete last admin (user or token) — at least one admin must exist
 
+A change to an account reaches whoever is signed in on it right away,
+without waiting for their session to lapse:
+
+- granting or withdrawing `admin` applies to their open session and to
+  the live status stream behind their browser tab, so the parts of the
+  UI they may no longer use disappear on the spot
+- changing `session_timeout` applies to their open session
+- **changing a password signs that account out everywhere.** That is
+  what makes it useful against an account that got out: nothing keeps
+  working on the old password, and the web UI drops back to the login
+  screen within a couple of seconds
+- deleting a user signs them out the same way
+
+API tokens are checked against the configuration on every request, so
+editing or deleting one takes effect immediately as well.
+
 Generate password hash:
 
 ```bash

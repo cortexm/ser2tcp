@@ -236,7 +236,9 @@ class TestSessionManager(unittest.TestCase):
         mgr = self._make_manager()
         mgr.add_user('new', 'pass', session_timeout=120)
         token = mgr.login('new', 'pass')
-        self.assertEqual(mgr._sessions[token]['timeout'], 120)
+        # The session lapses on the user's own timeout, not the global
+        # one - it is read off the user, so nothing is stored here.
+        self.assertLess(mgr._sessions[token]['expires'], time.time() + 121)
 
     def test_update_user_password(self):
         mgr = self._make_manager(users=[self._make_user()])
@@ -449,3 +451,192 @@ class TestSessionTimeoutOverride(unittest.TestCase):
         manager = self._manager()
         manager.add_user('a', 'x', session_timeout=30)
         self.assertEqual(manager.list_users()[0]['session_timeout'], 30)
+
+
+class TestAnOpenSessionFollowsTheUser(unittest.TestCase):
+    """What a session grants is looked up, not remembered.
+
+    A session used to carry a copy of the admin flag and the timeout
+    taken at login. Demoting somebody therefore did nothing until they
+    logged out of their own accord - and since every request pushed the
+    expiry further out, that could be never.
+    """
+
+    def _manager(self, **kwargs):
+        user = {
+            'login': 'ann', 'password': hash_password('pass'),
+            'admin': True,
+        }
+        user.update(kwargs)
+        return SessionManager({'session_timeout': 3600, 'users': [
+            user,
+            {'login': 'bob', 'password': hash_password('pass'),
+             'admin': True},
+        ]})
+
+    def test_demoting_an_admin_takes_effect_at_once(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', admin=False)
+        self.assertFalse(mgr.authenticate(token)['admin'])
+
+    def test_demoting_does_not_log_them_out(self):
+        """They are still who they were, with less to do"""
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', admin=False)
+        self.assertEqual(mgr.authenticate(token)['login'], 'ann')
+
+    def test_promoting_takes_effect_at_once_too(self):
+        mgr = self._manager(admin=False)
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', admin=True)
+        self.assertTrue(mgr.authenticate(token)['admin'])
+
+    def test_a_shortened_timeout_applies_to_the_open_session(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', session_timeout=60)
+        mgr.authenticate(token)
+        self.assertLess(mgr._sessions[token]['expires'], time.time() + 61)
+
+    def test_a_session_whose_user_is_gone_is_not_accepted(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        del mgr._users['ann']
+        self.assertIsNone(mgr.authenticate(token))
+
+    def test_the_session_of_a_vanished_user_is_dropped(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        del mgr._users['ann']
+        mgr.authenticate(token)
+        self.assertNotIn(token, mgr._sessions)
+
+
+class TestChangingAPasswordEndsTheSessions(unittest.TestCase):
+    """Changing a password is how a compromised account is shut out.
+
+    Leaving the sessions open made it useless for that: whoever was
+    already in stayed in, and every request they made renewed them.
+    """
+
+    def _manager(self):
+        return SessionManager({'session_timeout': 3600, 'users': [
+            {'login': 'ann', 'password': hash_password('pass'),
+             'admin': True},
+            {'login': 'bob', 'password': hash_password('pass')},
+        ]})
+
+    def test_the_sessions_of_that_user_stop_working(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', password='different')
+        self.assertIsNone(mgr.authenticate(token))
+
+    def test_every_session_of_that_user_goes(self):
+        """Signed in from three places, locked out of all three"""
+        mgr = self._manager()
+        tokens = [mgr.login('ann', 'pass') for _ in range(3)]
+        mgr.update_user('ann', password='different')
+        for token in tokens:
+            self.assertIsNone(mgr.authenticate(token))
+
+    def test_other_users_are_left_alone(self):
+        mgr = self._manager()
+        theirs = mgr.login('bob', 'pass')
+        mgr.update_user('ann', password='different')
+        self.assertIsNotNone(mgr.authenticate(theirs))
+
+    def test_the_new_password_works(self):
+        mgr = self._manager()
+        mgr.update_user('ann', password='different')
+        self.assertIsNotNone(mgr.login('ann', 'different'))
+
+    def test_a_change_that_is_not_the_password_keeps_the_session(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', session_timeout=120)
+        self.assertIsNotNone(mgr.authenticate(token))
+
+    def test_a_refused_update_leaves_the_session_alone(self):
+        """The last admin cannot be demoted - and must stay logged in"""
+        mgr = SessionManager({'session_timeout': 3600, 'users': [
+            {'login': 'ann', 'password': hash_password('pass'),
+             'admin': True}]})
+        token = mgr.login('ann', 'pass')
+        self.assertIsInstance(mgr.update_user('ann', admin=False), str)
+        self.assertTrue(mgr.authenticate(token)['admin'])
+
+
+class TestReadingASessionWithoutRenewingIt(unittest.TestCase):
+    """What a long-lived connection is allowed to ask.
+
+    The status stream stays open for hours and has to notice when the
+    account behind it changes. It cannot use authenticate() for that:
+    every check would count as activity and hold the session open for
+    as long as the page is, which is the opposite of a timeout.
+    """
+
+    def _manager(self, **kwargs):
+        user = {'login': 'ann', 'password': hash_password('pass'),
+                'admin': True}
+        user.update(kwargs)
+        return SessionManager({
+            'session_timeout': 3600,
+            'users': [user, {'login': 'bob',
+                             'password': hash_password('pass'),
+                             'admin': True}],
+            'tokens': [{'token': 'bot-key', 'name': 'bot', 'admin': True}],
+        })
+
+    def test_it_reports_who_and_what(self):
+        mgr = self._manager()
+        state = mgr.session_state(mgr.login('ann', 'pass'))
+        self.assertEqual(state['login'], 'ann')
+        self.assertTrue(state['admin'])
+
+    def test_it_does_not_push_the_expiry_out(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        expires = mgr._sessions[token]['expires']
+        mgr.session_state(token)
+        self.assertEqual(mgr._sessions[token]['expires'], expires)
+
+    def test_it_follows_a_demotion(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', admin=False)
+        self.assertFalse(mgr.session_state(token)['admin'])
+
+    def test_it_reports_nothing_after_a_password_change(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.update_user('ann', password='different')
+        self.assertIsNone(mgr.session_state(token))
+
+    def test_it_reports_nothing_for_a_deleted_user(self):
+        mgr = self._manager()
+        token = mgr.login('ann', 'pass')
+        mgr.delete_user('ann')
+        self.assertIsNone(mgr.session_state(token))
+
+    def test_an_expired_session_reports_nothing(self):
+        mgr = self._manager(session_timeout=0)
+        token = mgr.login('ann', 'pass')
+        self.assertIsNone(mgr.session_state(token))
+
+    def test_an_expired_session_is_not_thrown_away_here(self):
+        """Reaping belongs to cleanup(), which runs every pass anyway"""
+        mgr = self._manager(session_timeout=0)
+        token = mgr.login('ann', 'pass')
+        mgr.session_state(token)
+        self.assertIn(token, mgr._sessions)
+
+    def test_an_api_token_works_the_same_way(self):
+        mgr = self._manager()
+        self.assertEqual(mgr.session_state('bot-key'),
+                         {'login': 'bot', 'admin': True})
+
+    def test_an_unknown_token_reports_nothing(self):
+        self.assertIsNone(self._manager().session_state('nonsense'))

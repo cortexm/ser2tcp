@@ -2347,3 +2347,160 @@ class TestFailedPortInStatus(unittest.TestCase):
         detected = [{'device': '/dev/ttyUSB0'}]
         self.assertEqual(
             self.wrapper._compute_port_state(proxy, detected), 'error')
+
+
+class TestARevokedAdminIsRevokedAtOnce(unittest.TestCase):
+    """The API side of a permission change to a signed-in account.
+
+    Demoting somebody used to leave their open session holding the
+    admin flag it copied at login - and since every request pushed the
+    expiry out, they kept it until they chose to sign out.
+    """
+
+    def setUp(self):
+        self.wrapper = make_wrapper(auth_config={'users': [
+            {'login': 'ann', 'password': hash_password('secret'),
+             'admin': True},
+            {'login': 'bob', 'password': hash_password('secret'),
+             'admin': True},
+        ]})
+        self.token = self._login('ann')
+
+    def _login(self, login):
+        client = MockClient(
+            method='POST', path='/api/login',
+            data={'login': login, 'password': 'secret'})
+        self.wrapper._handle_request(client)
+        return client.responded['token']
+
+    def _as(self, token, method='GET', path='/api/status', data=None):
+        client = MockClient(
+            method=method, path=path, data=data,
+            headers={'authorization': f'Bearer {token}'})
+        self.wrapper._handle_request(client)
+        return client
+
+    def _update(self, login, **fields):
+        return self._as(
+            self._login('bob'), 'PUT', f'/api/users/{login}', fields)
+
+    def test_admin_only_work_is_refused_after_the_demotion(self):
+        self.assertEqual(self._as(self.token, path='/api/users').
+                         respond_status, 200)
+        self._update('ann', admin=False)
+        self.assertEqual(self._as(self.token, path='/api/users').
+                         respond_status, 403)
+
+    def test_they_can_still_read_what_any_user_may(self):
+        self._update('ann', admin=False)
+        self.assertEqual(self._as(self.token).respond_status, 200)
+
+    def test_a_new_password_signs_them_out(self):
+        self._update('ann', password='different')
+        self.assertEqual(self._as(self.token).respond_status, 401)
+
+    def test_deleting_them_signs_them_out(self):
+        self._as(self._login('bob'), 'DELETE', '/api/users/ann')
+        self.assertEqual(self._as(self.token).respond_status, 401)
+
+
+class TestAnOpenStreamFollowsTheAccount(unittest.TestCase):
+    """The status stream is a connection, not a request.
+
+    It is opened once and fed for hours, so the admin flag it was
+    handed at subscribe time is another copy that outlives the account
+    it describes - and a stream opened before a password change went on
+    delivering live port status to whoever was holding it.
+    """
+
+    def setUp(self):
+        self.wrapper = make_wrapper(auth_config={'users': [
+            {'login': 'ann', 'password': hash_password('secret'),
+             'admin': True},
+            {'login': 'bob', 'password': hash_password('secret'),
+             'admin': True},
+        ]})
+        self.wrapper._detect_cache = []
+        self.wrapper._detect_cache_at = float('inf')
+        self.token = self._login('ann')
+        self.client = self._subscribe(self.token)
+
+    def _login(self, login):
+        client = MockClient(
+            method='POST', path='/api/login',
+            data={'login': login, 'password': 'secret'})
+        self.wrapper._handle_request(client)
+        return client.responded['token']
+
+    def _subscribe(self, token):
+        client = MockClient(
+            path='/api/status', query={'stream': '1'},
+            headers={'authorization': f'Bearer {token}'})
+        self.wrapper._handle_request(client)
+        client.ndjson_lines.clear()
+        return client
+
+    def _update(self, login, **fields):
+        client = MockClient(
+            method='PUT', path=f'/api/users/{login}', data=fields,
+            headers={'authorization': f'Bearer {self._login("bob")}'})
+        self.wrapper._handle_request(client)
+        return client
+
+    def test_it_starts_out_saying_admin(self):
+        self.assertTrue(self.wrapper._stream_clients[0]['admin'])
+
+    def test_a_demotion_reaches_the_open_stream(self):
+        self._update('ann', admin=False)
+        self.wrapper._broadcast_status()
+        snapshot = [l for l in self.client.ndjson_lines if 'ports' in l]
+        self.assertTrue(snapshot, self.client.ndjson_lines)
+        self.assertFalse(snapshot[-1]['admin'])
+
+    def test_a_promotion_reaches_it_too(self):
+        self._update('ann', admin=False)
+        self.wrapper._broadcast_status()
+        self.client.ndjson_lines.clear()
+        self._update('ann', admin=True)
+        self.wrapper._broadcast_status()
+        snapshot = [l for l in self.client.ndjson_lines if 'ports' in l]
+        self.assertTrue(snapshot[-1]['admin'])
+
+    def test_nothing_is_resent_while_nothing_changes(self):
+        self.wrapper._broadcast_status()
+        self.assertEqual(self.client.ndjson_lines, [])
+
+    def test_a_password_change_closes_the_stream(self):
+        self._update('ann', password='different')
+        self.wrapper._broadcast_status()
+        self.assertEqual(self.wrapper._stream_clients, [])
+
+    def test_a_closed_stream_stops_being_fed(self):
+        self._update('ann', password='different')
+        self.wrapper._broadcast_status()
+        self.wrapper._broadcast_status()
+        self.assertFalse(self.client.ndjson_alive)
+
+    def test_deleting_the_user_closes_the_stream(self):
+        client = MockClient(
+            method='DELETE', path='/api/users/ann',
+            headers={'authorization': f'Bearer {self._login("bob")}'})
+        self.wrapper._handle_request(client)
+        self.wrapper._broadcast_status()
+        self.assertEqual(self.wrapper._stream_clients, [])
+
+    def test_somebody_elses_stream_is_left_alone(self):
+        theirs = self._subscribe(self._login('bob'))
+        self._update('ann', password='different')
+        self.wrapper._broadcast_status()
+        self.assertTrue(theirs.ndjson_alive)
+        self.assertEqual(len(self.wrapper._stream_clients), 1)
+
+    def test_without_auth_configured_streams_are_left_alone(self):
+        wrapper = make_wrapper()
+        wrapper._detect_cache = []
+        wrapper._detect_cache_at = float('inf')
+        client = MockClient(path='/api/status', query={'stream': '1'})
+        wrapper._handle_request(client)
+        wrapper._broadcast_status()
+        self.assertEqual(len(wrapper._stream_clients), 1)

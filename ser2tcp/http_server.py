@@ -830,6 +830,7 @@ class HttpServerWrapper():
                 'port_name': port_name,
                 'endpoint': endpoint,
                 'last_port': dict(match) if match else None,
+                'token': self._get_bearer_token(client),
                 'admin': is_admin,
                 'last_send': _time.time(),
             })
@@ -854,6 +855,7 @@ class HttpServerWrapper():
             'mode': 'all',
             'last_ports': [dict(p) for p in ports],
             'last_detected': [dict(d) for d in detected],
+            'token': self._get_bearer_token(client),
             'admin': is_admin,
             'last_send': _time.time(),
         })
@@ -896,11 +898,41 @@ class HttpServerWrapper():
         send_ndjson() returns False and the entry is dropped naturally.
         """
         client = entry['client']
+        if not self._stream_still_authorised(entry):
+            client.close()
+            return False
         if entry.get('mode') == 'filter':
             return self._broadcast_filter(
                 entry, client, now, current_ports)
         return self._broadcast_all(
             entry, client, now, current_ports, current_detected)
+
+    def _stream_still_authorised(self, entry):
+        """Re-check the account behind an open stream.
+
+        The admin flag was read once, at subscribe time, and the stream
+        outlives the request that opened it: a demoted admin kept being
+        told it was one, and a stream opened before a password change
+        went on delivering live status to whoever held it. Asking again
+        must not renew the session, or a page left open would keep it
+        alive forever - hence session_state() rather than
+        authenticate().
+        """
+        if not self._auth or self._auth.is_empty:
+            return True
+        state = self._auth.session_state(entry.get('token'))
+        if state is None:
+            return False
+        if state['admin'] != entry['admin']:
+            entry['admin'] = state['admin']
+            # Force the next pass to be a full snapshot: the flag rides
+            # along with one, and the client needs it to put its own
+            # admin-only affordances away.
+            if entry.get('mode') == 'filter':
+                entry['last_port'] = None
+            else:
+                entry['last_ports'] = None
+        return True
 
     def _broadcast_all(self, entry, client, now,
             current_ports, current_detected):
@@ -908,7 +940,7 @@ class HttpServerWrapper():
         last_detected = entry['last_detected']
         ok = True
         sent_anything = False
-        if len(last_ports) != len(current_ports):
+        if last_ports is None or len(last_ports) != len(current_ports):
             # Port added/removed — replay full snapshot. Cheaper than
             # diffing across mismatched indices.
             ok = client.send_ndjson({

@@ -665,6 +665,10 @@ function startStatusStream() {
     signal: ctrl.signal,
   }).then(async resp => {
     if (resp.status === 401) {
+      // The server answered, so it is not the one that is missing -
+      // this session is. Say so, or the login page arrives under a
+      // banner blaming the server we just reached.
+      setServerReachable(true);
       _statusStream = null;
       setCredentials(null, null);
       navigate('/login');

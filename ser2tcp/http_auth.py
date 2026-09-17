@@ -126,19 +126,33 @@ class SessionManager():
         return self.create_session(login)
 
     def create_session(self, login):
-        """Create session for user without password check, return token"""
+        """Create session for user without password check, return token.
+
+        The session holds who it belongs to and when it lapses, and
+        nothing else. What the login is allowed to do is read off the
+        user every time it is used - a copy taken here would go on
+        granting what the account no longer has.
+        """
         user = self._users.get(login)
         if not user:
             return None
         token = _secrets.token_hex(32)
         self._sessions[token] = {
             'login': login,
-            'admin': user.get('admin', False),
-            'timeout': user.get('session_timeout', self._default_timeout),
-            'expires': _time.time() + user.get(
-                'session_timeout', self._default_timeout),
+            'expires': _time.time() + self._timeout_for(user),
         }
         return token
+
+    def _timeout_for(self, user):
+        """How long this user's sessions last between requests"""
+        timeout = user.get('session_timeout')
+        return self._default_timeout if timeout is None else timeout
+
+    def _drop_sessions(self, login):
+        """End every session belonging to this login"""
+        for token in [t for t, s in self._sessions.items()
+                      if s['login'] == login]:
+            del self._sessions[token]
 
     def logout(self, token):
         """Remove session"""
@@ -160,12 +174,39 @@ class SessionManager():
         if _time.time() > session['expires']:
             del self._sessions[token]
             return None
+        user = self._users.get(session['login'])
+        if user is None:
+            # The account went away without going through delete_user.
+            del self._sessions[token]
+            return None
         # Renew session
-        session['expires'] = _time.time() + session['timeout']
+        session['expires'] = _time.time() + self._timeout_for(user)
         return {
             'login': session['login'],
-            'admin': session['admin'],
+            'admin': user.get('admin', False),
         }
+
+    def session_state(self, token):
+        """What this token grants right now, without renewing it.
+
+        authenticate() is the answer for a request: it pushes the
+        expiry out, because a request is activity. A connection held
+        open for hours is not, and has to be able to ask the same
+        question without keeping the session alive by asking.
+        """
+        token_cfg = self._tokens.get(token)
+        if token_cfg:
+            return {
+                'login': token_cfg.get('name', 'token'),
+                'admin': token_cfg.get('admin', False),
+            }
+        session = self._sessions.get(token)
+        if not session or _time.time() > session['expires']:
+            return None
+        user = self._users.get(session['login'])
+        if user is None:
+            return None
+        return {'login': session['login'], 'admin': user.get('admin', False)}
 
     def list_users(self):
         """Return list of users (without passwords)"""
@@ -214,6 +255,11 @@ class SessionManager():
                     return 'Cannot remove last admin'
         if 'password' in kwargs:
             user['password'] = ensure_hashed(kwargs['password'])
+            # Changing a password is how an account that got out is
+            # shut again. Leaving its sessions open would make that
+            # pointless: whoever is already in stays in, and every
+            # request they make pushes the expiry further out.
+            self._drop_sessions(login)
         if 'admin' in kwargs:
             user['admin'] = kwargs['admin']
         self._set_timeout(user, kwargs)
@@ -236,12 +282,7 @@ class SessionManager():
             if self._admin_token_count() == 0:
                 return 'Cannot delete last admin'
         del self._users[login]
-        # Invalidate all sessions for this user
-        to_remove = [
-            t for t, s in self._sessions.items()
-            if s['login'] == login]
-        for token in to_remove:
-            del self._sessions[token]
+        self._drop_sessions(login)
         return True
 
     def list_tokens(self):
