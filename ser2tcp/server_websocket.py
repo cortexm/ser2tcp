@@ -119,6 +119,15 @@ class ServerWebSocket():
         else:
             client.ws_close(1011, 'Serial port unavailable')
 
+    def set_read_paused(self, paused):
+        """Backpressure has no handle here.
+
+        uhttp owns these sockets and their selector registration, so
+        there is nothing to un-arm. WebSocket clients are held back by
+        the serial write buffer's hard limit instead - see
+        SerialProxy.WRITE_BUFFER_LIMIT.
+        """
+
     def disconnect_client(self, client):
         """Drop one client on request, return its address for logging.
 

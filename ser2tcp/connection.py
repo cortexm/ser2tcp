@@ -20,6 +20,9 @@ class Connection():
         self._owner = None
         self._interest = None
         self._out_buffer = bytearray()
+        # Set while the device this client feeds is behind: see
+        # set_read_paused().
+        self._read_paused = False
         self._last_write_time = _time.time()
         if send_timeout is not None:
             self._send_timeout = send_timeout
@@ -57,10 +60,28 @@ class Connection():
         Subclasses that are mid-handshake ask for what the TLS layer
         wants instead.
         """
-        want = _selectors.EVENT_READ
+        want = 0
+        if not self._read_paused:
+            want |= _selectors.EVENT_READ
         if self._out_buffer:
             want |= _selectors.EVENT_WRITE
         return want
+
+    def set_read_paused(self, paused):
+        """Stop or resume reading from this client.
+
+        Backpressure: while the serial port is behind, not reading is
+        what closes the TCP window and makes the sender wait. Dropping
+        data it already handed over would be worse, and buffering it
+        without end is not an answer at a device's baud rate.
+
+        What we still owe the client goes out regardless - this is
+        about the direction that is backed up, not the other one.
+        """
+        if self._read_paused == bool(paused):
+            return
+        self._read_paused = bool(paused)
+        self.update_interest()
 
     def needs_handshake(self):
         """True while this connection is not usable yet (see SSL)"""
@@ -86,12 +107,23 @@ class Connection():
         if want == self._interest:
             return
         try:
-            self._selector.modify(self._socket, want, self._owner)
+            if not want:
+                # Paused with nothing owed: a zero mask is not
+                # selectable, so stop watching until something changes.
+                self._selector.unregister(self._socket)
+            elif not self._interest:
+                self._selector.register(self._socket, want, self._owner)
+            else:
+                self._selector.modify(self._socket, want, self._owner)
         except (KeyError, ValueError, OSError):
             # Cannot be re-armed, so it would hang instead of failing.
             self.close()
             return
         self._interest = want
+
+    def is_read_paused(self):
+        """True while this connection is deliberately not being read"""
+        return self._read_paused
 
     def _unregister(self):
         """Drop the socket from the selector before it is closed.

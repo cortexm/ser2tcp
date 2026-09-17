@@ -2,6 +2,7 @@
 
 import fnmatch as _fnmatch
 import logging as _logging
+import os as _os
 import selectors as _selectors
 import socket as _socket
 import threading as _threading
@@ -45,15 +46,37 @@ class SerialProxy():
     MATCH_ATTRIBUTES = ('vid', 'pid', 'serial_number', 'manufacturer',
         'product', 'location', 'description', 'hwid')
 
+    # A device drains at its baud rate - 256 KB at 9600 is minutes - so
+    # what clients hand over is buffered and written as the port takes
+    # it. Past the high water mark their sockets stop being read, which
+    # closes the TCP window and makes the sender wait; reading starts
+    # again below the low mark, so a busy port does not flap on every
+    # byte. The hard limit is the last line of defence, for clients that
+    # cannot be paused (uhttp owns the WebSocket sockets) or a device
+    # that has stopped draining altogether.
+    WRITE_HIGH_WATER = 64 * 1024
+    WRITE_LOW_WATER = 16 * 1024
+    WRITE_BUFFER_LIMIT = 1024 * 1024
+    WRITE_WARN_INTERVAL = 10.0
+    # A device that accepts nothing at all for this long is not slow,
+    # it is stuck - and while it is, clients paused for backpressure
+    # are not being watched, so nothing would ever reap them.
+    WRITE_STALL_TIMEOUT = 30.0
+
     def __init__(self, config, log=None, certs_dir=None, selector=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._serial = None
+        self._out_buffer = bytearray()
+        self._read_paused = False
+        self._last_drop_warning = 0
+        self._write_progress_at = _time.time()
         self._certs_dir = certs_dir
         self._selector = selector
         # What the loop watches for incoming serial data: the port
         # itself, or the socketpair a reader thread feeds for ports with
         # no usable fileno(). None while disconnected.
         self._serial_source = None
+        self._serial_interest = None
         self._reader_thread = None
         self._reader_sock_r = None
         self._reader_sock_w = None
@@ -100,6 +123,10 @@ class SerialProxy():
         if 'port' not in config and 'match' not in config:
             raise ValueError("Serial config must have 'port' or 'match'")
         config = {k: v for k, v in config.items() if k != 'match'}
+        # Non-blocking writes, whatever the config says: pyserial then
+        # returns how much it took instead of waiting for the device,
+        # and the rest is driven by write interest from the loop.
+        config['write_timeout'] = 0
         if 'parity' in config:
             for key, val in self.PARITY_CONFIG.items():
                 if config['parity'] == key:
@@ -264,6 +291,10 @@ class SerialProxy():
             # whose fileno() has already gone away.
             self._unregister_serial()
             self._stop_reader_thread()
+            # Whatever is still queued belongs to a port that is gone.
+            self._out_buffer.clear()
+            if self._read_paused:
+                self._set_read_paused(False)
             self._last_signals = None
             self._serial.close()
             self._serial = None
@@ -289,6 +320,7 @@ class SerialProxy():
             self._log.warning("Cannot watch serial port: %s", err)
             return
         self._serial_source = source
+        self._serial_interest = _selectors.EVENT_READ
 
     def _unregister_serial(self):
         """Stop watching the port before it is closed"""
@@ -299,6 +331,7 @@ class SerialProxy():
         except (KeyError, ValueError, OSError):
             pass
         self._serial_source = None
+        self._serial_interest = None
 
     def send_to_connections(self, data):
         """Send data to all connections"""
@@ -333,17 +366,27 @@ class SerialProxy():
         self.disconnect()
 
     def handle_event(self, fileobj, mask):
-        """Owner dispatch for the serial read source"""
+        """Owner dispatch for the serial source"""
         if self._serial is None or fileobj is not self._serial_source:
             # Disconnected between the select() and this event.
             return None
-        self._process_serial_data()
+        if mask & _selectors.EVENT_WRITE:
+            self.flush_serial()
+            if self._serial is None:
+                return None
+        if mask & _selectors.EVENT_READ:
+            self._process_serial_data()
         return None
 
     def process_stale(self):
         """Remove stale connections"""
         for server in self._servers:
             server.process_stale()
+        if self._out_buffer and self._serial_source is not self._serial:
+            # A port with no usable fileno() is read through a reader
+            # thread's socketpair, which says nothing about whether the
+            # device will take a write - so retry here instead.
+            self.flush_serial()
         self.process_signals()
 
     def set_rts(self, value):
@@ -457,18 +500,139 @@ class SerialProxy():
                     server.send_signal_report(bitmask)
 
     def send(self, data):
-        """Send data to serial port"""
-        if not self._serial:
+        """Queue data for the serial port and write what it will take"""
+        if not self._serial or not data:
+            return
+        room = self.WRITE_BUFFER_LIMIT - len(self._out_buffer)
+        if len(data) > room:
+            # Nothing else to do: the device is not keeping up and the
+            # client could not be slowed down. Say so rather than
+            # dropping in silence, but not on every write.
+            self._warn_dropped(len(data) - max(room, 0))
+            data = data[:max(room, 0)]
+            if not data:
+                return
+        if not self._out_buffer:
+            self._write_progress_at = _time.time()
+        self._out_buffer.extend(data)
+        # Monitors see what was accepted for the device, in order.
+        self._notify_monitors(1, bytes(data))  # TX
+        self.flush_serial()
+
+    def _warn_dropped(self, count):
+        """Report dropped output, at most once every few seconds"""
+        now = _time.time()
+        if now - self._last_drop_warning < self.WRITE_WARN_INTERVAL:
+            return
+        self._last_drop_warning = now
+        self._log.warning(
+            "(%s): write buffer full, dropped %d bytes - the device is "
+            "not keeping up", self._serial_config.get('port'), count)
+
+    def flush_serial(self):
+        """Write as much of the buffer as the device will take"""
+        if not self._serial or not self._out_buffer:
             return
         try:
-            self._serial.write(data)
+            sent = self._write_device(self._out_buffer)
         except (OSError, _serial.SerialException) as err:
             # A device unplugged mid-write reaches us here rather than
             # on the read side; same response either way.
             self._log.warning(err)
             self._serial_failed()
             return
-        self._notify_monitors(1, data)  # TX
+        if sent:
+            del self._out_buffer[:sent]
+            self._write_progress_at = _time.time()
+        elif self._stalled():
+            return
+        self._update_serial_interest()
+        self._update_backpressure()
+
+    def _write_device(self, data):
+        """Hand bytes to the device, returning how many it took.
+
+        Writes through the file descriptor rather than Serial.write():
+        with write_timeout=0 pyserial swallows the EAGAIN from a full
+        device and loops on it, so a device that can take nothing spins
+        a core inside a call that never comes back. Ports with no usable
+        descriptor - socket:// and friends, the same ones that need a
+        reader thread - still go through pyserial, which uses a blocking
+        socket there and returns on its own.
+        """
+        try:
+            fileno = self._serial.fileno()
+        except (OSError, AttributeError, NotImplementedError):
+            fileno = None
+        if fileno is None:
+            return self._serial.write(bytes(data)) or 0
+        try:
+            return _os.write(fileno, data)
+        except BlockingIOError:
+            return 0
+
+    def _stalled(self):
+        """True once the device has taken nothing for far too long.
+
+        Treated as a device failure, which drops the clients: a port
+        that accepts nothing is no more use than one that is unplugged,
+        and leaving it be would strand clients paused for backpressure
+        with nothing watching them.
+        """
+        if _time.time() - self._write_progress_at < self.WRITE_STALL_TIMEOUT:
+            return False
+        self._log.warning(
+            "(%s): device accepted nothing for %.0fs with %d bytes queued, "
+            "giving up on it", self._serial_config.get('port'),
+            self.WRITE_STALL_TIMEOUT, len(self._out_buffer))
+        self._serial_failed()
+        return True
+
+    def _update_serial_interest(self):
+        """Arm EVENT_WRITE only while there is something to write.
+
+        Same rule the client connections follow: left armed on an empty
+        buffer the loop spins on an always-writable device, never armed
+        the backlog never leaves.
+        """
+        if self._selector is None or self._serial_source is None:
+            return
+        want = _selectors.EVENT_READ
+        if self._out_buffer:
+            want |= _selectors.EVENT_WRITE
+        if want == self._serial_interest:
+            return
+        try:
+            self._selector.modify(self._serial_source, want, self)
+        except (KeyError, ValueError, OSError) as err:
+            self._log.warning("Cannot watch serial port: %s", err)
+            return
+        self._serial_interest = want
+
+    def _update_backpressure(self):
+        """Stop or resume reading clients based on the backlog.
+
+        Hysteresis on purpose: pausing at the high mark and resuming at
+        the low one keeps a steadily busy port from toggling interest on
+        every single write.
+        """
+        if self._read_paused:
+            if len(self._out_buffer) > self.WRITE_LOW_WATER:
+                return
+            self._set_read_paused(False)
+        else:
+            if len(self._out_buffer) <= self.WRITE_HIGH_WATER:
+                return
+            self._set_read_paused(True)
+
+    def _set_read_paused(self, paused):
+        self._read_paused = paused
+        self._log.debug(
+            "(%s): %s reading clients (%d bytes queued)",
+            self._serial_config.get('port'),
+            'pausing' if paused else 'resuming', len(self._out_buffer))
+        for server in self._servers:
+            server.set_read_paused(paused)
 
     def add_monitor(self, callback):
         """Register monitor callback - receives (direction, data)"""

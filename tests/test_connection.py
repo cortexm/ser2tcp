@@ -1,5 +1,6 @@
 """Tests for Connection class"""
 
+import selectors
 import unittest
 from unittest.mock import Mock, patch
 import time
@@ -148,3 +149,68 @@ class TestConnectionFlushError(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadBackpressure(unittest.TestCase):
+    """A connection can be told to stop being read.
+
+    The device drains at its baud rate; when its queue backs up the
+    honest answer is to stop reading clients, so the TCP window closes
+    and the sender waits, rather than buffering without end or dropping
+    what has already been accepted.
+    """
+
+    def _attached(self):
+        conn = Connection((MockSocket(), ('127.0.0.1', 5555)), log=Mock())
+        selector = Mock()
+        conn.attach(selector, owner='server')
+        selector.register.reset_mock()
+        return conn, selector
+
+    def test_a_connection_starts_readable(self):
+        conn, _ = self._attached()
+        self.assertEqual(conn.wanted_events(), selectors.EVENT_READ)
+
+    def test_pausing_drops_read_interest(self):
+        conn, _ = self._attached()
+        conn.set_read_paused(True)
+        self.assertFalse(conn.wanted_events() & selectors.EVENT_READ)
+
+    def test_pausing_with_nothing_to_write_stops_watching_entirely(self):
+        """A zero mask is not selectable, so the socket is unregistered"""
+        conn, selector = self._attached()
+        conn.set_read_paused(True)
+        selector.unregister.assert_called_once_with(conn.socket())
+
+    def test_resuming_watches_it_again(self):
+        conn, selector = self._attached()
+        conn.set_read_paused(True)
+        selector.register.reset_mock()
+        conn.set_read_paused(False)
+        selector.register.assert_called_once()
+        self.assertEqual(
+            selector.register.call_args.args[1], selectors.EVENT_READ)
+
+    def test_a_paused_connection_still_flushes_what_it_owes(self):
+        conn, selector = self._attached()
+        conn.send(b'pending')
+        conn.set_read_paused(True)
+        want = conn.wanted_events()
+        self.assertTrue(want & selectors.EVENT_WRITE)
+        self.assertFalse(want & selectors.EVENT_READ)
+        selector.unregister.assert_not_called()
+
+    def test_pausing_twice_changes_nothing(self):
+        conn, selector = self._attached()
+        conn.set_read_paused(True)
+        selector.unregister.reset_mock()
+        conn.set_read_paused(True)
+        selector.unregister.assert_not_called()
+
+    def test_the_send_timeout_keeps_running_while_paused(self):
+        """Pausing is about reading; what we owe the client is unaffected"""
+        conn, _ = self._attached()
+        conn.send(b'pending')
+        conn.set_read_paused(True)
+        conn._last_write_time = time.time() - 3600
+        self.assertTrue(conn.is_stale())

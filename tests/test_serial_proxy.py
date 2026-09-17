@@ -1,5 +1,7 @@
 """Tests for SerialProxy config parsing"""
 
+import selectors
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -14,10 +16,14 @@ def _mock_init(self, config=None, log=None):
     self._serial = None
     self._selector = None
     self._serial_source = None
+    self._serial_interest = None
     self._reader_thread = None
     self._reader_sock_r = None
     self._reader_sock_w = None
     self._reader_running = False
+    self._out_buffer = bytearray()
+    self._read_paused = False
+    self._last_drop_warning = 0
 
 
 def _make_port_info(device, vid=None, pid=None, serial_number=None,
@@ -532,6 +538,7 @@ class TestSerialErrorsAreContained(unittest.TestCase):
     def test_write_failure_drops_clients_and_closes_the_port(self):
         proxy = self._make_proxy()
         proxy._serial = MagicMock()
+        proxy._serial.fileno.side_effect = OSError('no fileno')
         proxy._serial.write.side_effect = OSError('device gone')
         server = MagicMock()
         proxy._servers = [server]
@@ -638,3 +645,294 @@ class TestSignalLogging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSerialWriteBuffer(unittest.TestCase):
+    """Writing to the device must never stall the loop.
+
+    One selectors loop serves every port and the HTTP API, and a serial
+    port drains at its baud rate: 256 KB at 9600 is minutes. Writes are
+    buffered and driven by write interest, exactly as client sockets
+    already are.
+    """
+
+    def _make_proxy(self, accept=None):
+        """A proxy whose device accepts `accept` bytes per write"""
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._serial_config = {'port': '/dev/null'}
+        proxy._monitors = []
+        device = MagicMock()
+        # No usable descriptor, so writes go through pyserial - which is
+        # what device.write mocks here.
+        device.fileno.side_effect = OSError('no fileno')
+        if accept is None:
+            device.write.side_effect = lambda data: len(data)
+        else:
+            device.write.side_effect = lambda data: min(accept, len(data))
+        proxy._serial = device
+        proxy._serial_source = device
+        return proxy, device
+
+    def test_a_write_the_device_takes_whole_leaves_nothing_behind(self):
+        proxy, device = self._make_proxy()
+        proxy.send(b'hello')
+        device.write.assert_called_once()
+        self.assertEqual(bytes(proxy._out_buffer), b'')
+
+    def test_what_the_device_would_not_take_is_kept(self):
+        proxy, _ = self._make_proxy(accept=2)
+        proxy.send(b'hello')
+        self.assertEqual(bytes(proxy._out_buffer), b'llo')
+
+    def test_the_rest_goes_out_as_the_device_accepts_it(self):
+        proxy, device = self._make_proxy(accept=2)
+        proxy.send(b'hello')
+        device.write.side_effect = lambda data: len(data)
+        proxy.flush_serial()
+        self.assertEqual(bytes(proxy._out_buffer), b'')
+
+    def test_order_is_preserved_across_partial_writes(self):
+        proxy, device = self._make_proxy(accept=3)
+        written = bytearray()
+        device.write.side_effect = lambda data: (
+            written.extend(data[:3]) or min(3, len(data)))
+        proxy.send(b'abcdefghij')
+        for _ in range(5):
+            proxy.flush_serial()
+        self.assertEqual(bytes(written), b'abcdefghij')
+
+    def test_a_device_error_drops_the_clients(self):
+        proxy, device = self._make_proxy()
+        device.write.side_effect = OSError('device gone')
+        proxy._serial_failed = MagicMock()
+        proxy.send(b'x')
+        proxy._serial_failed.assert_called_once()
+
+    def test_nothing_is_written_while_disconnected(self):
+        proxy, _ = self._make_proxy()
+        proxy._serial = None
+        proxy.send(b'x')
+        self.assertEqual(bytes(proxy._out_buffer), b'')
+
+
+class TestSerialWriteInterest(unittest.TestCase):
+    """EVENT_WRITE is armed only while there is something to write"""
+
+    def _make_proxy(self, accept=0):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._serial_config = {'port': '/dev/null'}
+        proxy._monitors = []
+        device = MagicMock()
+        device.fileno.side_effect = OSError('no fileno')
+        device.write.side_effect = lambda data: min(accept, len(data))
+        proxy._serial = device
+        proxy._serial_source = device
+        proxy._selector = MagicMock()
+        # A registered port is already being watched for reads.
+        proxy._serial_interest = selectors.EVENT_READ
+        return proxy, device
+
+    def test_a_backed_up_write_arms_write_interest(self):
+        proxy, _ = self._make_proxy(accept=0)
+        proxy.send(b'stuck')
+        proxy._selector.modify.assert_called_once()
+        mask = proxy._selector.modify.call_args.args[1]
+        self.assertTrue(mask & selectors.EVENT_WRITE)
+        self.assertTrue(mask & selectors.EVENT_READ)
+
+    def test_a_drained_buffer_disarms_write_interest(self):
+        proxy, device = self._make_proxy(accept=0)
+        proxy.send(b'stuck')
+        proxy._selector.modify.reset_mock()
+        device.write.side_effect = lambda data: len(data)
+        proxy.flush_serial()
+        mask = proxy._selector.modify.call_args.args[1]
+        self.assertEqual(mask, selectors.EVENT_READ)
+
+    def test_a_write_that_goes_straight_out_never_arms_it(self):
+        proxy, _ = self._make_proxy(accept=1000)
+        proxy.send(b'quick')
+        proxy._selector.modify.assert_not_called()
+
+
+class TestSerialBackpressure(unittest.TestCase):
+    """Stop reading clients rather than buffering without end.
+
+    A client can hand over data far faster than the device drains it.
+    Dropping is a last resort; the honest answer is to stop reading,
+    which closes the TCP window and makes the sender wait.
+    """
+
+    def _make_proxy(self):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._serial_config = {'port': '/dev/null'}
+        proxy._monitors = []
+        device = MagicMock()
+        device.fileno.side_effect = OSError('no fileno')
+        device.write.side_effect = lambda data: 0
+        proxy._serial = device
+        proxy._serial_source = device
+        server = MagicMock()
+        proxy._servers = [server]
+        return proxy, device, server
+
+    def test_a_small_backlog_does_not_pause_anyone(self):
+        proxy, _, server = self._make_proxy()
+        proxy.send(b'x' * 1024)
+        server.set_read_paused.assert_not_called()
+
+    def test_passing_the_high_water_mark_pauses_reading(self):
+        proxy, _, server = self._make_proxy()
+        proxy.send(b'x' * (SerialProxy.WRITE_HIGH_WATER + 1))
+        server.set_read_paused.assert_called_once_with(True)
+
+    def test_dropping_below_the_low_water_mark_resumes_reading(self):
+        proxy, device, server = self._make_proxy()
+        proxy.send(b'x' * (SerialProxy.WRITE_HIGH_WATER + 1))
+        server.set_read_paused.reset_mock()
+        # The device takes all but a little.
+        keep = SerialProxy.WRITE_LOW_WATER - 1
+        device.write.side_effect = lambda data: len(data) - keep
+        proxy.flush_serial()
+        server.set_read_paused.assert_called_once_with(False)
+
+    def test_between_the_marks_nothing_changes(self):
+        proxy, device, server = self._make_proxy()
+        proxy.send(b'x' * (SerialProxy.WRITE_HIGH_WATER + 1))
+        server.set_read_paused.reset_mock()
+        # Still above the low water mark: no flapping on every byte.
+        device.write.side_effect = lambda data: 1
+        proxy.flush_serial()
+        server.set_read_paused.assert_not_called()
+
+    def test_the_hard_limit_drops_and_says_so(self):
+        """WebSocket clients cannot be paused, so a cap still matters"""
+        proxy, _, _ = self._make_proxy()
+        proxy.send(b'x' * (SerialProxy.WRITE_BUFFER_LIMIT + 4096))
+        self.assertLessEqual(
+            len(proxy._out_buffer), SerialProxy.WRITE_BUFFER_LIMIT)
+        self.assertTrue(proxy._log.warning.called)
+
+    def test_disconnecting_clears_the_backlog_and_the_pause(self):
+        proxy, _, server = self._make_proxy()
+        proxy.send(b'x' * (SerialProxy.WRITE_HIGH_WATER + 1))
+        server.set_read_paused.reset_mock()
+        proxy.has_connections = MagicMock(return_value=False)
+        proxy._unregister_serial = MagicMock()
+        proxy._stop_reader_thread = MagicMock()
+        proxy.disconnect()
+        self.assertEqual(bytes(proxy._out_buffer), b'')
+        server.set_read_paused.assert_called_once_with(False)
+
+
+class TestWriteTimeoutIsForced(unittest.TestCase):
+    """A blocking write has no place in the loop, whatever the config"""
+
+    def _config(self, **serial_cfg):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        cfg = {'port': '/dev/ttyUSB0'}
+        cfg.update(serial_cfg)
+        return proxy._init_serial_config(cfg)
+
+    def test_write_timeout_defaults_to_non_blocking(self):
+        self.assertEqual(self._config()['write_timeout'], 0)
+
+    def test_a_configured_write_timeout_is_overridden(self):
+        self.assertEqual(self._config(write_timeout=30)['write_timeout'], 0)
+
+
+class TestDeviceWritePath(unittest.TestCase):
+    """How bytes actually reach the device.
+
+    pyserial's write() swallows the EAGAIN from a completely full
+    device and loops on it, so with write_timeout=0 a stuck port spins
+    a core inside a call that never returns. Ports with a real
+    descriptor are written through it instead.
+    """
+
+    def _proxy(self):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._serial_config = {'port': '/dev/null'}
+        proxy._monitors = []
+        return proxy
+
+    def test_a_port_with_a_descriptor_is_written_through_it(self):
+        proxy = self._proxy()
+        device = MagicMock()
+        device.fileno.return_value = 42
+        proxy._serial = device
+        with patch('ser2tcp.serial_proxy._os.write',
+                   return_value=3) as os_write:
+            self.assertEqual(proxy._write_device(bytearray(b'abc')), 3)
+        os_write.assert_called_once()
+        device.write.assert_not_called()
+
+    def test_a_full_device_reports_nothing_written(self):
+        """EAGAIN means "not now", not an error and not a reason to loop"""
+        proxy = self._proxy()
+        device = MagicMock()
+        device.fileno.return_value = 42
+        proxy._serial = device
+        with patch('ser2tcp.serial_proxy._os.write',
+                   side_effect=BlockingIOError()):
+            self.assertEqual(proxy._write_device(bytearray(b'abc')), 0)
+
+    def test_a_port_without_a_descriptor_falls_back_to_pyserial(self):
+        proxy = self._proxy()
+        device = MagicMock()
+        device.fileno.side_effect = OSError('no fileno')
+        device.write.return_value = 3
+        proxy._serial = device
+        self.assertEqual(proxy._write_device(bytearray(b'abc')), 3)
+        device.write.assert_called_once_with(b'abc')
+
+
+class TestStalledDevice(unittest.TestCase):
+    """A device that takes nothing at all is stuck, not slow"""
+
+    def _proxy(self):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._serial_config = {'port': '/dev/null'}
+        proxy._monitors = []
+        device = MagicMock()
+        device.fileno.side_effect = OSError('no fileno')
+        device.write.side_effect = lambda data: 0
+        proxy._serial = device
+        proxy._serial_source = device
+        proxy._serial_failed = MagicMock()
+        return proxy
+
+    def test_a_slow_device_is_left_alone(self):
+        proxy = self._proxy()
+        proxy.send(b'queued')
+        proxy._serial_failed.assert_not_called()
+
+    def test_a_device_that_never_takes_anything_is_given_up_on(self):
+        proxy = self._proxy()
+        proxy.send(b'queued')
+        proxy._write_progress_at = time.time() - (
+            SerialProxy.WRITE_STALL_TIMEOUT + 1)
+        proxy.flush_serial()
+        proxy._serial_failed.assert_called_once()
+        self.assertTrue(proxy._log.warning.called)
+
+    def test_progress_resets_the_clock(self):
+        proxy = self._proxy()
+        proxy.send(b'queued')
+        proxy._write_progress_at = time.time() - (
+            SerialProxy.WRITE_STALL_TIMEOUT + 1)
+        proxy._serial.write.side_effect = lambda data: len(data)
+        proxy.flush_serial()
+        proxy._serial_failed.assert_not_called()

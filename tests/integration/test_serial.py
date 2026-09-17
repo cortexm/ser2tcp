@@ -472,3 +472,88 @@ class TestPortReconfiguration(SerialPtyTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSlowDeviceBackpressure(SerialPtyTestCase):
+    """A device drains at its baud rate; a client does not.
+
+    Writing straight to the port blocked the one loop that serves every
+    other port and the HTTP API - 256 KB at 9600 baud is minutes of
+    that. Writes are buffered and driven by write interest, and once
+    the queue backs up the clients stop being read so TCP makes them
+    wait instead.
+    """
+
+    PAYLOAD = 512 * 1024
+
+    def _push(self, sock, payload, seconds):
+        """Send as much as the socket will take, without blocking"""
+        sock.setblocking(False)
+        sent = 0
+        deadline = time.time() + seconds
+        while sent < len(payload) and time.time() < deadline:
+            try:
+                sent += sock.send(payload[sent:sent + 65536])
+            except BlockingIOError:
+                time.sleep(0.01)
+        sock.setblocking(True)
+        return sent
+
+    def test_the_api_answers_while_the_device_is_behind(self):
+        sock = self.connect()
+        self._push(sock, b'x' * self.PAYLOAD, 2)
+        # Nothing has drained the pty, so whatever is queued is stuck.
+        started = time.time()
+        status, _ = self.get('/api/status', timeout=5)
+        self.assertEqual(status, 200)
+        self.assertLess(time.time() - started, 3)
+
+    def test_another_port_still_moves_while_the_device_is_behind(self):
+        sock = self.connect()
+        self._push(sock, b'x' * self.PAYLOAD, 2)
+        second = self.connect()
+        os.write(self.master_fd, b'')  # no-op, keeps the pty alive
+        self.assertEqual(self.connections_on(self.tcp_port), 2)
+        second.close()
+
+    def test_a_client_is_held_back_rather_than_losing_data(self):
+        """What the server accepted must reach the device, in order"""
+        sock = self.connect()
+        payload = bytes(range(256)) * 256  # 64 KB, every byte distinct
+        accepted = self._push(sock, payload, 2)
+        self.assertGreater(accepted, 0)
+        got = read_device(self.master_fd, accepted, timeout=20)
+        self.assertEqual(got, payload[:len(got)])
+        self.assertGreaterEqual(len(got), accepted)
+
+    def _drain_until_quiet(self, timeout=25):
+        """Read the pty until nothing more turns up, return the count"""
+        total = 0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not select.select([self.master_fd], [], [], 0.5)[0]:
+                return total
+            total += len(os.read(self.master_fd, 65536))
+        return total
+
+    def test_the_backlog_drains_once_the_device_reads(self):
+        sock = self.connect()
+        accepted = self._push(sock, b'y' * self.PAYLOAD, 2)
+        drained = self._drain_until_quiet()
+        self.assertGreaterEqual(drained, accepted)
+        # And the port keeps working afterwards.
+        sock.sendall(b'after')
+        self.assertEqual(read_device(self.master_fd, 5, timeout=10), b'after')
+
+    def test_reading_resumes_after_the_backlog_clears(self):
+        """A paused client must not stay paused for good"""
+        sock = self.connect()
+        self._push(sock, b'z' * self.PAYLOAD, 2)
+        self.drain_device()
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            if not select.select([self.master_fd], [], [], 0.1)[0]:
+                break
+            os.read(self.master_fd, 65536)
+        sock.sendall(b'resumed')
+        self.assertIn(b'resumed', read_device(self.master_fd, 7, timeout=10))

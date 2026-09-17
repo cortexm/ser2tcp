@@ -55,6 +55,8 @@ class Server():
         # Set while the listening socket is deliberately not watched
         # after running out of file descriptors (see _accept_failed).
         self._accept_paused_until = 0
+        # Set while the serial port is behind and clients must wait.
+        self._read_paused = False
         if self._protocol not in self.CONNECTIONS:
             raise ConfigError('Unknown protocol %s' % self._protocol)
         if not self._data_enabled and not self._control:
@@ -226,11 +228,25 @@ class Server():
         else:
             connection.close()
 
+    def set_read_paused(self, paused):
+        """Stop or resume reading every client on this server.
+
+        The serial port asks for this when its write queue backs up:
+        not reading is what closes the TCP window and makes the sender
+        wait, instead of queueing without end at the device's baud rate.
+        """
+        self._read_paused = bool(paused)
+        for con in self._connections:
+            con.set_read_paused(self._read_paused)
+
     def _add_connection(self, connection):
         """Track a connection and start watching its socket"""
         self._connections.append(connection)
         self._conn_by_socket[connection.socket()] = connection
         connection.attach(self._selector, self)
+        if self._read_paused:
+            # Joined while the port is behind: wait like the others.
+            connection.set_read_paused(True)
 
     def _handshake(self, con):
         """Carry a TLS handshake one step further.
