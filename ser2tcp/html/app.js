@@ -1406,6 +1406,10 @@ function _buildPortForm(cfg, editId, bundles) {
   return {
     root,
     addServerBox,
+    // What the entry looked like when it was read. Sent back with the
+    // save so a change somebody else made in the meantime is reported
+    // instead of being quietly overwritten.
+    rev: cfg.rev,
     idInput,
     nameInput,
     portInput,
@@ -1668,6 +1672,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
 
 function _collectPortConfig(form) {
   const cfg = { serial: {}, servers: [] };
+  if (form.rev) cfg.rev = form.rev;
   const id = form.idInput.value.trim();
   if (id) {
     if (!ID_PATTERN.test(id)) {
@@ -1759,7 +1764,14 @@ function _savePortFromForm(form, id) {
     : '/api/ports';
   api(method, path, cfg)
     .then(() => navigate('/ports'))
-    .catch(e => { if (e !== 'unauthorized') modalError(String(e)); });
+    .catch(e => {
+      if (e === 'unauthorized') return;
+      // Includes the answer to a save aimed at a version of the port
+      // that has since been edited. The box stays open with the typing
+      // in it - discarding the change to report that it clashed would
+      // be the very thing this is here to prevent.
+      modalError(String(e));
+    });
 }
 
 // ===========================================================================
@@ -2231,12 +2243,17 @@ function showHttpEditor(id) {
     setTimeout(() => showHttpEditor(id), 50);
     return;
   }
-  // Fetch bundle list each time so newly created bundles show up.
-  api('GET', '/api/certs').then(data => {
-    _showHttpEditorWithBundles(id, data.bundles || []);
-  }).catch(e => {
-    if (e !== 'unauthorized') alert(String(e));
-  });
+  // Fetch bundle list each time so newly created bundles show up, and
+  // the settings with it: the editor saves back the entry it opened,
+  // and one read when the Settings screen was drawn can be minutes old
+  // by now.
+  Promise.all([api('GET', '/api/certs'), api('GET', '/api/settings')])
+    .then(([certs, settings]) => {
+      currentSettings = settings;
+      _showHttpEditorWithBundles(id, certs.bundles || []);
+    }).catch(e => {
+      if (e !== 'unauthorized') alert(String(e));
+    });
 }
 
 function _showHttpEditorWithBundles(id, bundles) {

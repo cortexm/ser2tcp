@@ -616,6 +616,31 @@ Connections carry an `id` too, in `/api/status`, and that is what
 `DELETE /api/ports/<id>/connections/<conn_id>` takes. Counting them
 would not work: a client hanging up moves every connection after it.
 
+### Concurrent edits
+
+`GET /api/ports/<id>` and `GET /api/settings` report a `rev` alongside
+each entry — a fingerprint of what that entry currently says. Send it
+back in the `PUT` and the change is refused with **409** if the entry
+was saved by somebody else in between:
+
+```
+$ curl -s localhost:8080/api/ports/9f3c1a20
+{"id": "9f3c1a20", "name": "my-device", ..., "rev": "bfe02568399c9e7f"}
+
+$ curl -sX PUT -d '{..., "rev": "bfe02568399c9e7f"}' \
+      localhost:8080/api/ports/9f3c1a20
+{"error": "It has changed since you opened it - reload it and apply your change again"}
+```
+
+Re-read the entry, apply the change to what it says now, and save that.
+The web UI does this for you: it sends the `rev` it loaded and leaves
+your editor open with the message rather than discarding what you typed.
+
+`rev` is optional. A request without one is not checked, so a script
+that writes a whole entry without reading it first keeps working. It is
+derived from the content rather than stored, so it never appears in
+`config.json` and an entry edited by hand is covered as well.
+
 ## Usage examples
 
 ```

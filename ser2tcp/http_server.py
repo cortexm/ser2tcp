@@ -149,6 +149,28 @@ class HttpServerWrapper():
             return None, f"id '{wanted}' is already in use"
         return wanted, None
 
+    def _rev_conflict(self, client, data, entry):
+        """True - and answered with 409 - if the entry has moved on.
+
+        The revision a client sends is the one it read. If the stored
+        entry no longer matches it, somebody saved in between and this
+        request would drop their change without either side noticing.
+
+        Sending it is optional: a script that never read the entry is
+        not racing anybody, and a client written before this existed
+        keeps working the way it did.
+        """
+        if not isinstance(data, dict):
+            return False
+        wanted = data.get('rev')
+        if wanted is None or wanted == _config_ids.entry_rev(entry):
+            return False
+        self._error(
+            client,
+            'It has changed since you opened it - '
+            'reload it and apply your change again', 409)
+        return True
+
     def _port_index(self, port_id):
         """Position of the port with this id, or None.
 
@@ -1047,7 +1069,10 @@ class HttpServerWrapper():
         saving the form rewrote the port with different ones.
         """
         ports = self._get_ports_config()
-        client.respond(ports[index])
+        # The revision travels with the configuration it describes, so
+        # a client that saves it back says which version it edited.
+        client.respond(
+            dict(ports[index], rev=_config_ids.entry_rev(ports[index])))
 
     @staticmethod
     def _is_port_number(value):
@@ -1243,6 +1268,11 @@ class HttpServerWrapper():
             self._error(client, 'Port not found', 404)
             return
         data = client.data
+        if self._rev_conflict(client, data, ports[index]):
+            return
+        if isinstance(data, dict):
+            # It describes the entry, it is not part of it.
+            data.pop('rev', None)
         error = self._validate_port_config(data)
         if not error:
             error = self._validate_endpoints(data, exclude_index=index)
@@ -1622,7 +1652,8 @@ class HttpServerWrapper():
             # Normalised to a list: the config allows a single object,
             # and a client that got one had to special-case it or
             # conclude there were no servers at all.
-            'http': self._http_list(),
+            'http': [dict(srv, rev=_config_ids.entry_rev(srv))
+                     for srv in self._http_list()],
             'session_timeout': self._configuration.get('session_timeout'),
         }
         client.respond(settings)
@@ -1712,7 +1743,8 @@ class HttpServerWrapper():
         from a list of known keys instead is how an IP filter used to
         disappear from a server whose name was edited.
         """
-        entry = {key: value for key, value in data.items() if key != 'id'}
+        entry = {key: value for key, value in data.items()
+                 if key not in ('id', 'rev')}
         entry['id'] = entry_id
         if not entry.get('name'):
             entry.pop('name', None)
@@ -1755,6 +1787,8 @@ class HttpServerWrapper():
             self._error(client, 'HTTP server not found', 404)
             return
         data = client.data
+        if self._rev_conflict(client, data, http_list[index]):
+            return
         error = self._validate_http_config(data)
         if error:
             self._error(client, error, 400)

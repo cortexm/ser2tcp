@@ -269,3 +269,141 @@ class TestChoosingAnId(unittest.TestCase):
             wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 200, client.responded)
         self.assertEqual(cfg['ports'][0]['id'], 'keep')
+
+
+class TestEntryRevision(unittest.TestCase):
+    """A fingerprint of what an entry says, so a save can tell whether
+    it is writing over something it has not seen."""
+
+    def test_the_same_entry_gives_the_same_revision(self):
+        from ser2tcp.config_ids import entry_rev
+        entry = {'id': 'a', 'name': 'dev', 'serial': {'port': '/dev/x'}}
+        self.assertEqual(entry_rev(entry), entry_rev(dict(entry)))
+
+    def test_key_order_does_not_matter(self):
+        from ser2tcp.config_ids import entry_rev
+        first = {'id': 'a', 'name': 'dev'}
+        second = {'name': 'dev', 'id': 'a'}
+        self.assertEqual(entry_rev(first), entry_rev(second))
+
+    def test_a_changed_value_changes_the_revision(self):
+        from ser2tcp.config_ids import entry_rev
+        entry = {'id': 'a', 'serial': {'baudrate': 9600}}
+        changed = {'id': 'a', 'serial': {'baudrate': 57600}}
+        self.assertNotEqual(entry_rev(entry), entry_rev(changed))
+
+    def test_the_revision_itself_is_not_part_of_it(self):
+        """Otherwise it would change every time it is reported"""
+        from ser2tcp.config_ids import entry_rev
+        entry = {'id': 'a', 'name': 'dev'}
+        with_rev = dict(entry, rev='whatever')
+        self.assertEqual(entry_rev(entry), entry_rev(with_rev))
+
+
+class TestConcurrentEdits(unittest.TestCase):
+    """Two people with the same port open.
+
+    Addressing by id stopped an edit landing on the wrong port. It does
+    nothing about two edits of the right one: the second save used to
+    overwrite the first without either of them being told.
+    """
+
+    def _wrapper(self):
+        cfg = {
+            'ports': [{'id': 'p1', 'name': 'dev',
+                       'serial': {'port': '/dev/a', 'baudrate': 9600},
+                       'servers': [{'protocol': 'tcp',
+                                    'address': '0.0.0.0',
+                                    'port': 10001}]}],
+            'http': [{'id': 'h1', 'address': '127.0.0.1', 'port': 8080}],
+        }
+        wrapper = _wrapper_for(cfg)
+        wrapper._serial_proxies = [Mock()]
+        return wrapper, cfg
+
+    def _get(self, wrapper, path):
+        client = _MockClient(method='GET', path=path)
+        wrapper._handle_request(client)
+        return client.responded
+
+    def _put(self, wrapper, path, data):
+        client = _MockClient(method='PUT', path=path, data=data)
+        with patch.object(wrapper, '_create_proxy', return_value=Mock()):
+            wrapper._handle_request(client)
+        return client
+
+    def test_the_config_comes_with_a_revision(self):
+        wrapper, _ = self._wrapper()
+        self.assertTrue(self._get(wrapper, '/api/ports/p1')['rev'])
+
+    def test_saving_what_you_read_is_accepted(self):
+        wrapper, _ = self._wrapper()
+        cfg = self._get(wrapper, '/api/ports/p1')
+        cfg['name'] = 'renamed'
+        client = self._put(wrapper, '/api/ports/p1', cfg)
+        self.assertEqual(client.respond_status, 200, client.responded)
+
+    def test_saving_over_somebody_else_is_refused(self):
+        wrapper, _ = self._wrapper()
+        mine = self._get(wrapper, '/api/ports/p1')
+        theirs = self._get(wrapper, '/api/ports/p1')
+        theirs['serial']['baudrate'] = 57600
+        self._put(wrapper, '/api/ports/p1', theirs)
+        mine['name'] = 'renamed'
+        client = self._put(wrapper, '/api/ports/p1', mine)
+        self.assertEqual(client.respond_status, 409)
+        self.assertIn('changed', client.responded['error'].lower())
+
+    def test_their_change_survives_the_refusal(self):
+        wrapper, cfg = self._wrapper()
+        mine = self._get(wrapper, '/api/ports/p1')
+        theirs = self._get(wrapper, '/api/ports/p1')
+        theirs['serial']['baudrate'] = 57600
+        self._put(wrapper, '/api/ports/p1', theirs)
+        mine['name'] = 'renamed'
+        self._put(wrapper, '/api/ports/p1', mine)
+        self.assertEqual(cfg['ports'][0]['serial']['baudrate'], 57600)
+        self.assertEqual(cfg['ports'][0]['name'], 'dev')
+
+    def test_rereading_lets_you_save(self):
+        """The way out is to look at what is there now"""
+        wrapper, _ = self._wrapper()
+        theirs = self._get(wrapper, '/api/ports/p1')
+        theirs['serial']['baudrate'] = 57600
+        self._put(wrapper, '/api/ports/p1', theirs)
+        fresh = self._get(wrapper, '/api/ports/p1')
+        fresh['name'] = 'renamed'
+        client = self._put(wrapper, '/api/ports/p1', fresh)
+        self.assertEqual(client.respond_status, 200, client.responded)
+
+    def test_a_request_without_a_revision_is_not_checked(self):
+        """A script that never read the entry is not fighting anyone"""
+        wrapper, _ = self._wrapper()
+        client = self._put(wrapper, '/api/ports/p1', {
+            'serial': {'port': '/dev/a'},
+            'servers': [{'protocol': 'tcp', 'address': '0.0.0.0',
+                         'port': 10001}]})
+        self.assertEqual(client.respond_status, 200, client.responded)
+
+    def test_the_revision_is_not_stored_in_the_config(self):
+        wrapper, cfg = self._wrapper()
+        conf = self._get(wrapper, '/api/ports/p1')
+        conf['name'] = 'renamed'
+        self._put(wrapper, '/api/ports/p1', conf)
+        self.assertNotIn('rev', cfg['ports'][0])
+
+    def test_http_servers_are_guarded_the_same_way(self):
+        wrapper, cfg = self._wrapper()
+        settings = self._get(wrapper, '/api/settings')
+        entry = dict(settings['http'][0])
+        stale = dict(entry)
+        entry['name'] = 'theirs'
+        client = _MockClient(
+            method='PUT', path='/api/settings/http/h1', data=entry)
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 200, client.responded)
+        stale['name'] = 'mine'
+        client = _MockClient(
+            method='PUT', path='/api/settings/http/h1', data=stale)
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 409)

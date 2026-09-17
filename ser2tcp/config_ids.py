@@ -7,12 +7,18 @@ at one lands on another. An id is handed out once, written back to the
 file, and never changes after that.
 """
 
+import hashlib as _hashlib
+import json as _json
 import re as _re
 import secrets as _secrets
 
 # Long enough that a collision is not a practical concern, short enough
 # to read in a URL.
 ID_BYTES = 4
+
+# Enough of the digest to make a collision between two edits of the
+# same entry unthinkable, short enough to travel in a form field.
+REV_CHARS = 16
 
 # An id travels in a URL and names an entry in a config file, so it is
 # kept to what survives both untouched: no spaces, no slashes, nothing
@@ -76,3 +82,22 @@ def assign_ids(configuration):
         seen.add(new_id)
         changed = True
     return changed
+
+
+def entry_rev(entry):
+    """A short fingerprint of what an entry currently says.
+
+    Two admins with the same port open used to overwrite each other in
+    silence: the second save wrote back a copy read before the first one
+    landed, and neither was told. A save can carry the revision it read
+    and be refused when the entry has moved on since.
+
+    It is derived from the content rather than stored, so nothing extra
+    lands in config.json, an entry edited by hand is covered too, and
+    the revision cannot go stale against the thing it describes.
+    """
+    payload = {key: value for key, value in entry.items() if key != 'rev'}
+    canonical = _json.dumps(
+        payload, sort_keys=True, separators=(',', ':'), default=str)
+    digest = _hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    return digest[:REV_CHARS]
