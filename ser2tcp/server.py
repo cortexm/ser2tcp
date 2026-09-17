@@ -97,7 +97,9 @@ class Server():
                 raise ConfigError(
                     f"{self._protocol} {config['address']}:{config['port']}: "
                     f"failed to bind: {err.strerror or err}") from err
-        self._socket.listen(1)
+        # A backlog of one drops clients that arrive together, and
+        # reconnect storms arrive together.
+        self._socket.listen(_socket.SOMAXCONN)
         if self._selector is not None:
             self._selector.register(
                 self._socket, _selectors.EVENT_READ, self)
@@ -173,6 +175,9 @@ class Server():
         except OSError as err:
             self._accept_failed(err)
             return
+        # Everything from here on shares one event loop with every other
+        # port and the HTTP API, so nothing may wait on this socket.
+        sock.setblocking(False)
         if self._protocol == 'SOCKET':
             addr = (self._config['address'],)
         elif self._ip_filter and not self._ip_filter.is_allowed(addr[0]):
@@ -210,12 +215,41 @@ class Server():
             if not self._connections:
                 self._serial.disconnect()
             return
+        if connection.needs_handshake():
+            # Track it and watch it, but do not open the serial port for
+            # it yet: an unfinished TLS connection is not a client.
+            self._add_connection(connection)
+            self._handshake(connection)
+            return
         if self._serial.connect():
-            self._connections.append(connection)
-            self._conn_by_socket[connection.socket()] = connection
-            connection.attach(self._selector, self)
+            self._add_connection(connection)
         else:
             connection.close()
+
+    def _add_connection(self, connection):
+        """Track a connection and start watching its socket"""
+        self._connections.append(connection)
+        self._conn_by_socket[connection.socket()] = connection
+        connection.attach(self._selector, self)
+
+    def _handshake(self, con):
+        """Carry a TLS handshake one step further.
+
+        Called from the event loop, so a client that stalls costs only
+        its own connection - and its own slot, until process_stale()
+        reaps it.
+        """
+        try:
+            done = con.handshake()
+        except _connection_ssl.SslHandshakeError as err:
+            self._log.info(
+                "Client rejected: %s (%s)", con.address_str(), err)
+            self._remove_connection(con)
+            return
+        if not done:
+            return
+        if not self._serial.connect():
+            self._remove_connection(con)
 
     def _accept_failed(self, err):
         """Deal with an accept() that raised.
@@ -343,6 +377,9 @@ class Server():
             # socket is already None. Reap it instead of reading it.
             self._remove_connection(con)
             return None
+        if con.needs_handshake():
+            self._handshake(con)
+            return None
         if mask & _selectors.EVENT_WRITE and not self._flush(con):
             return None
         if mask & _selectors.EVENT_READ:
@@ -350,24 +387,40 @@ class Server():
         return None
 
     def _read(self, con):
-        """Read from a client and forward it, or drop the connection"""
-        data = b''
-        try:
-            data = con.socket().recv(4096)
+        """Read from a client and forward it, or drop the connection.
+
+        Reads again while the connection says it is still holding
+        decrypted bytes. Under TLS those sit in the SSL object rather
+        than the kernel buffer, so select() will never mention them
+        again - one large record used to arrive 4 KB at a time, the
+        rest stuck until the client happened to send something else.
+        """
+        while True:
+            try:
+                data = con.recv(4096)
+            except OSError as err:
+                # OSError covers the lot: a reset or aborted peer, an
+                # SSL error, a timeout, and a descriptor another handler
+                # closed earlier in this same batch of events. Every one
+                # of them means this connection is finished, and naming
+                # only two of them left the rest to reach the event loop.
+                self._log.info("(%s): %s", con.address_str(), err)
+                self._remove_connection(con)
+                return
+            if data is None:
+                # Nothing to read right now; not an error.
+                break
+            if not data:
+                self._remove_connection(con)
+                return
             self._log.debug("(%s): %s", con.address_str(), data)
-        except OSError as err:
-            # OSError covers the lot: a reset or aborted peer, an SSL
-            # error, a timeout, and a descriptor another handler closed
-            # earlier in this same batch of events. Every one of them
-            # means this connection is finished, and naming only two of
-            # them left the rest to reach the event loop.
-            self._log.info("(%s): %s", con.address_str(), err)
-        if not data:
-            self._remove_connection(con)
-            return
-        # on_received may answer (a control protocol signal report), so
-        # the send buffer has to be re-checked afterwards.
-        con.on_received(data)
+            # on_received may answer (a control protocol signal report),
+            # and may also take the whole port down with it.
+            con.on_received(data)
+            if con.is_closed():
+                return
+            if not con.pending():
+                break
         con.update_interest()
 
     def _flush(self, con):

@@ -51,6 +51,29 @@ class Connection():
         self._interest = _selectors.EVENT_READ
         selector.register(self._socket, self._interest, owner)
 
+    def wanted_events(self):
+        """Which events this connection needs watching for right now.
+
+        Subclasses that are mid-handshake ask for what the TLS layer
+        wants instead.
+        """
+        want = _selectors.EVENT_READ
+        if self._out_buffer:
+            want |= _selectors.EVENT_WRITE
+        return want
+
+    def needs_handshake(self):
+        """True while this connection is not usable yet (see SSL)"""
+        return False
+
+    def pending(self):
+        """Bytes already decrypted and waiting, past what recv() gave.
+
+        Zero for a plain socket: anything unread is still in the kernel
+        buffer, and select() will say so again.
+        """
+        return 0
+
     def update_interest(self):
         """Arm EVENT_WRITE only while there is something to flush.
 
@@ -59,9 +82,7 @@ class Connection():
         """
         if self._selector is None or self._socket is None:
             return
-        want = _selectors.EVENT_READ
-        if self._out_buffer:
-            want |= _selectors.EVENT_WRITE
+        want = self.wanted_events()
         if want == self._interest:
             return
         try:
@@ -123,18 +144,48 @@ class Connection():
         self._out_buffer.extend(data)
         return len(data)
 
+    def recv(self, size=4096):
+        """Read from the client.
+
+        Returns the bytes, b'' once the peer has gone, or None when
+        there is nothing to read right now - which a non-blocking
+        socket reports by raising, and which is not an error.
+        """
+        if not self._socket:
+            return b''
+        try:
+            return self._socket.recv(size)
+        except BlockingIOError:
+            return None
+
+    def _send_bytes(self, data):
+        """Push bytes at the socket.
+
+        Returns the count written, or None if the socket would block -
+        the buffer stays put and write interest holds, so the loop comes
+        back to it. Other errors are left to the caller.
+        """
+        try:
+            return self._socket.send(data)
+        except BlockingIOError:
+            return None
+
     def flush(self):
         """Flush output buffer, return number of bytes sent or None on error"""
         if not self._socket or not self._out_buffer:
             return 0
         try:
-            sent = self._socket.send(self._out_buffer)
-            if sent > 0:
-                del self._out_buffer[:sent]
-                self._last_write_time = _time.time()
-            return sent
+            sent = self._send_bytes(self._out_buffer)
         except OSError:
             return None
+        if sent is None:
+            # Would block. Nothing left the buffer, so _last_write_time
+            # stays where it is and the send timeout keeps running.
+            return 0
+        if sent > 0:
+            del self._out_buffer[:sent]
+            self._last_write_time = _time.time()
+        return sent
 
     def has_pending_data(self):
         """Return True if there is data in output buffer"""

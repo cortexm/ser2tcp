@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock
 
 from ser2tcp.cert_manager import CertManager, generate_certificate
+from ser2tcp.connection_ssl import SslHandshakeError
 from ser2tcp.server import Server
 
 
@@ -174,6 +175,8 @@ class TestReadErrors(unittest.TestCase):
         con = Mock()
         con.address_str.return_value = '10.0.0.1:1234'
         con.is_closed.return_value = False
+        con.needs_handshake.return_value = False
+        con.pending.return_value = 0
         sock = Mock()
         con.socket.return_value = sock
         srv._connections.append(con)
@@ -181,8 +184,8 @@ class TestReadErrors(unittest.TestCase):
         return srv, con, sock
 
     def _read_raising(self, err):
-        srv, con, sock = self._server_with_connection()
-        sock.recv.side_effect = err
+        srv, con, _sock = self._server_with_connection()
+        con.recv.side_effect = err
         srv._read(con)
         return srv
 
@@ -203,6 +206,20 @@ class TestReadErrors(unittest.TestCase):
         srv = self._read_raising(ConnectionAbortedError('aborted'))
         self.assertEqual(srv.connections, [])
 
+    def test_a_peer_that_went_away_is_dropped(self):
+        srv, con, _ = self._server_with_connection()
+        con.recv.return_value = b''
+        srv._read(con)
+        self.assertEqual(srv.connections, [])
+
+    def test_nothing_to_read_right_now_is_not_an_error(self):
+        """A non-blocking socket says "later" by returning None"""
+        srv, con, _ = self._server_with_connection()
+        con.recv.return_value = None
+        srv._read(con)
+        self.assertEqual(len(srv.connections), 1)
+        con.on_received.assert_not_called()
+
     def test_a_connection_closed_earlier_in_the_batch_is_reaped(self):
         """Its socket is already None, so recv() would fail on None"""
         srv, con, sock = self._server_with_connection()
@@ -212,8 +229,102 @@ class TestReadErrors(unittest.TestCase):
         self.assertEqual(srv.connections, [])
 
     def test_a_healthy_read_is_forwarded(self):
-        srv, con, sock = self._server_with_connection()
-        sock.recv.return_value = b'hello'
+        srv, con, _ = self._server_with_connection()
+        con.recv.side_effect = [b'hello', None]
         srv._read(con)
         con.on_received.assert_called_once_with(b'hello')
         self.assertEqual(len(srv.connections), 1)
+
+    def test_buffered_bytes_are_drained_in_the_same_pass(self):
+        """TLS keeps the rest of a record where select() cannot see it"""
+        srv, con, _ = self._server_with_connection()
+        con.recv.side_effect = [b'first', b'second', b'third']
+        con.pending.side_effect = [4096, 4096, 0]
+        srv._read(con)
+        self.assertEqual(
+            [c.args[0] for c in con.on_received.call_args_list],
+            [b'first', b'second', b'third'])
+
+    def test_draining_stops_when_the_port_takes_the_client_down(self):
+        """A serial failure inside on_received drops every client"""
+        srv, con, _ = self._server_with_connection()
+        con.recv.return_value = b'data'
+        con.pending.return_value = 4096
+        con.on_received.side_effect = lambda _d: setattr(
+            con.is_closed, 'return_value', True)
+        srv._read(con)
+        con.on_received.assert_called_once()
+
+    def test_a_plain_socket_is_read_once_per_event(self):
+        """Nothing is buffered above the kernel, so select() will say"""
+        srv, con, _ = self._server_with_connection()
+        con.recv.return_value = b'data'
+        con.pending.return_value = 0
+        srv._read(con)
+        self.assertEqual(con.recv.call_count, 1)
+
+
+class TestHandshakeDispatch(unittest.TestCase):
+    """A connection that is still negotiating is not a client yet"""
+
+    def setUp(self):
+        self.log = Mock()
+        self.serial = Mock()
+        self.servers = []
+
+    def tearDown(self):
+        for srv in self.servers:
+            srv.close()
+
+    def _server_with_handshaking_connection(self):
+        srv = Server(
+            {'address': '127.0.0.1', 'port': free_port(), 'protocol': 'tcp'},
+            self.serial, self.log)
+        self.servers.append(srv)
+        con = Mock()
+        con.address_str.return_value = '10.0.0.1:1234'
+        con.is_closed.return_value = False
+        con.needs_handshake.return_value = True
+        sock = Mock()
+        con.socket.return_value = sock
+        srv._connections.append(con)
+        srv._conn_by_socket[sock] = con
+        return srv, con, sock
+
+    def test_an_event_advances_the_handshake_and_nothing_else(self):
+        srv, con, sock = self._server_with_handshaking_connection()
+        con.handshake.return_value = False
+        srv.handle_event(sock, 1)
+        con.handshake.assert_called_once()
+        con.recv.assert_not_called()
+
+    def test_the_device_is_not_opened_until_the_handshake_lands(self):
+        srv, con, sock = self._server_with_handshaking_connection()
+        con.handshake.return_value = False
+        srv.handle_event(sock, 1)
+        self.serial.connect.assert_not_called()
+        self.assertEqual(len(srv.connections), 1)
+
+    def test_a_finished_handshake_opens_the_device(self):
+        srv, con, sock = self._server_with_handshaking_connection()
+        con.handshake.return_value = True
+        self.serial.connect.return_value = True
+        srv.handle_event(sock, 1)
+        self.serial.connect.assert_called_once()
+        self.assertEqual(len(srv.connections), 1)
+
+    def test_a_failed_handshake_drops_the_connection(self):
+        srv, con, sock = self._server_with_handshaking_connection()
+        con.handshake.side_effect = SslHandshakeError('no shared cipher')
+        srv.handle_event(sock, 1)
+        self.assertEqual(srv.connections, [])
+        self.serial.connect.assert_not_called()
+
+    def test_a_device_that_will_not_open_drops_the_connection(self):
+        srv, con, sock = self._server_with_handshaking_connection()
+        con.handshake.return_value = True
+        self.serial.connect.return_value = False
+        srv.handle_event(sock, 1)
+        self.assertEqual(srv.connections, [])
+
+
