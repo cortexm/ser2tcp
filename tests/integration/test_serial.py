@@ -142,6 +142,32 @@ class SerialPtyTestCase(base.IntegrationTestCase):
             f'server on {port} reports {self.connections_on(port)} '
             f'connections, expected {count}')
 
+    def serial_connected(self):
+        """Whether ser2tcp currently holds the device open"""
+        body = self.get('/api/status')[1]
+        return bool(body['ports'][0]['serial']['connected'])
+
+    def wait_for_serial(self, connected=True, timeout=5.0):
+        """Block until ser2tcp has opened (or closed) the device.
+
+        Opening a tty flushes whatever is already sitting in its input
+        buffer, so bytes written to the pty master before the port is
+        open are simply gone. Anything that writes to the master has to
+        wait for this first.
+
+        The answer is authoritative because the loop is single-threaded:
+        this request can only be handled after the one that opened the
+        port has returned.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.serial_connected() == connected:
+                return
+            time.sleep(0.02)
+        raise AssertionError(
+            f'serial reports connected={self.serial_connected()}, '
+            f'expected {connected}')
+
     def connect(self, port=None):
         """Open a client connection, accepted, closing with the test"""
         port = port or self.tcp_port

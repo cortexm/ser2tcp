@@ -55,9 +55,21 @@ class WebSocketTestCase(SerialPtyTestCase):
         ]
 
     def ws_connect(self, path):
+        """Open a WebSocket, and wait for the device behind it.
+
+        create_connection() returns as soon as the 101 arrives, and
+        ser2tcp queues that response before it opens the serial port -
+        so without the wait a test can write to the pty master in that
+        gap and lose the bytes to the flush that opening a tty does.
+
+        Monitor endpoints only attach a callback and never open the
+        device, so there is nothing to wait for there.
+        """
         conn = websocket.create_connection(
             f'ws://127.0.0.1:{self.port}{path}', timeout=5)
         self.addCleanup(conn.close)
+        if not path.startswith('/ws/monitor/'):
+            self.wait_for_serial()
         return conn
 
 
