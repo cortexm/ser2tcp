@@ -2,11 +2,12 @@
 
 # pylint: disable=C0209
 
+import errno as _errno
 import logging as _logging
 import os as _os
 import selectors as _selectors
 import socket as _socket
-import ssl as _ssl
+import time as _time
 
 import ser2tcp.cert_manager as _cert_manager
 import ser2tcp.connection_control as _connection_control
@@ -51,6 +52,9 @@ class Server():
         self._ip_filter = _ip_filter.create_filter(self._config, log=self._log)
         self._ssl_context = None
         self._socket = None
+        # Set while the listening socket is deliberately not watched
+        # after running out of file descriptors (see _accept_failed).
+        self._accept_paused_until = 0
         if self._protocol not in self.CONNECTIONS:
             raise ConfigError('Unknown protocol %s' % self._protocol)
         if not self._data_enabled and not self._control:
@@ -155,9 +159,20 @@ class Server():
         """Return list of connections"""
         return self._connections
 
+    # How long to stop watching the listening socket after running out
+    # of file descriptors, so the loop is not pinned at 100% CPU.
+    ACCEPT_COOLDOWN = 1.0
+    # Errors that mean "no descriptors left", not "this client failed".
+    _FD_EXHAUSTED = frozenset((_errno.EMFILE, _errno.ENFILE, _errno.ENOBUFS,
+        _errno.ENOMEM))
+
     def _client_connect(self):
         """connect to client, will accept waiting connection"""
-        sock, addr = self._socket.accept()
+        try:
+            sock, addr = self._socket.accept()
+        except OSError as err:
+            self._accept_failed(err)
+            return
         if self._protocol == 'SOCKET':
             addr = (self._config['address'],)
         elif self._ip_filter and not self._ip_filter.is_allowed(addr[0]):
@@ -201,6 +216,66 @@ class Server():
             connection.attach(self._selector, self)
         else:
             connection.close()
+
+    def _accept_failed(self, err):
+        """Deal with an accept() that raised.
+
+        Most failures are about the one connection - the peer gave up
+        between select() and accept(), or the readiness was spurious -
+        and the next pass carries on as normal.
+
+        Running out of file descriptors is different: the connection
+        stays queued, so the listening socket is readable again
+        immediately and accept() fails again, forever, at 100% CPU.
+        Nothing can be accepted until a descriptor frees up, so stop
+        watching the listener for a moment instead. Everything already
+        connected keeps being served in the meantime, which is the part
+        that actually matters while the process is out of descriptors.
+        """
+        if err.errno in self._FD_EXHAUSTED:
+            self._log.error(
+                "%s %s: cannot accept (%s); not accepting for %.0fs",
+                self._protocol, self._where(), err.strerror or err,
+                self.ACCEPT_COOLDOWN)
+            self._pause_accepting()
+            return
+        self._log.info(
+            "%s %s: accept failed: %s",
+            self._protocol, self._where(), err.strerror or err)
+
+    def _where(self):
+        """Address of this server, for log lines"""
+        if self._protocol == 'SOCKET':
+            return str(self._config.get('address'))
+        return "%s:%s" % (
+            self._config.get('address'), self._config.get('port'))
+
+    def _pause_accepting(self):
+        """Stop watching the listening socket until the cooldown ends"""
+        self._accept_paused_until = _time.time() + self.ACCEPT_COOLDOWN
+        if self._selector is None or self._socket is None:
+            return
+        try:
+            self._selector.unregister(self._socket)
+        except (KeyError, ValueError, OSError):
+            pass
+
+    def _resume_accepting(self):
+        """Watch the listening socket again once the cooldown is over"""
+        if not self._accept_paused_until:
+            return
+        if _time.time() < self._accept_paused_until:
+            return
+        self._accept_paused_until = 0
+        if self._selector is None or self._socket is None:
+            return
+        try:
+            self._selector.register(
+                self._socket, _selectors.EVENT_READ, self)
+        except (KeyError, ValueError, OSError) as err:
+            self._log.warning(
+                "%s %s: cannot listen again: %s",
+                self._protocol, self._where(), err)
 
     def close_connections(self):
         """close all clients"""
@@ -262,6 +337,12 @@ class Server():
         if con is None:
             # Closed earlier in this same batch of events.
             return None
+        if con.is_closed():
+            # Closed without going through us - a connection drops
+            # itself when its interest cannot be re-armed - so its
+            # socket is already None. Reap it instead of reading it.
+            self._remove_connection(con)
+            return None
         if mask & _selectors.EVENT_WRITE and not self._flush(con):
             return None
         if mask & _selectors.EVENT_READ:
@@ -274,7 +355,12 @@ class Server():
         try:
             data = con.socket().recv(4096)
             self._log.debug("(%s): %s", con.address_str(), data)
-        except (ConnectionResetError, _ssl.SSLError) as err:
+        except OSError as err:
+            # OSError covers the lot: a reset or aborted peer, an SSL
+            # error, a timeout, and a descriptor another handler closed
+            # earlier in this same batch of events. Every one of them
+            # means this connection is finished, and naming only two of
+            # them left the rest to reach the event loop.
             self._log.info("(%s): %s", con.address_str(), err)
         if not data:
             self._remove_connection(con)
@@ -295,6 +381,7 @@ class Server():
 
     def process_stale(self):
         """Remove stale connections (send timeout expired, or closed)"""
+        self._resume_accepting()
         for con in list(self._connections):
             if con.is_closed():
                 self._remove_connection(con)
