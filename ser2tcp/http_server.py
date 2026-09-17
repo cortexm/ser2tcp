@@ -2283,8 +2283,11 @@ class HttpServerWrapper():
 
         Returns (reloaded, errors): labels of the servers that picked up
         the new files, and user-facing messages for those that refused.
-        A server whose reload fails keeps serving its previous cert —
-        load_cert_chain() raises before installing anything.
+        A server whose reload fails keeps serving its previous cert.
+        That is not something load_cert_chain() gives you - it installs
+        the cert before it checks the key against it - so
+        reload_ssl_context() rehearses the load on a throwaway context
+        and only repeats it on the live one once that worked.
         """
         reloaded = []
         errors = []

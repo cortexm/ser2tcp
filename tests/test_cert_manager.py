@@ -1,6 +1,7 @@
 """Tests for cert_manager module"""
 
 import os
+import ssl
 import stat
 import tempfile
 import unittest
@@ -832,6 +833,127 @@ class TestReloadSslContext(unittest.TestCase):
             reload_ssl_context(
                 ctx, {'bundle': 'web', 'require_client_cert': True},
                 self.certs_dir)
+
+
+def handshake_cert(server_context):
+    """The certificate this context actually presents.
+
+    A TLS handshake is the only way to ask - the ssl module offers no
+    way to read a loaded cert chain back off a context - and it is also
+    the thing being protected, so it is the right question. Done over
+    memory BIOs, so no socket or thread is involved.
+    """
+    client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_context.check_hostname = False
+    client_context.verify_mode = ssl.CERT_NONE
+    server_in, server_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client_in, client_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    server = server_context.wrap_bio(server_in, server_out, server_side=True)
+    client = client_context.wrap_bio(client_in, client_out)
+    done = set()
+    for _ in range(40):
+        for side, out_bio, peer_in in (
+                (client, client_out, server_in),
+                (server, server_out, client_in)):
+            if side not in done:
+                try:
+                    side.do_handshake()
+                    done.add(side)
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    pass
+            pending = out_bio.read()
+            if pending:
+                peer_in.write(pending)
+        if len(done) == 2:
+            return ssl.DER_cert_to_PEM_cert(
+                client.getpeercert(binary_form=True))
+    raise AssertionError('handshake did not complete')
+
+
+class TestAFailedReloadLeavesTheServerServing(unittest.TestCase):
+    """A reload that cannot finish must change nothing.
+
+    load_cert_chain() installs the certificate, then the key, and only
+    then checks that they belong together - so a bundle whose halves do
+    not match left the live context holding a new cert over an old key.
+    The reload reported the failure and the server went on to refuse
+    every handshake made from then on, until a good reload or a
+    restart. The files arriving one at a time is exactly what a renewal
+    looks like while it is in progress.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = CertManager(self.tmp)
+        self.certs_dir = os.path.join(self.tmp, 'certs')
+        cert, key = generate_certificate(
+            'serving.local', key_type='ec_p256', days=30)
+        self.mgr.save_files(
+            'web', [('cert.pem', cert), ('key.pem', key)])
+        self.context = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, name, content):
+        with open(os.path.join(self.certs_dir, 'web', name), 'w',
+                  encoding='utf-8') as file:
+            file.write(content)
+
+    def _reload(self, **config):
+        config.setdefault('bundle', 'web')
+        with self.assertRaises(CertManagerError) as caught:
+            reload_ssl_context(self.context, config, self.certs_dir)
+        return str(caught.exception)
+
+    def _still_serving(self):
+        return inspect_certificate(
+            handshake_cert(self.context))['subject_cn']
+
+    def test_the_context_started_out_serving(self):
+        self.assertEqual(self._still_serving(), 'serving.local')
+
+    def test_a_cert_that_does_not_match_the_key_is_refused(self):
+        """Half a renewal: the new cert.pem landed, key.pem did not"""
+        other_cert, _ = generate_certificate(
+            'renewed.local', key_type='ec_p256', days=30)
+        self._write('cert.pem', other_cert)
+        self._reload()
+
+    def test_and_the_old_certificate_is_still_served(self):
+        other_cert, _ = generate_certificate(
+            'renewed.local', key_type='ec_p256', days=30)
+        self._write('cert.pem', other_cert)
+        self._reload()
+        self.assertEqual(self._still_serving(), 'serving.local')
+
+    def test_an_unreadable_key_leaves_the_certificate_alone(self):
+        """The other order: cert.pem loads, key.pem is garbage"""
+        other_cert, _ = generate_certificate(
+            'renewed.local', key_type='ec_p256', days=30)
+        self._write('cert.pem', other_cert)
+        self._write('key.pem', 'not a key at all\n')
+        self._reload()
+        self.assertEqual(self._still_serving(), 'serving.local')
+
+    def test_an_unreadable_ca_leaves_the_certificate_alone(self):
+        """ca.pem is read after the chain, and used to be read into it"""
+        other_cert, other_key = generate_certificate(
+            'renewed.local', key_type='ec_p256', days=30)
+        self.mgr.save_files('web', [
+            ('cert.pem', other_cert), ('key.pem', other_key)])
+        self._write('ca.pem', 'not a certificate\n')
+        self._reload(require_client_cert=True)
+        self.assertEqual(self._still_serving(), 'serving.local')
+
+    def test_a_good_reload_still_goes_through(self):
+        other_cert, other_key = generate_certificate(
+            'renewed.local', key_type='ec_p256', days=30)
+        self.mgr.save_files('web', [
+            ('cert.pem', other_cert), ('key.pem', other_key)])
+        reload_ssl_context(self.context, {'bundle': 'web'}, self.certs_dir)
+        self.assertEqual(self._still_serving(), 'renewed.local')
 
 
 if __name__ == '__main__':

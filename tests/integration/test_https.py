@@ -217,6 +217,72 @@ class TestBundleReload(base.IntegrationTestCase):
         self.assertNotEqual(_serial_of(served), first_serial)
 
 
+
+class TestAFailedReloadKeepsTheServerServing(base.IntegrationTestCase):
+    """A half-finished renewal must not take the HTTPS server down.
+
+    Files arriving one at a time is what a renewal looks like while it
+    is in progress - a deploy hook mid-copy, an scp, a symlink swung
+    over before its partner. The reload has to refuse that and leave
+    the server exactly as it was.
+
+    The API is reached over plain HTTP here on purpose: asking the
+    broken server whether it is broken would not work.
+    """
+
+    tls_port = None
+
+    @classmethod
+    def build_config(cls):
+        cls.tls_port = base.free_port()
+        return {
+            'ports': [],
+            'http': [
+                {'address': '127.0.0.1', 'port': cls.port},
+                {'address': '127.0.0.1', 'port': cls.tls_port,
+                 'ssl': {'bundle': 'web'}},
+            ],
+        }
+
+    @classmethod
+    def prepare(cls, proc):
+        cert, key = _gen('serving.local')
+        cert_manager.CertManager(proc.dir).save_files(
+            'web', [('cert.pem', cert), ('key.pem', key)])
+
+    def _cert_path(self, name='cert.pem'):
+        return os.path.join(self.proc.dir, 'certs', 'web', name)
+
+    def test_the_server_starts_out_serving_its_bundle(self):
+        served = base.tls_peer_cert('127.0.0.1', self.tls_port)
+        self.assertEqual(_cn_of(served), 'serving.local')
+
+    def test_zz_a_cert_without_its_key_is_refused_and_changes_nothing(self):
+        before = _serial_of(base.tls_peer_cert('127.0.0.1', self.tls_port))
+
+        # Only half the renewal lands on disk.
+        renewed, _unused_key = _gen('renewed.local')
+        _write(self._cert_path(), renewed)
+
+        status, body = self.post('/api/certs/web/reload')
+        self.assertEqual(status, 400, body)
+
+        served = base.tls_peer_cert('127.0.0.1', self.tls_port)
+        self.assertEqual(_cn_of(served), 'serving.local')
+        self.assertEqual(_serial_of(served), before)
+
+    def test_zzz_the_other_half_arriving_completes_the_renewal(self):
+        renewed, renewed_key = _gen('renewed.local')
+        _write(self._cert_path(), renewed)
+        self.assertEqual(self.post('/api/certs/web/reload')[0], 400)
+        _write(self._cert_path('key.pem'), renewed_key)
+        status, body = self.post('/api/certs/web/reload')
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            _cn_of(base.tls_peer_cert('127.0.0.1', self.tls_port)),
+            'renewed.local')
+
+
 class TestPortSslBundleUsage(base.IntegrationTestCase):
     """A port SSL server reports its bundle usage and accepts a reload.
 

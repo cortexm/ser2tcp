@@ -355,6 +355,13 @@ the files on disk is only half the job:
    from that moment on uses the new one. The response lists the servers
    that were reloaded.
 
+   A reload that cannot finish changes nothing: the files are loaded
+   into a throwaway context first, and only repeated on the running one
+   once that worked. Catching a bundle halfway through a renewal — the
+   new `cert.pem` in place, `key.pem` still the old one — answers 400
+   and leaves the server serving what it was serving, so a deploy hook
+   that fires mid-copy is a failed reload rather than an outage.
+
 `generate` refuses to overwrite an existing `cert.pem`, so regenerating
 into a bundle in use means deleting `cert.pem` first, then generating,
 then reloading.

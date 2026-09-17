@@ -408,14 +408,37 @@ def reload_ssl_context(context, ssl_config, certs_dir):
     OpenSSL exposes no way to clear it, so a CA *removed* from ca.pem
     stays trusted until restart; an added one takes effect at once.
     """
+    cert_path, key_path, ca_path, bundle = _bundle_for(ssl_config, certs_dir)
+    # Load into a throwaway context first. load_cert_chain() installs
+    # the certificate, then the key, and only then checks that they
+    # belong together, so a bundle caught mid-renewal - new cert.pem on
+    # disk, key.pem still the old one - left the live context holding a
+    # cert it had no key for. The reload reported the failure and the
+    # server refused every handshake from then on, until a good reload
+    # or a restart. Doing it twice is the cheapest way to be sure: the
+    # rehearsal is the same operation, so it fails in the same places.
+    _load_bundle(_ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER),
+                 bundle, cert_path, key_path, ca_path)
+    _load_bundle(context, bundle, cert_path, key_path, ca_path)
+
+
+def _bundle_for(ssl_config, certs_dir):
+    """Resolve an ssl config to (cert, key, ca_or_None, bundle_name)"""
     if not isinstance(ssl_config, dict):
         raise CertManagerError('ssl config must be an object')
     bundle = ssl_config.get('bundle')
     mtls = bool(ssl_config.get('require_client_cert'))
     cert_path, key_path, ca_path = resolve_bundle_paths(
         certs_dir, bundle, require_client_cert=mtls)
-    # Translate OpenSSL load errors into CertManagerError so callers
-    # don't need to know about the ssl module's exception types.
+    return cert_path, key_path, ca_path, bundle
+
+
+def _load_bundle(context, bundle, cert_path, key_path, ca_path):
+    """Read a bundle's files into one context.
+
+    Translates OpenSSL load errors into CertManagerError so callers
+    don't need to know about the ssl module's exception types.
+    """
     try:
         context.load_cert_chain(cert_path, key_path)
     except (_ssl.SSLError, OSError) as err:
@@ -436,9 +459,12 @@ def build_ssl_context(ssl_config, certs_dir):
     Expected config: {"bundle": "<name>", "require_client_cert": bool?}
 
     Raises CertManagerError on missing/invalid config or missing files.
+    There is nothing serving yet, so this loads once - the rehearsal in
+    reload_ssl_context() is there to protect a context already in use.
     """
+    cert_path, key_path, ca_path, bundle = _bundle_for(ssl_config, certs_dir)
     context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-    reload_ssl_context(context, ssl_config, certs_dir)
+    _load_bundle(context, bundle, cert_path, key_path, ca_path)
     return context
 
 
