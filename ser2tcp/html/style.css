@@ -404,6 +404,13 @@ body {
 .card-offline { border-left-color: var(--ready); }
 .card-error   { border-left-color: var(--error); }
 .card-warning { border-left-color: var(--warning); }
+/* The title carries the state as well, so the answer is legible
+   without tracing a thin stripe back to the edge of the card. Every
+   card kind reuses these classes, and the meaning travels with them. */
+.card-online  .card-title { color: var(--success); }
+.card-offline .card-title { color: var(--ready); }
+.card-error   .card-title { color: var(--error); }
+.card-warning .card-title { color: var(--warning); }
 
 .card-header-row {
   display: flex;
@@ -463,8 +470,12 @@ body {
   gap: 8px;
   border-left-color: var(--warning);
 }
+.card-detected .card-title { color: var(--warning); }
 .card-detected.card-detected-configured {
   border-left-color: var(--success);
+}
+.card-detected.card-detected-configured .card-title {
+  color: var(--success);
 }
 .detect-attrs {
   display: grid;
