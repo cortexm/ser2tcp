@@ -170,11 +170,17 @@ def main():
 
     if isinstance(configuration, dict) and 'http' in configuration:
         import ser2tcp.http_server as _http_server
-        http_server = _http_server.HttpServerWrapper(
-            configuration['http'], serial_proxies, log,
-            config_path=args.config, configuration=configuration,
-            server_manager=servers_manager,
-            selector=servers_manager.selector)
+        try:
+            http_server = _http_server.HttpServerWrapper(
+                configuration['http'], serial_proxies, log,
+                config_path=args.config, configuration=configuration,
+                server_manager=servers_manager,
+                selector=servers_manager.selector)
+        except ValueError as err:
+            # An unreadable users/tokens block. Refusing to start is the
+            # safe answer: carrying on without those users would publish
+            # the whole API, since no users at all means no auth at all.
+            raise SystemExit(f"{config_path}: {err}") from err
         servers_manager.add_server(http_server)
         # uhttp connections come out of the loop as return values, not
         # through a server the manager knows about.

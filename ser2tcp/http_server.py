@@ -1250,6 +1250,37 @@ class HttpServerWrapper():
             self._auth.logout(token)
         client.respond({'ok': True})
 
+    @staticmethod
+    def _validate_auth_fields(data, fields):
+        """Type-check user/token fields, return error string or None.
+
+        `fields` maps a key to 'string', 'nonempty' or 'timeout'. Only
+        keys actually present are checked, so one table serves both the
+        add endpoints (where the caller has already established what is
+        required) and the update ones, which take any subset.
+
+        These are not cosmetic checks: a login and a token are dict
+        keys, a password is concatenated with a salt, and a session
+        timeout is added to time.time().
+        """
+        for key, kind in fields.items():
+            if key not in data:
+                continue
+            value = data[key]
+            if kind == 'timeout':
+                # null means "use the default", same as globally.
+                if value is None:
+                    continue
+                if isinstance(value, bool) \
+                        or not isinstance(value, (int, float)) \
+                        or value < 0:
+                    return f'{key} must be a non-negative number or null'
+            elif not isinstance(value, str):
+                return f'{key} must be a string'
+            elif kind == 'nonempty' and not value:
+                return f'{key} must not be empty'
+        return None
+
     def _require_admin(self, client, user):
         """Check if user is admin, send 403 if not"""
         if not user.get('admin'):
@@ -1305,6 +1336,12 @@ class HttpServerWrapper():
                 or 'password' not in data:
             self._error(client, 'login and password required', 400)
             return
+        error = self._validate_auth_fields(data, {
+            'login': 'nonempty', 'password': 'string',
+            'session_timeout': 'timeout'})
+        if error:
+            self._error(client, error, 400)
+            return
         kwargs = {}
         if 'admin' in data:
             kwargs['admin'] = bool(data['admin'])
@@ -1333,6 +1370,11 @@ class HttpServerWrapper():
         data = client.data
         if not isinstance(data, dict):
             self._error(client, 'Invalid request', 400)
+            return
+        error = self._validate_auth_fields(data, {
+            'password': 'string', 'session_timeout': 'timeout'})
+        if error:
+            self._error(client, error, 400)
             return
         kwargs = {}
         if 'password' in data:
@@ -1388,6 +1430,11 @@ class HttpServerWrapper():
                 or 'name' not in data:
             self._error(client, 'token and name required', 400)
             return
+        error = self._validate_auth_fields(data, {
+            'token': 'nonempty', 'name': 'string'})
+        if error:
+            self._error(client, error, 400)
+            return
         auth = self._ensure_auth()
         admin = bool(data.get('admin', False))
         if not auth.add_token(data['token'], data['name'], admin):
@@ -1407,6 +1454,11 @@ class HttpServerWrapper():
         data = client.data
         if not isinstance(data, dict):
             self._error(client, 'Invalid request', 400)
+            return
+        error = self._validate_auth_fields(data, {
+            'token': 'nonempty', 'name': 'string'})
+        if error:
+            self._error(client, error, 400)
             return
         kwargs = {}
         if 'token' in data:

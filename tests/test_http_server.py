@@ -2131,3 +2131,132 @@ class TestHttpConfigTypeValidation(unittest.TestCase):
         client = self._post({'address': '0.0.0.0', 'port': 8080,
             'name': ['main']})
         self.assertEqual(client.respond_status, 400)
+
+
+class TestAuthFieldTypeValidation(unittest.TestCase):
+    """Users and tokens take the same treatment as port configs.
+
+    A login is a dict key, a password is concatenated with a salt, and
+    a session timeout is added to time.time() - none of which survives
+    the wrong type, and all of which come straight from a request body.
+    """
+
+    def _make_wrapper(self):
+        configuration = {
+            'http': [{'address': '127.0.0.1', 'port': 0}],
+            'users': [{
+                'login': 'admin',
+                'password': hash_password('secret'),
+                'admin': True,
+            }],
+            'tokens': [{'token': 'key', 'name': 'monitoring'}],
+        }
+        with patch('ser2tcp.http_server._uhttp_server.HttpServer'):
+            return HttpServerWrapper(
+                {'address': '127.0.0.1', 'port': 0}, [],
+                log=Mock(), configuration=configuration,
+                server_manager=Mock())
+
+    def _token(self, wrapper):
+        client = MockClient(
+            method='POST', path='/api/login',
+            data={'login': 'admin', 'password': 'secret'})
+        wrapper._handle_request(client)
+        return client.responded['token']
+
+    def _call(self, method, path, data, wrapper=None):
+        wrapper = wrapper or self._make_wrapper()
+        client = MockClient(
+            method=method, path=path, data=data,
+            headers={'authorization': f'Bearer {self._token(wrapper)}'})
+        wrapper._handle_request(client)
+        return client
+
+    def _assert_400(self, method, path, data):
+        client = self._call(method, path, data)
+        self.assertEqual(client.respond_status, 400, client.responded)
+
+    # --- users ---
+
+    def test_add_user_password_must_be_a_string(self):
+        self._assert_400('POST', '/api/users', {'login': 'x', 'password': 42})
+
+    def test_add_user_login_must_be_a_string(self):
+        self._assert_400('POST', '/api/users', {'login': ['x'],
+            'password': 'y'})
+
+    def test_add_user_login_must_not_be_empty(self):
+        self._assert_400('POST', '/api/users', {'login': '', 'password': 'y'})
+
+    def test_add_user_session_timeout_must_be_a_number(self):
+        self._assert_400('POST', '/api/users', {
+            'login': 'x', 'password': 'y', 'session_timeout': 'soon'})
+
+    def test_add_user_session_timeout_must_not_be_negative(self):
+        self._assert_400('POST', '/api/users', {
+            'login': 'x', 'password': 'y', 'session_timeout': -1})
+
+    def test_update_user_password_must_be_a_string(self):
+        self._assert_400('PUT', '/api/users/admin', {'password': 42})
+
+    def test_update_user_session_timeout_must_be_a_number(self):
+        self._assert_400('PUT', '/api/users/admin',
+            {'session_timeout': [60]})
+
+    def test_update_user_session_timeout_may_be_null(self):
+        """null clears the override rather than breaking the session"""
+        wrapper = self._make_wrapper()
+        client = self._call('PUT', '/api/users/admin',
+            {'session_timeout': None}, wrapper=wrapper)
+        self.assertEqual(client.respond_status, 200)
+        login = MockClient(
+            method='POST', path='/api/login',
+            data={'login': 'admin', 'password': 'secret'})
+        wrapper._handle_request(login)
+        self.assertEqual(login.respond_status, 200)
+
+    def test_adding_a_user_with_a_timeout_still_works(self):
+        client = self._call('POST', '/api/users', {
+            'login': 'x', 'password': 'y', 'session_timeout': 60})
+        self.assertEqual(client.respond_status, 201)
+
+    # --- tokens ---
+
+    def test_add_token_must_be_a_string(self):
+        self._assert_400('POST', '/api/tokens', {'token': ['k'],
+            'name': 'n'})
+
+    def test_add_token_must_not_be_empty(self):
+        self._assert_400('POST', '/api/tokens', {'token': '', 'name': 'n'})
+
+    def test_add_token_name_must_be_a_string(self):
+        self._assert_400('POST', '/api/tokens', {'token': 'k', 'name': 7})
+
+    def test_update_token_must_be_a_string(self):
+        self._assert_400('PUT', '/api/tokens/key', {'token': ['new']})
+
+    def test_update_token_name_must_be_a_string(self):
+        self._assert_400('PUT', '/api/tokens/key', {'name': 7})
+
+    def test_adding_a_valid_token_still_works(self):
+        client = self._call('POST', '/api/tokens', {'token': 'k2',
+            'name': 'n'})
+        self.assertEqual(client.respond_status, 201)
+
+    # --- login ---
+
+    def test_login_with_a_non_string_password_is_refused(self):
+        wrapper = self._make_wrapper()
+        client = MockClient(
+            method='POST', path='/api/login',
+            data={'login': 'admin', 'password': 42})
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 401)
+
+    def test_login_with_a_non_string_login_is_refused(self):
+        wrapper = self._make_wrapper()
+        client = MockClient(
+            method='POST', path='/api/login',
+            data={'login': ['admin'], 'password': 'secret'})
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 401)

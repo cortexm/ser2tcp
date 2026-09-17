@@ -327,3 +327,125 @@ class TestSessionManager(unittest.TestCase):
         self.assertIn('tokens', config)
         self.assertEqual(len(config['users']), 1)
         self.assertEqual(config['users'][0]['login'], 'admin')
+
+
+class TestPasswordHelpersRejectNonStrings(unittest.TestCase):
+    """JSON can carry any type into these; none of them may raise.
+
+    Every one of these values arrives from a request body, and an
+    unhandled TypeError in an API handler is a 500 at best.
+    """
+
+    def test_verify_password_refuses_a_non_string_password(self):
+        stored = hash_password('secret')
+        for value in (42, None, ['secret'], {'p': 1}, True):
+            self.assertFalse(verify_password(value, stored))
+
+    def test_verify_password_refuses_a_non_string_hash(self):
+        for stored in (42, None, ['sha256:a:b']):
+            self.assertFalse(verify_password('secret', stored))
+
+    def test_verify_password_still_works_normally(self):
+        stored = hash_password('secret')
+        self.assertTrue(verify_password('secret', stored))
+        self.assertFalse(verify_password('wrong', stored))
+
+    def test_hash_password_rejects_a_non_string(self):
+        for value in (42, None, ['secret']):
+            with self.assertRaises(TypeError):
+                hash_password(value)
+
+    def test_ensure_hashed_rejects_a_non_string(self):
+        for value in (42, None, ['secret']):
+            with self.assertRaises(TypeError):
+                ensure_hashed(value)
+
+    def test_login_with_a_non_string_password_just_fails(self):
+        manager = SessionManager({'users': [
+            {'login': 'a', 'password': hash_password('secret')}]})
+        self.assertIsNone(manager.login('a', 42))
+        self.assertIsNone(manager.login(42, 'secret'))
+
+
+class TestMalformedAuthConfig(unittest.TestCase):
+    """A broken users/tokens block must fail loudly, never quietly.
+
+    Skipping the entries that cannot be read would leave a server with
+    no users at all - which is not "locked down", it is wide open,
+    because is_empty turns authentication off entirely.
+    """
+
+    def test_user_without_a_login_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            SessionManager({'users': [{'password': 'x'}]})
+        self.assertIn('login', str(caught.exception))
+
+    def test_user_without_a_password_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            SessionManager({'users': [{'login': 'a'}]})
+        self.assertIn('password', str(caught.exception))
+
+    def test_user_with_a_non_string_login_is_rejected(self):
+        with self.assertRaises(ValueError):
+            SessionManager({'users': [{'login': ['a'], 'password': 'x'}]})
+
+    def test_user_entry_that_is_not_an_object_is_rejected(self):
+        with self.assertRaises(ValueError):
+            SessionManager({'users': ['admin']})
+
+    def test_user_with_a_bad_session_timeout_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            SessionManager({'users': [
+                {'login': 'a', 'password': 'x', 'session_timeout': 'soon'}]})
+        self.assertIn('session_timeout', str(caught.exception))
+
+    def test_token_without_a_token_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            SessionManager({'tokens': [{'name': 'monitoring'}]})
+        self.assertIn('token', str(caught.exception))
+
+    def test_token_with_a_non_string_token_is_rejected(self):
+        with self.assertRaises(ValueError):
+            SessionManager({'tokens': [{'token': ['k'], 'name': 'x'}]})
+
+    def test_global_session_timeout_must_be_a_number(self):
+        with self.assertRaises(ValueError) as caught:
+            SessionManager({'session_timeout': 'never'})
+        self.assertIn('session_timeout', str(caught.exception))
+
+    def test_a_good_config_is_still_accepted(self):
+        manager = SessionManager({
+            'session_timeout': 60,
+            'users': [{'login': 'a', 'password': hash_password('x'),
+                       'admin': True, 'session_timeout': 30}],
+            'tokens': [{'token': 'k', 'name': 'monitoring'}],
+        })
+        self.assertFalse(manager.is_empty)
+        self.assertIsNotNone(manager.login('a', 'x'))
+        self.assertEqual(manager.authenticate('k')['login'], 'monitoring')
+
+
+class TestSessionTimeoutOverride(unittest.TestCase):
+    """null means "use the default", not "expire at the epoch"."""
+
+    def _manager(self):
+        return SessionManager({'session_timeout': 1000})
+
+    def test_adding_a_user_without_an_override(self):
+        manager = self._manager()
+        manager.add_user('a', 'x', session_timeout=None)
+        token = manager.login('a', 'x')
+        self.assertIsNotNone(manager.authenticate(token))
+
+    def test_clearing_an_override_falls_back_to_the_default(self):
+        manager = self._manager()
+        manager.add_user('a', 'x', session_timeout=30)
+        manager.update_user('a', session_timeout=None)
+        self.assertNotIn('session_timeout', manager.list_users()[0])
+        token = manager.login('a', 'x')
+        self.assertIsNotNone(manager.authenticate(token))
+
+    def test_an_override_is_still_honoured(self):
+        manager = self._manager()
+        manager.add_user('a', 'x', session_timeout=30)
+        self.assertEqual(manager.list_users()[0]['session_timeout'], 30)
