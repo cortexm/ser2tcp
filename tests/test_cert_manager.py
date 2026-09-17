@@ -836,3 +836,196 @@ class TestReloadSslContext(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def make_cert_with_a_broken_extension():
+    """A certificate that loads but whose extensions cannot be parsed.
+
+    cryptography parses extension *values* lazily, so a cert like this
+    passes load_pem_x509_certificate() and only blows up when something
+    reads .extensions - which is exactly what makes it dangerous: it
+    also sails through PEM validation and lands on disk.
+    """
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    import datetime
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'broken.test')])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=5))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName('sanhost.example')]),
+            critical=False)
+        .sign(key, hashes.SHA256()))
+    der = bytearray(cert.public_bytes(serialization.Encoding.DER))
+    # Overstate the length of the DNSName inside the SAN extension.
+    index = der.find(b'sanhost.example')
+    der[index - 1] = 0x60
+    broken = x509.load_der_x509_certificate(bytes(der))
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()).decode()
+    return broken.public_bytes(serialization.Encoding.PEM).decode(), key_pem
+
+
+class TestInspectCertificateNeverRaises(unittest.TestCase):
+    """The contract says best-effort; a listing must not die on one file.
+
+    A bundle holding a cert like this made every GET /api/certs from any
+    logged-in user kill the process - and since the file stays on disk,
+    it did so again after every restart.
+    """
+
+    def setUp(self):
+        self.pem, self.key = make_cert_with_a_broken_extension()
+
+    def test_a_broken_extension_is_reported_not_raised(self):
+        info = inspect_certificate(self.pem)
+        self.assertIn('error', info)
+
+    def test_what_could_be_read_is_still_returned(self):
+        info = inspect_certificate(self.pem)
+        self.assertEqual(info.get('subject_cn'), 'broken.test')
+        self.assertIn('not_after', info)
+
+    def test_garbage_is_still_reported(self):
+        info = inspect_certificate('not a certificate at all')
+        self.assertIn('error', info)
+
+    def test_a_good_certificate_is_unaffected(self):
+        pem, _key = generate_certificate(cn='fine.test', days=5,
+            key_type='ec_p256')
+        info = inspect_certificate(pem)
+        self.assertNotIn('error', info)
+        self.assertEqual(info['subject_cn'], 'fine.test')
+
+    def test_pairing_still_works_on_a_cert_that_cannot_be_inspected(self):
+        """A broken extension says nothing about the public key"""
+        self.assertIs(cert_key_match(self.pem, self.key), True)
+
+    def test_pairing_reports_a_real_mismatch(self):
+        _pem, other = generate_certificate(cn='other.test', days=5,
+            key_type='ec_p256')
+        self.assertIs(cert_key_match(self.pem, other), False)
+
+    def test_pairing_cannot_tell_with_garbage(self):
+        self.assertIsNone(cert_key_match('garbage', self.key))
+
+
+class TestBundleListingSurvivesABrokenCert(unittest.TestCase):
+    """get_bundle()/list_bundles() have to ride over one bad file"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.mgr = CertManager(self.dir)
+        self.mgr.create_bundle('broken')
+        path = os.path.join(self.mgr.certs_dir, 'broken', 'cert.pem')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(make_cert_with_a_broken_extension()[0])
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_get_bundle_reports_the_problem(self):
+        bundle = self.mgr.get_bundle('broken')
+        self.assertIn('error', bundle['files']['cert.pem']['cert_info'])
+
+    def test_list_bundles_still_lists_it(self):
+        names = [b['name'] for b in self.mgr.list_bundles()]
+        self.assertIn('broken', names)
+
+    def test_a_good_bundle_alongside_it_is_unaffected(self):
+        pem, key = generate_certificate(cn='fine.test', days=5,
+            key_type='ec_p256')
+        self.mgr.save_files('fine', [('cert.pem', pem), ('key.pem', key)])
+        bundles = {b['name']: b for b in self.mgr.list_bundles()}
+        self.assertNotIn(
+            'error', bundles['fine']['files']['cert.pem']['cert_info'])
+
+
+class TestFilesystemErrorsBecomeCertManagerError(unittest.TestCase):
+    """Every caller catches CertManagerError and nothing else.
+
+    A bare OSError out of these reaches the event loop, so a symlinked
+    bundle or a stray file where a directory belongs used to be enough
+    to take the process down.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.mgr = CertManager(self.dir)
+        self.certs = self.mgr.certs_dir
+        os.makedirs(self.certs, mode=0o700, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_deleting_a_symlinked_bundle_removes_only_the_link(self):
+        """Symlinked bundles are a documented Let's Encrypt pattern.
+
+        rmtree refuses a symlink outright, which used to raise OSError
+        straight past every caller. Removing the link is both what the
+        request means and the only safe reading of it - the target may
+        be /etc/letsencrypt/live/... and must survive untouched.
+        """
+        target = os.path.join(self.dir, 'elsewhere')
+        os.makedirs(target)
+        with open(os.path.join(target, 'keepme'), 'w',
+                  encoding='utf-8') as f:
+            f.write('still here')
+        os.symlink(target, os.path.join(self.certs, 'linked'))
+        self.mgr.delete_bundle('linked')
+        self.assertFalse(os.path.lexists(os.path.join(self.certs, 'linked')))
+        self.assertTrue(os.path.isfile(os.path.join(target, 'keepme')))
+
+    def test_saving_into_a_name_taken_by_a_file(self):
+        with open(os.path.join(self.certs, 'taken'), 'w',
+                  encoding='utf-8') as f:
+            f.write('not a directory')
+        with self.assertRaises(CertManagerError):
+            self.mgr.save_files('taken', [('cert.pem', CERT_PEM)])
+
+    def test_deleting_a_file_that_is_really_a_directory(self):
+        self.mgr.create_bundle('odd')
+        os.makedirs(os.path.join(self.certs, 'odd', 'cert.pem'))
+        with self.assertRaises(CertManagerError):
+            self.mgr.delete_file('odd', 'cert.pem')
+
+    def test_reading_a_file_that_is_not_utf8(self):
+        self.mgr.create_bundle('binary')
+        path = os.path.join(self.certs, 'binary', 'cert.pem')
+        with open(path, 'wb') as f:
+            f.write(b'\xff\xfe\x00\x01 not text')
+        with self.assertRaises(CertManagerError):
+            self.mgr.read_public_file('binary', 'cert.pem')
+
+    def test_writing_into_a_directory_that_cannot_be_written(self):
+        self.mgr.create_bundle('locked')
+        path = os.path.join(self.certs, 'locked')
+        os.chmod(path, 0o500)
+        try:
+            with self.assertRaises(CertManagerError):
+                self.mgr.save_files('locked', [('cert.pem', CERT_PEM)])
+        finally:
+            os.chmod(path, 0o700)
+
+    def test_normal_operations_still_work(self):
+        self.mgr.create_bundle('fine')
+        self.mgr.save_files('fine', [('cert.pem', CERT_PEM)])
+        self.assertIn('BEGIN CERTIFICATE',
+            self.mgr.read_public_file('fine', 'cert.pem'))
+        self.mgr.delete_file('fine', 'cert.pem')
+        self.mgr.delete_bundle('fine')
+        self.assertEqual(self.mgr.list_bundles(), [])

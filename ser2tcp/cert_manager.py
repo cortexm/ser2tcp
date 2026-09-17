@@ -100,6 +100,14 @@ def inspect_certificate(pem_content):
     display the file but without parsed info. We never raise — this
     function is best-effort and is called when listing bundles, where a
     single bad file shouldn't break the whole response.
+
+    Loading a certificate is not the same as being able to read it:
+    cryptography parses extension values lazily, so a certificate with
+    a malformed extension loads cleanly, passes PEM validation, lands
+    on disk, and only raises later when something touches .extensions.
+    That made a listing fatal for as long as the file stayed there.
+    Whatever was read before the failure is kept, with the error beside
+    it.
     """
     if not pem_content:
         return {'error': 'empty content'}
@@ -108,6 +116,15 @@ def inspect_certificate(pem_content):
     except (ValueError, TypeError) as err:
         return {'error': f'parse failed: {err}'}
     info = {}
+    try:
+        _fill_cert_info(info, cert)
+    except Exception as err:  # pylint: disable=W0703
+        info['error'] = f'inspect failed: {err}'
+    return info
+
+
+def _fill_cert_info(info, cert):
+    """Fill `info` with everything readable off `cert` (may raise)"""
     info['subject_cn'] = _name_cn(cert.subject)
     info['issuer_cn'] = _name_cn(cert.issuer)
     info['self_signed'] = cert.subject == cert.issuer
@@ -153,7 +170,6 @@ def inspect_certificate(pem_content):
     info['key_type'] = alg
     if size is not None:
         info['key_size'] = size
-    return info
 
 
 def resolve_bundle_paths(certs_dir, bundle_name, require_client_cert=False):
@@ -221,17 +237,18 @@ def _serialize_cert_pem(cert):
 def cert_key_match(cert_pem, key_pem):
     """Return True/False whether a cert and private key belong together.
 
-    Returns None when either side cannot be parsed — an encrypted key or
-    a dangling symlink is not a mismatch, and the caller decides what to
-    do with a file it cannot read.
+    Returns None when either side cannot be parsed — an encrypted key,
+    a dangling symlink or a certificate whose key cannot be read is not
+    a mismatch, and the caller decides what to do with a file it cannot
+    read. "Cannot tell" is an answer here; raising is not.
     """
     try:
         cert = _x509.load_pem_x509_certificate(_as_bytes(cert_pem))
         key = _serialization.load_pem_private_key(
             _as_bytes(key_pem), password=None)
-    except (ValueError, TypeError):
+        return _public_key_der(cert) == _public_key_der(key)
+    except Exception:  # pylint: disable=W0703
         return None
-    return _public_key_der(cert) == _public_key_der(key)
 
 
 def load_cert_and_key(cert_pem, key_pem, what='Cert'):
@@ -591,7 +608,16 @@ class CertManager():
         path = self._bundle_path(name)
         if not _os.path.isdir(path):
             raise CertManagerError(f"Bundle '{name}' not found")
-        _shutil.rmtree(path)
+        try:
+            # A symlinked bundle dir passes isdir() but rmtree refuses
+            # it outright, and permissions can fail here too.
+            if _os.path.islink(path):
+                _os.unlink(path)
+            else:
+                _shutil.rmtree(path)
+        except OSError as err:
+            raise CertManagerError(
+                f"Cannot delete bundle '{name}': {err}") from err
         self._log.info("Cert bundle deleted: %s", name)
 
     def save_file(self, name, filename, content):
@@ -620,7 +646,13 @@ class CertManager():
         self._ensure_certs_dir()
         path = self._bundle_path(name)
         if not _os.path.isdir(path):
-            _os.makedirs(path, mode=_DIR_MODE)
+            try:
+                _os.makedirs(path, mode=_DIR_MODE)
+            except OSError as err:
+                # Typically a plain file sitting where the bundle
+                # directory belongs, or a permission problem.
+                raise CertManagerError(
+                    f"Cannot create bundle '{name}': {err}") from err
         for filename, content in items:
             self._write_file(path, name, filename, content)
 
@@ -676,12 +708,15 @@ class CertManager():
                 _os.close(fd)
             _os.chmod(tmp, mode)
             _os.replace(tmp, fpath)
-        except Exception:
+        except Exception as err:
             if _os.path.exists(tmp):
                 try:
                     _os.unlink(tmp)
                 except OSError:
                     pass
+            if isinstance(err, OSError):
+                raise CertManagerError(
+                    f"Cannot write {name}/{filename}: {err}") from err
             raise
         self._log.info("Cert file saved: %s/%s", name, filename)
 
@@ -692,7 +727,12 @@ class CertManager():
         if not _os.path.lexists(fpath):
             raise CertManagerError(
                 f"File '{filename}' not found in bundle '{name}'")
-        _os.unlink(fpath)
+        try:
+            _os.unlink(fpath)
+        except OSError as err:
+            # A directory under that name, or no write access here.
+            raise CertManagerError(
+                f"Cannot delete {name}/{filename}: {err}") from err
         self._log.info("Cert file deleted: %s/%s", name, filename)
 
     def read_public_file(self, name, filename):
@@ -705,5 +745,12 @@ class CertManager():
         if not _os.path.isfile(fpath):
             raise CertManagerError(
                 f"File '{filename}' not found in bundle '{name}'")
-        with open(fpath, 'r', encoding='utf-8') as f:
-            return f.read()
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                return f.read()
+        except (OSError, UnicodeDecodeError) as err:
+            # Nothing guarantees what is on disk is text: this endpoint
+            # is reachable by any authenticated user, so a binary file
+            # dropped in by hand must not be fatal.
+            raise CertManagerError(
+                f"Cannot read {name}/{filename}: {err}") from err
