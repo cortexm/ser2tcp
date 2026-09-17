@@ -62,6 +62,15 @@ class SerialProxy():
     # it is stuck - and while it is, clients paused for backpressure
     # are not being watched, so nothing would ever reap them.
     WRITE_STALL_TIMEOUT = 30.0
+    # The reader thread blocks in read(), so it only notices it should
+    # stop when that returns. A read timeout bounds how long that takes
+    # for backends whose cancel_read() does nothing.
+    READ_TIMEOUT = 0.2
+    # How long disconnect() waits for the thread. It runs in the one
+    # loop that serves everything else, so this is a ceiling on how long
+    # the whole process can stand still; with the read timeout above it
+    # normally returns at once.
+    READER_JOIN_TIMEOUT = 0.5
 
     def __init__(self, config, log=None, certs_dir=None, selector=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
@@ -127,6 +136,10 @@ class SerialProxy():
         # returns how much it took instead of waiting for the device,
         # and the rest is driven by write interest from the loop.
         config['write_timeout'] = 0
+        # A bounded read, so the reader thread cannot sit in read()
+        # ignoring a request to stop. Reads here always pass an explicit
+        # size taken from in_waiting, so this only caps the waiting.
+        config['timeout'] = self.READ_TIMEOUT
         if 'parity' in config:
             for key, val in self.PARITY_CONFIG.items():
                 if config['parity'] == key:
@@ -185,33 +198,66 @@ class SerialProxy():
         except OSError:
             self._start_reader_thread()
 
-    def _serial_reader_run(self):
-        """Reader thread: read from serial, forward to socketpair"""
-        while self._reader_running:
+    def _serial_reader_run(self, sock_w):
+        """Reader thread: read from serial, forward to socketpair.
+
+        Owns `sock_w` for its whole life and closes it on the way out.
+        Letting the main thread close it instead is a descriptor being
+        closed under a thread that may be mid-send, and a descriptor
+        number that can then be reused by something else entirely.
+        """
+        try:
+            while self._reader_running:
+                try:
+                    data = self._serial.read(
+                        size=max(1, self._serial.in_waiting))
+                    if data:
+                        sock_w.sendall(data)
+                except (OSError, _serial.SerialException):
+                    break
+        finally:
             try:
-                data = self._serial.read(size=max(1, self._serial.in_waiting))
-                if data:
-                    self._reader_sock_w.sendall(data)
-            except (OSError, _serial.SerialException):
-                break
+                sock_w.close()
+            except OSError:
+                pass
 
     def _start_reader_thread(self):
         """Start reader thread with socketpair for select() compatibility"""
         self._reader_sock_r, self._reader_sock_w = _socket.socketpair()
         self._reader_running = True
         self._reader_thread = _threading.Thread(
-            target=self._serial_reader_run, daemon=True)
+            target=self._serial_reader_run, args=(self._reader_sock_w,),
+            daemon=True)
         self._reader_thread.start()
         self._log.debug("Serial reader thread started")
 
     def _stop_reader_thread(self):
-        """Stop reader thread and close socketpair"""
+        """Stop the reader thread and let go of the socketpair.
+
+        Waits, but briefly: the thread reads the port we are about to
+        close, so letting it run on would risk a read against a
+        descriptor that has been closed and perhaps reused. cancel_read()
+        wakes it at once where the backend has one, and the read timeout
+        covers the rest, so this normally returns without waiting.
+        """
         if self._reader_thread is None:
             return
         self._reader_running = False
-        self._reader_thread.join(timeout=2)
-        self._reader_sock_r.close()
-        self._reader_sock_w.close()
+        try:
+            self._serial.cancel_read()
+        except Exception:  # pylint: disable=W0703
+            # Not every backend has one, and the read timeout covers it.
+            pass
+        self._reader_thread.join(timeout=self.READER_JOIN_TIMEOUT)
+        if self._reader_thread.is_alive():
+            self._log.warning(
+                "(%s): serial reader thread did not stop within %.1fs",
+                self._serial_config.get('port'), self.READER_JOIN_TIMEOUT)
+        try:
+            self._reader_sock_r.close()
+        except OSError:
+            pass
+        # The thread closes its own end, whenever it gets there.
         self._reader_thread = None
         self._reader_sock_r = None
         self._reader_sock_w = None

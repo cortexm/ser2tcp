@@ -1,6 +1,7 @@
 """Tests for SerialProxy config parsing"""
 
 import selectors
+import threading
 import time
 import unittest
 from unittest.mock import patch, MagicMock
@@ -936,3 +937,119 @@ class TestStalledDevice(unittest.TestCase):
         proxy._serial.write.side_effect = lambda data: len(data)
         proxy.flush_serial()
         proxy._serial_failed.assert_not_called()
+
+
+class TestReaderThreadShutdown(unittest.TestCase):
+    """Stopping the reader thread must not stall the loop.
+
+    The thread exists for ports with no usable descriptor, which cannot
+    be selected on. Waiting two seconds for it inside disconnect() -
+    which runs in the one loop serving everything else - was two seconds
+    of the whole process standing still, every time the last client on
+    such a port left.
+    """
+
+    def _proxy(self):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        proxy._serial_config = {'port': 'socket://host:1234'}
+        proxy._monitors = []
+        proxy._serial = MagicMock()
+        proxy._serial.in_waiting = 0
+        return proxy
+
+    def test_stopping_an_idle_proxy_does_nothing(self):
+        proxy = self._proxy()
+        proxy._stop_reader_thread()  # no thread: must not raise
+
+    def test_a_responsive_thread_is_waited_for_briefly(self):
+        proxy = self._proxy()
+        proxy._serial.read.return_value = b''
+        proxy._start_reader_thread()
+        started = time.time()
+        proxy._stop_reader_thread()
+        self.assertLess(time.time() - started, 1.0)
+        self.assertIsNone(proxy._reader_thread)
+
+    def test_the_port_is_asked_to_cancel_the_read(self):
+        """Waking it at once beats waiting out a read timeout"""
+        proxy = self._proxy()
+        proxy._serial.read.return_value = b''
+        proxy._start_reader_thread()
+        proxy._stop_reader_thread()
+        proxy._serial.cancel_read.assert_called_once()
+
+    def test_a_backend_without_cancel_read_still_stops(self):
+        proxy = self._proxy()
+        proxy._serial.read.return_value = b''
+        proxy._serial.cancel_read.side_effect = NotImplementedError()
+        proxy._start_reader_thread()
+        proxy._stop_reader_thread()
+        self.assertIsNone(proxy._reader_thread)
+
+    def test_a_thread_that_will_not_stop_is_reported(self):
+        """Better a warning than a loop frozen without explanation"""
+        proxy = self._proxy()
+        release = threading.Event()
+        proxy._serial.read.side_effect = lambda **kw: (
+            release.wait(5) or b'')
+        proxy._serial.cancel_read.side_effect = NotImplementedError()
+        proxy._start_reader_thread()
+        time.sleep(0.05)
+        started = time.time()
+        try:
+            proxy._stop_reader_thread()
+            self.assertLess(time.time() - started, 1.5)
+            self.assertTrue(proxy._log.warning.called)
+        finally:
+            release.set()
+
+    def test_the_thread_closes_its_own_end_of_the_pair(self):
+        """Neither side closes a descriptor the other might still use.
+
+        Closing the writer from here while the thread is mid-send is a
+        descriptor that can be reused underneath it - the kind of bug
+        that shows up somewhere else entirely.
+        """
+        proxy = self._proxy()
+        proxy._serial.read.return_value = b''
+        proxy._start_reader_thread()
+        writer = proxy._reader_sock_w
+        proxy._stop_reader_thread()
+        deadline = time.time() + 2
+        while time.time() < deadline and writer.fileno() != -1:
+            time.sleep(0.02)
+        self.assertEqual(writer.fileno(), -1)
+
+    def test_the_reader_forwards_what_it_reads(self):
+        proxy = self._proxy()
+        chunks = [b'from the device', b'']
+        proxy._serial.read.side_effect = lambda **kw: (
+            chunks.pop(0) if chunks else b'')
+        proxy._start_reader_thread()
+        try:
+            proxy._reader_sock_r.settimeout(2)
+            self.assertEqual(proxy._reader_sock_r.recv(64), b'from the device')
+        finally:
+            proxy._stop_reader_thread()
+
+
+class TestReadTimeoutIsForced(unittest.TestCase):
+    """The reader thread has to come up for air to notice it should stop"""
+
+    def _config(self, **serial_cfg):
+        proxy = SerialProxy.__new__(SerialProxy)
+        _mock_init(proxy)
+        proxy._log = MagicMock()
+        cfg = {'port': '/dev/ttyUSB0'}
+        cfg.update(serial_cfg)
+        return proxy._init_serial_config(cfg)
+
+    def test_a_read_timeout_is_set(self):
+        self.assertEqual(
+            self._config()['timeout'], SerialProxy.READ_TIMEOUT)
+
+    def test_a_configured_read_timeout_is_overridden(self):
+        self.assertEqual(
+            self._config(timeout=None)['timeout'], SerialProxy.READ_TIMEOUT)
