@@ -19,6 +19,7 @@
   --info: #2563eb;
   --success: #16a34a;
   --warning: #f59e0b;
+  --ready: #0284c7;
   --shadow: rgba(0, 0, 0, 0.1);
   --tag-bg: #e8f0fe;
   --tag-text: #1a56db;
@@ -43,6 +44,7 @@
   --info: #60a5fa;
   --success: #4ade80;
   --warning: #fbbf24;
+  --ready: #7dd3fc;
   --shadow: rgba(0, 0, 0, 0.4);
   --tag-bg: #1e3a5f;
   --tag-text: #93c5fd;
@@ -80,6 +82,10 @@ body {
   align-items: center;
   gap: 16px;
 }
+/* The logo doubles as the server-reachability light: green while the
+   status stream is delivering, red once it stops. */
+.logo.server-online  { color: var(--success); }
+.logo.server-offline { color: var(--error); }
 .logo {
   display: flex;
   align-items: center;
@@ -395,7 +401,7 @@ body {
   transform: translateY(-1px);
 }
 .card-online  { border-left-color: var(--success); }
-.card-offline { border-left-color: var(--text-faint); }
+.card-offline { border-left-color: var(--ready); }
 .card-error   { border-left-color: var(--error); }
 .card-warning { border-left-color: var(--warning); }
 
@@ -415,7 +421,14 @@ body {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  /* Device paths are one long unbreakable token; without this they
+     overflow the title box and run under the button beside them. */
+  overflow-wrap: anywhere;
 }
+/* Whatever shares the header row with the title keeps its size. */
+.card-header-row > .btn,
+.card-header-row > .tag,
+.card-header-row > .kebab-menu { flex: none; }
 .card-subtitle { font-size: 13px; color: var(--text-muted); }
 .card-meta {
   display: flex;
@@ -429,6 +442,9 @@ body {
 
 /* --- Detected (unconfigured) --- */
 .detected-section { margin-top: 24px; }
+.detected-section:first-child { margin-top: 0; }
+/* Forces whatever follows onto a new grid row. */
+.grid-break { grid-column: 1 / -1; height: 0; }
 .detected-title {
   font-size: 14px;
   color: var(--text-muted);
@@ -439,17 +455,16 @@ body {
 }
 .detected-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
 }
 .card-detected {
-  padding: 10px 12px;
-  gap: 6px;
+  padding: 14px 16px;
+  gap: 8px;
   border-left-color: var(--warning);
 }
-.card-detected.card-detected-offline {
-  border-left-color: var(--text-faint);
-  opacity: 0.7;
+.card-detected.card-detected-configured {
+  border-left-color: var(--success);
 }
 .detect-attrs {
   display: grid;

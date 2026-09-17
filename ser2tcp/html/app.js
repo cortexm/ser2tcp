@@ -247,6 +247,7 @@ function updateNav() {
   const userName = $('user-name');
   const navUsers = $('nav-users');
   const navCerts = $('nav-certificates');
+  const navDetected = $('nav-detected');
   header.hidden = !_authed;
   if (token && username) {
     userName.textContent = username;
@@ -257,6 +258,7 @@ function updateNav() {
   }
   if (navUsers) navUsers.hidden = !isAdmin;
   if (navCerts) navCerts.hidden = !isAdmin;
+  if (navDetected) navDetected.hidden = !isAdmin;
 }
 
 function updateActiveTab() {
@@ -423,6 +425,7 @@ const routes = [
   [/^\/ports$/,                    () => showPorts()],
   [/^\/ports\/new$/,               m => showPortEditor(null, m._q)],
   [/^\/ports\/(\d+)\/edit$/,       m => showPortEditor(parseInt(m[1]), m._q)],
+  [/^\/detected$/,                 () => showDetected()],
   [/^\/users$/,                    () => showUsers()],
   [/^\/users\/new$/,               () => showUserEditor(null)],
   [/^\/users\/([^/]+)\/edit$/,     m => showUserEditor(decodeURIComponent(m[1]))],
@@ -449,7 +452,7 @@ function route() {
   const q = _parseQuery(queryStr || '');
   // List-view routes — close any modal so it doesn't linger.
   if (path === '/ports' || path === '/users' || path === '/settings'
-      || path === '/certificates') {
+      || path === '/certificates' || path === '/detected') {
     closeModal();
   }
   for (const [re, handler] of routes) {
@@ -535,6 +538,19 @@ function showPorts() {
   // render from cached state, no extra fetches needed.
   renderPortsActions();
   renderPortsList();
+}
+
+function _refreshDetectedView() {
+  if ($('detected-view').classList.contains('active')) {
+    renderDetectedSection();
+  }
+}
+
+function showDetected() {
+  // Admin-only: the whole point of this screen is adding a port from a
+  // device, and only an admin can do that.
+  if (!isAdmin) { navigate('/ports'); return; }
+  show('detected-view');
   renderDetectedSection();
 }
 
@@ -565,6 +581,20 @@ function _refreshPortViews() {
 let _statusStream = null;        // AbortController for the active fetch
 let _statusReconnectTimer = null;
 const STATUS_RECONNECT_MS = 2000;
+// Whether the status stream is delivering. The page is built entirely
+// from what the stream says, so when it stops, everything on screen is
+// a snapshot of a server we can no longer reach - and the title says so.
+let _serverReachable = null;
+
+function setServerReachable(reachable) {
+  if (_serverReachable === reachable) return;
+  _serverReachable = reachable;
+  const logo = document.querySelector('.logo');
+  if (!logo) return;
+  logo.classList.toggle('server-online', reachable === true);
+  logo.classList.toggle('server-offline', reachable === false);
+  logo.title = reachable === false ? 'Server unreachable' : '';
+}
 
 function startStatusStream() {
   stopStatusStream();
@@ -587,6 +617,7 @@ function startStatusStream() {
     if (!resp.ok || !resp.body) {
       throw new Error('stream HTTP ' + resp.status);
     }
+    setServerReachable(true);
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -608,6 +639,7 @@ function startStatusStream() {
     if (ctrl.signal.aborted) return;
     if (_statusStream === ctrl) {
       _statusStream = null;
+      setServerReachable(false);
       _scheduleStatusReconnect();
     }
   });
@@ -645,7 +677,7 @@ function _applyStatusLine(line) {
     updateNav();
     renderPortsActions();
     _refreshPortViews();
-    renderDetectedSection();
+    _refreshDetectedView();
     if (!wasAuthed) {
       // First snapshot after page load or login — pick up routing.
       const hash = location.hash.replace(/^#/, '');
@@ -660,10 +692,8 @@ function _applyStatusLine(line) {
   // so re-render both sections.
   if (line.detected !== undefined) {
     detectedPorts = line.detected;
-    if ($('ports-view').classList.contains('active')) {
-      renderPortsList();
-      renderDetectedSection();
-    }
+    if ($('ports-view').classList.contains('active')) renderPortsList();
+    _refreshDetectedView();
     return;
   }
   // Per-port delta
@@ -763,8 +793,13 @@ function renderPortCard(port, index) {
   const subParts = [];
   if (subtitle) subParts.push(subtitle);
   if (ser.baudrate) subParts.push(ser.baudrate + ' bps');
-  subParts.push(ser.connected ? 'connected' : 'disconnected');
-  card.appendChild(el('div', { class: 'card-subtitle' }, subParts.join(' — ')));
+  // No "connected"/"disconnected" here: the card's colour is the answer
+  // (green connected, blue idle but ready, red device missing) and the
+  // word only repeated it.
+  if (subParts.length) {
+    card.appendChild(
+      el('div', { class: 'card-subtitle' }, subParts.join(' — ')));
+  }
 
   // Match attributes (if used)
   if (ser.match) {
@@ -891,23 +926,63 @@ function renderServerRow(srv, portIdx, srvIdx, portState) {
   return li;
 }
 
+// Is this device already spoken for by a configured port? Either it is
+// named outright, or some port's match filter selects it.
+function _detectedIsConfigured(p) {
+  const ports = (portsStatus && portsStatus.ports) || [];
+  return ports.some(port => {
+    const ser = port.serial || {};
+    if (ser.port && ser.port === p.device) return true;
+    return !!(ser.match && _matchesPort(p, ser.match));
+  });
+}
+
 function renderDetectedSection() {
   const root = $('detected-ports');
   root.innerHTML = '';
-  if (!detectedPorts.length) return;
+  if (!detectedPorts.length) {
+    root.appendChild(el('div', { class: 'empty' },
+      'No serial devices detected.'));
+    return;
+  }
+  const marked = detectedPorts.map(
+    p => ({ port: p, configured: _detectedIsConfigured(p) }));
+  // A vid is what makes a device identifiable as a particular piece of
+  // hardware, so those come first and get their own section. The rest
+  // are plain ports: built-in UARTs, Bluetooth pairings, virtual ones.
+  _appendDetectedGroup(root, 'USB devices', marked.filter(m => m.port.vid));
+  _appendDetectedGroup(root, 'Serial ports', marked.filter(m => !m.port.vid));
+}
+
+function _appendDetectedGroup(root, title, entries) {
+  if (!entries.length) return;
   const sec = el('div', { class: 'detected-section' });
-  sec.appendChild(el('h3', { class: 'detected-title' }, 'Detected serial ports'));
+  sec.appendChild(el('h3', { class: 'detected-title' }, title));
   const grid = el('div', { class: 'detected-grid' });
-  detectedPorts.forEach(p => grid.appendChild(renderDetectedCard(p)));
+  const free = entries.filter(m => !m.configured);
+  const taken = entries.filter(m => m.configured);
+  free.forEach(m => grid.appendChild(renderDetectedCard(m.port, false)));
+  // The configured ones start a fresh row. They are reference rather
+  // than something to act on, and the break says so without spending
+  // another heading on it.
+  if (free.length && taken.length) {
+    grid.appendChild(el('div', { class: 'grid-break' }));
+  }
+  taken.forEach(m => grid.appendChild(renderDetectedCard(m.port, true)));
   sec.appendChild(grid);
   root.appendChild(sec);
 }
 
-function renderDetectedCard(p) {
-  const card = el('div', { class: 'card card-detected card-detected-online' });
+function renderDetectedCard(p, configured) {
+  const card = el('div', {
+    class: 'card card-detected'
+      + (configured ? ' card-detected-configured' : '') });
   const title = el('span', { class: 'card-title' }, p.device);
   const headerRow = el('div', { class: 'card-header-row' }, title);
-  if (isAdmin) {
+  if (configured) {
+    headerRow.appendChild(
+      el('span', { class: 'tag tag-success' }, 'configured'));
+  } else {
     headerRow.appendChild(btn('+ Add', 'btn-primary btn-small',
       () => navigate('/ports/new?device=' + encodeURIComponent(p.device))));
   }
