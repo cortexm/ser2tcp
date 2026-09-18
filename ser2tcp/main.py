@@ -67,6 +67,28 @@ def create_default_config(config_path, log):
     return config
 
 
+def log_level(verbose=0, quiet=False):
+    """The logging level the command line asks for.
+
+    One step per level, so each flag adds exactly one kind of message:
+    -q errors only, nothing extra warnings, -v the request log, -vv
+    debug.
+
+    `-q` deliberately stops at ERROR. It used to be CRITICAL, and
+    nothing here logs CRITICAL - so it silenced "Failed to create port"
+    and an HTTP server that could not bind along with everything else,
+    and the process came up serving nothing without a word about it.
+    Total silence is still available, by redirecting the output.
+    """
+    if quiet:
+        return _logging.ERROR
+    if verbose >= 2:
+        return _logging.DEBUG
+    if verbose == 1:
+        return _logging.INFO
+    return _logging.WARNING
+
+
 def list_usb_devices():
     """List USB serial devices with match attributes"""
     devices = []
@@ -98,10 +120,10 @@ def main():
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument(
         '-v', '--verbose', action='count', default=0,
-        help="Verbose output (-v: debug)")
+        help="Verbose output (-v: requests, -vv: debug)")
     log_group.add_argument(
         '-q', '--quiet', action='store_true',
-        help="No output")
+        help="Errors only")
     parser.add_argument(
         '-u', '--usb', action='store_true',
         help="List USB serial devices and exit")
@@ -124,12 +146,7 @@ def main():
 
     _logging.basicConfig(format='%(levelname).1s: %(message)s (%(filename)s:%(lineno)s)')
     log = _logging.getLogger('ser2tcp')
-    if args.quiet:
-        log.setLevel(_logging.CRITICAL)
-    elif args.verbose:
-        log.setLevel(_logging.DEBUG)
-    else:
-        log.setLevel(_logging.INFO)
+    log.setLevel(log_level(verbose=args.verbose, quiet=args.quiet))
 
     config_path = args.config
     if _os.path.exists(config_path):

@@ -50,7 +50,8 @@ pip uninstall ser2tcp
 ```
   -h, --help            show this help message and exit
   -V, --version         show program's version number and exit
-  -v, --verbose         Increase verbosity
+  -v, --verbose         Verbose output (-v: requests, -vv: debug)
+  -q, --quiet           Errors only
   -u, --usb             List USB serial devices and exit
   --hash-password PASSWORD
                         Hash password for config file and exit
@@ -60,11 +61,41 @@ pip uninstall ser2tcp
 
 If no config file is specified and default config doesn't exist, creates one with HTTP server on first free port from 20080.
 
-### Verbose
+### Logging
 
-- By default print only ERROR and WARNING messages
-- `-v`: will print INFO messages
-- `-vv`: print also DEBUG messages
+One step per flag — each one adds a kind of message to the one below:
+
+| | shows |
+|---|---|
+| `-q` | errors only — a port that will not open, a server that cannot bind |
+| *(default)* | and warnings, which includes every refused request |
+| `-v` | and one line per request |
+| `-vv` | and debug |
+
+`-q` stops at errors rather than silencing everything: a process that
+comes up serving nothing should still say so. Redirect the output if you
+want it truly quiet.
+
+A request is logged when it arrives. A request that is refused adds a
+second line carrying the status, the method, the path, the client
+address and the reason:
+
+```
+I: POST /api/login from 192.168.1.5
+W: 401 POST /api/login from 192.168.1.5: Login failed: admin
+```
+
+That second line is deliberately self-contained, so log-watching tools
+can act on it without stitching lines together. A fail2ban filter for
+failed logins is just:
+
+```ini
+[Definition]
+failregex = ^W: 401 POST /api/login from <HOST>: Login failed
+```
+
+Stopping an attack is not this program's job — that belongs to a proxy,
+a firewall or a blocklist. Being readable by whatever does it is.
 
 ## Configuration file example
 
