@@ -325,11 +325,10 @@ class HttpServerWrapper():
                 _uhttp_server.EVENT_HEADERS,
                 _uhttp_server.EVENT_WS_REQUEST):
             ip_flt = self._ip_filter_for(client)
-            client_ip = client.addr[0] \
-                if isinstance(client.addr, tuple) else None
-            if ip_flt and client_ip and not ip_flt.is_allowed(client_ip):
-                self._log.info("HTTP rejected (IP filter): %s", client_ip)
-                client.respond({'error': 'Forbidden'}, status=403)
+            client_ip = self._client_ip(client)
+            if ip_flt and client_ip != '-' \
+                    and not ip_flt.is_allowed(client_ip):
+                self._error(client, 'Forbidden (IP filter)', 403)
                 return
         if client.event == _uhttp_server.EVENT_WS_REQUEST:
             self._handle_ws_upgrade(client)
@@ -384,7 +383,7 @@ class HttpServerWrapper():
         """Handle WebSocket upgrade request"""
         path = client.path
         if not path.startswith('/ws/'):
-            client.respond({'error': 'Not found'}, status=404)
+            self._error(client, 'Not found', 404)
             return
         endpoint_name = path[4:]
         # Monitor endpoint: /ws/monitor/<port-name>
@@ -394,15 +393,14 @@ class HttpServerWrapper():
         endpoints = self._get_ws_endpoints()
         ws_server = endpoints.get(endpoint_name)
         if not ws_server:
-            client.respond({'error': 'Not found'}, status=404)
+            self._error(client, 'Not found', 404)
             return
         # IP filter check
         if ws_server.ip_filter:
-            client_ip = client.addr[0] if isinstance(client.addr, tuple) else None
-            if client_ip and not ws_server.ip_filter.is_allowed(client_ip):
-                self._log.info(
-                    "WebSocket rejected (IP filter): %s", client_ip)
-                client.respond({'error': 'Forbidden'}, status=403)
+            client_ip = self._client_ip(client)
+            if client_ip != '-' and not ws_server.ip_filter.is_allowed(
+                    client_ip):
+                self._error(client, 'Forbidden (IP filter)', 403)
                 return
         # Auth: per-server token, global auth, or both
         # No auth configured and no per-server token → allow
@@ -411,20 +409,17 @@ class HttpServerWrapper():
             pass  # per-server token matches
         elif self._auth and not self._auth.is_empty:
             if not token:
-                client.respond(
-                    {'error': 'Authorization required'}, status=401)
+                self._error(client, 'Authorization required', 401)
                 return
             # Try global auth first, then per-server token
             user = self._auth.authenticate(token)
             if not user and token != ws_server.token:
-                client.respond(
-                    {'error': 'Invalid or expired token'}, status=401)
+                self._error(client, 'Invalid or expired token', 401)
                 return
         elif ws_server.token:
             # No global auth, but server has token
             if token != ws_server.token:
-                client.respond(
-                    {'error': 'Authorization required'}, status=401)
+                self._error(client, 'Authorization required', 401)
                 return
         client.accept_websocket()
         self._ws_clients[client] = ws_server
@@ -439,19 +434,17 @@ class HttpServerWrapper():
                 proxy = p
                 break
         if not proxy:
-            client.respond({'error': 'Port not found'}, status=404)
+            self._error(client, 'Port not found', 404)
             return
         # Auth check (same as regular endpoints)
         token = self._get_bearer_token(client)
         if self._auth and not self._auth.is_empty:
             if not token:
-                client.respond(
-                    {'error': 'Authorization required'}, status=401)
+                self._error(client, 'Authorization required', 401)
                 return
             user = self._auth.authenticate(token)
             if not user:
-                client.respond(
-                    {'error': 'Invalid or expired token'}, status=401)
+                self._error(client, 'Invalid or expired token', 401)
                 return
         # Get or create monitor server for this port
         if port_name not in self._monitor_servers:
@@ -471,9 +464,36 @@ class HttpServerWrapper():
             return client.query.get('token')
         return None
 
+    @staticmethod
+    def _client_ip(client):
+        """The address a request came from, for the log.
+
+        Never raises and never returns something that is not an address:
+        a log line is not worth failing a request over, and `addr` is
+        absent or a stand-in often enough - in tests, and on objects
+        uhttp hands over for events that have no peer yet - that
+        checking the type is the only safe read.
+        """
+        addr = getattr(client, 'addr', None)
+        if isinstance(addr, tuple) and addr and isinstance(addr[0], str):
+            return addr[0]
+        return '-'
+
     def _error(self, client, error, status):
-        """Log warning and send error response"""
-        self._log.warning("%s", error)
+        """Send an error response, and log the one line that explains it.
+
+        Self-contained on purpose: status, method, path and address all
+        on this line. fail2ban and friends match a line at a time, so a
+        refusal that only says what went wrong - and leaves who it was
+        on the request line above - cannot be acted on.
+
+        Our own failures are louder than somebody else's typo: 5xx is an
+        ERROR, 4xx a WARNING. At the default verbosity that means the
+        log carries failures and nothing else.
+        """
+        report = self._log.error if status >= 500 else self._log.warning
+        report("%s %s %s from %s: %s", status, client.method, client.path,
+               self._client_ip(client), error)
         client.respond({'error': error}, status=status)
 
     def _require_auth(self, client):
@@ -491,9 +511,18 @@ class HttpServerWrapper():
         return user
 
     def _handle_request(self, client):
-        """Handle HTTP request"""
+        """Handle HTTP request.
+
+        Logged on arrival rather than on completion: this log is
+        interleaved with what the request goes on to do ("Port updated",
+        "Serial disconnected"), and a line written at the end would sit
+        *after* the things it caused. A success adds nothing further -
+        no error is the answer - and a failure adds one line from
+        _error().
+        """
         if self._log.isEnabledFor(_logging.INFO):
-            self._log.info("%s %s", client.method, client.path)
+            self._log.info("%s %s from %s", client.method, client.path,
+                           self._client_ip(client))
         # Login endpoint - no auth required
         if client.method == 'POST' and client.path == '/api/login':
             self._handle_api_login(client)

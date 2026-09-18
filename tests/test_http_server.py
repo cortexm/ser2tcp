@@ -51,11 +51,14 @@ class MockClient:
         self.ndjson_alive = False
 
 
-def make_wrapper(auth_config=None, serial_proxies=None, config_path=None):
+def make_wrapper(auth_config=None, serial_proxies=None, config_path=None,
+        log=None):
     """Create HttpServerWrapper with mocked uhttp server.
 
     Pass config_path to keep the cert manager inside a temporary
     directory — without it, it would fall back to ~/.config/ser2tcp.
+    Pass log to use a real logger, for tests that read what was logged
+    rather than that something was.
     """
     http_config = {'address': '127.0.0.1', 'port': 0}
     # Auth config goes at root level of configuration
@@ -69,7 +72,7 @@ def make_wrapper(auth_config=None, serial_proxies=None, config_path=None):
             configuration['session_timeout'] = auth_config['session_timeout']
     proxies = serial_proxies if serial_proxies is not None else []
     with patch('ser2tcp.http_server._uhttp_server.HttpServer'):
-        return HttpServerWrapper(http_config, proxies, log=Mock(),
+        return HttpServerWrapper(http_config, proxies, log=log or Mock(),
             config_path=config_path, configuration=configuration)
 
 
