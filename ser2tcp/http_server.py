@@ -753,6 +753,13 @@ class HttpServerWrapper():
                     srv_info = {
                         'protocol': server.protocol,
                         'endpoint': server.endpoint,
+                        # Whether there is a per-server token, never the
+                        # token. The web terminals sign in as a user and
+                        # never send it, so an endpoint that has one is
+                        # out of a browser's reach where there are no
+                        # users to sign in as - and the UI can only stop
+                        # offering the link if it is told.
+                        'token_required': bool(server.token),
                         'connections': [],
                     }
                     for con in server.connections:

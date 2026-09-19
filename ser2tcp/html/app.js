@@ -945,17 +945,26 @@ function renderServerRow(srv, portId, srvIdx, portState) {
       // Skip Terminal / Raw when the configured device isn't present —
       // clicking them would just fail to open a serial connection.
       if (portState !== 'error') {
-        const tokenParam = srv.token
-          ? '?token=' + encodeURIComponent(srv.token) : '';
-        li.appendChild(el('div', { class: 'ws-links' },
-          el('a', {
-            href: '/xterm/' + srv.endpoint + tokenParam,
-            target: '_blank', rel: 'noopener',
-          }, 'Terminal'),
-          el('a', {
-            href: '/raw/' + srv.endpoint + tokenParam,
-            target: '_blank', rel: 'noopener',
-          }, 'Raw')));
+        // The terminal pages authenticate as the signed-in user: they
+        // read the session token from localStorage and never look at
+        // the per-server token. So an endpoint that has one, on an
+        // installation with no users to sign in as, cannot be reached
+        // from the browser at all — offering the link would only lead
+        // to a 401. The per-server token is for devices.
+        if (srv.token_required && !token) {
+          li.appendChild(el('div', { class: 'server-row-detail' },
+            'no terminal — endpoint has a token and nobody to sign in as'));
+        } else {
+          li.appendChild(el('div', { class: 'ws-links' },
+            el('a', {
+              href: '/xterm/' + srv.endpoint,
+              target: '_blank', rel: 'noopener',
+            }, 'Terminal'),
+            el('a', {
+              href: '/raw/' + srv.endpoint,
+              target: '_blank', rel: 'noopener',
+            }, 'Raw')));
+        }
       }
     } else {
       li.appendChild(el('div', { class: 'server-row-detail' }, 'control only'));

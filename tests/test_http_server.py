@@ -1,5 +1,6 @@
 """Tests for HTTP server wrapper"""
 
+import json
 import os
 import shutil
 import tempfile
@@ -1348,7 +1349,7 @@ def _proxy(port=None, baudrate=None, match=None, connected=False,
 
 def _server(protocol='TCP', address='0.0.0.0', port=10001,
         endpoint=None, connections=None, control=None,
-        max_connections=0, data_enabled=True):
+        max_connections=0, data_enabled=True, token=None):
     s = Mock()
     s.protocol = protocol
     cfg = {'address': address, 'port': port}
@@ -1358,7 +1359,48 @@ def _server(protocol='TCP', address='0.0.0.0', port=10001,
     s.control = control
     s.max_connections = max_connections
     s.data_enabled = data_enabled
+    s.token = token
     return s
+
+
+class TestStatusSaysWhetherAnEndpointHasAToken(unittest.TestCase):
+    """The web terminals sign in as a user and never send the per-server
+    token, so an endpoint that has one cannot be reached from a browser
+    on an installation with no users. The UI can only stop offering the
+    link if it is told the endpoint has a token — the fact, never the
+    value.
+    """
+
+    def _servers(self, **kwargs):
+        wrapper = make_wrapper(serial_proxies=[
+            _proxy(port='/dev/ttyUSB0', servers=[
+                _server(protocol='WEBSOCKET', endpoint='dev', **kwargs)])])
+        wrapper._detect_cache = []
+        wrapper._detect_cache_at = float('inf')
+        return wrapper._build_ports_payload()[0]['servers'][0]
+
+    def test_an_endpoint_with_a_token_says_so(self):
+        self.assertTrue(self._servers(token='device-secret')['token_required'])
+
+    def test_one_without_says_so_too(self):
+        self.assertFalse(self._servers()['token_required'])
+
+    def test_the_token_itself_is_never_reported(self):
+        reported = self._servers(token='device-secret')
+        self.assertNotIn('device-secret', json.dumps(reported))
+
+    def test_and_not_anywhere_else_in_the_payload(self):
+        wrapper = make_wrapper(serial_proxies=[
+            _proxy(port='/dev/ttyUSB0', servers=[
+                _server(protocol='WEBSOCKET', endpoint='dev',
+                        token='device-secret')])])
+        wrapper._detect_cache = []
+        wrapper._detect_cache_at = float('inf')
+        # default=str so the Mocks a test proxy leaves behind do not stop
+        # the search; none of them repr as the token.
+        self.assertNotIn(
+            'device-secret',
+            json.dumps(wrapper._build_ports_payload(), default=str))
 
 
 # ===========================================================================
