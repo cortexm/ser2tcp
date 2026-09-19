@@ -318,6 +318,49 @@ clients too, and they arrive as IPv4-mapped addresses like
 `192.168.1.0/24`) apply to them; so does a rule written in the mapped
 form. Real IPv6 clients are matched against IPv6 rules as usual.
 
+#### Behind a reverse proxy
+
+Without `trusted_proxies`, every client behind nginx looks like nginx:
+the filter stops distinguishing anyone and the log names the proxy. List
+the proxy's address and `X-Forwarded-For` is used instead:
+
+```json
+{
+    "http": [{
+        "address": "127.0.0.1",
+        "port": 8080,
+        "trusted_proxies": ["127.0.0.1"],
+        "allow": ["192.168.0.0/16"]
+    }]
+}
+```
+
+- Exact addresses only — **CIDR is not accepted here**, and neither is a
+  bare string instead of a list. The list of proxies is short and known,
+  and a range would quietly widen who may claim to be someone else
+- An entry that is not an address is refused: the server keeps its place
+  in the configuration and reports the reason, rather than starting up
+  and silently going on filtering the proxy
+- The header is read **only** for connections that arrive from a listed
+  address. Anyone else could have written it themselves
+
+The client is resolved by walking the chain from the right, stopping at
+the first address that is not a listed proxy — the same rule as nginx's
+`real_ip_recursive on`. That matters with the usual nginx snippet:
+
+```nginx
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+
+which *appends*, so a client sending `X-Forwarded-For: 10.0.0.1` ends up
+with its forged entry on the left and its real address on the right.
+Reading from the left would take the forged one and let it through an
+allow list.
+
+Only HTTP and WebSocket servers have a proxy in front of them. TCP,
+TELNET and SSL servers carry no headers, so their filters always compare
+the socket address.
+
 ##### Managing certificates via web UI
 
 The web UI has a **Certificates** tab (admin only) for managing SSL

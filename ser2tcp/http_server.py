@@ -1,5 +1,6 @@
 """HTTP server integration with uhttp"""
 
+import ipaddress as _ipaddress
 import itertools as _itertools
 import json as _json
 import logging as _logging
@@ -243,10 +244,17 @@ class HttpServerWrapper():
         else:
             self._log.info("HTTP server: %s:%d", address, port)
         ip_flt = _ip_filter.create_filter(config, log=self._log)
+        # uhttp accepts an entry it cannot parse and then simply never
+        # matches it, which is safe but silent - the filter goes on
+        # seeing the proxy and nothing says why. Refuse it here instead.
+        error = self._validate_trusted_proxies(config)
+        if error:
+            raise ValueError(f"HTTP {address}:{port}: {error}")
         try:
             server = _uhttp_server.HttpServer(
                 address=address, port=port, ssl_context=ssl_context,
-                event_mode=True, selector=self._selector)
+                event_mode=True, selector=self._selector,
+                trusted_proxies=config.get('trusted_proxies'))
         except OSError as err:
             raise ValueError(
                 f"HTTP {address}:{port}: failed to bind: "
@@ -466,14 +474,23 @@ class HttpServerWrapper():
 
     @staticmethod
     def _client_ip(client):
-        """The address a request came from, for the log.
+        """Who is asking - the client, not the proxy in front of it.
+
+        uhttp resolves X-Forwarded-For for us, and only for connections
+        that arrive from a listed proxy: it walks the chain right to
+        left and stops at the first hop nobody vouched for. Taking the
+        leftmost entry instead would trust whatever the client wrote
+        there itself.
 
         Never raises and never returns something that is not an address:
-        a log line is not worth failing a request over, and `addr` is
-        absent or a stand-in often enough - in tests, and on objects
-        uhttp hands over for events that have no peer yet - that
+        a log line is not worth failing a request over, and these
+        attributes are absent or stand-ins often enough - in tests, and
+        on objects uhttp hands over for events with no peer yet - that
         checking the type is the only safe read.
         """
+        resolved = getattr(client, 'remote_address', None)
+        if isinstance(resolved, str) and resolved:
+            return resolved
         addr = getattr(client, 'addr', None)
         if isinstance(addr, tuple) and addr and isinstance(addr[0], str):
             return addr[0]
@@ -1789,6 +1806,40 @@ class HttpServerWrapper():
         client.respond({'ok': True})
 
     @staticmethod
+    def _validate_trusted_proxies(config):
+        """Check `trusted_proxies`, return an error string or None.
+
+        This list is the whole security boundary for X-Forwarded-For:
+        the header is honoured only for connections arriving from an
+        address on it. uhttp refuses a bare string and a CIDR range, but
+        an entry that is simply not an address gets through and then
+        matches nothing - so the proxy is never recognised, the header
+        is ignored, and the IP filter quietly goes on filtering the
+        proxy. That is the very failure this config exists to fix, so a
+        typo has to be loud.
+        """
+        proxies = config.get('trusted_proxies')
+        if proxies is None:
+            return None
+        if not isinstance(proxies, list):
+            return ('trusted_proxies must be a list of addresses, '
+                    f'got {type(proxies).__name__}')
+        for proxy in proxies:
+            if not isinstance(proxy, str):
+                return ('trusted_proxies entries must be strings, '
+                        f'got {type(proxy).__name__}')
+            if '/' in proxy:
+                return ('trusted_proxies matches exact addresses, CIDR is '
+                        f"not supported: '{proxy}'")
+            # Parse it the way uhttp will, so the two never disagree
+            # about which spellings are acceptable.
+            try:
+                _ipaddress.ip_address(_uhttp_server.parse_ip(proxy))
+            except ValueError:
+                return f"trusted_proxies: invalid address '{proxy}'"
+        return None
+
+    @staticmethod
     def _validate_ip_rules(config):
         """Check allow/deny with the parser the filter itself uses.
 
@@ -1825,7 +1876,8 @@ class HttpServerWrapper():
             err = self._validate_ssl_config(data['ssl'])
             if err:
                 return err
-        return self._validate_ip_rules(data)
+        return (self._validate_trusted_proxies(data)
+                or self._validate_ip_rules(data))
 
     def _validate_ssl_config(self, ssl):
         """Validate {"bundle": "...", "require_client_cert": bool} block.
