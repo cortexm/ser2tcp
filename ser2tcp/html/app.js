@@ -972,8 +972,8 @@ function renderPortCard(port, index) {
 
   // Note: signal indicators (RTS/DTR/CTS/DSR/RI/CD) used to live on the
   // card here — moved to the terminal/raw/monitor page toolbars where
-  // they're more actionable in context. Toggle still works via the
-  // PUT /api/ports/<i>/signals endpoint inside those pages.
+  // they're more actionable in context. Those pages report and toggle
+  // them over their own WebSocket, not through the API.
 
   // Monitor link — only useful when the serial proxy is actually
   // connected and producing TX/RX traffic (state === 'online'). Hidden

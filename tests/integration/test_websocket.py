@@ -152,13 +152,20 @@ class TestTheGreetingOverTheWire(WebSocketTestCase):
 
 
 class TestAttachingOverTheWire(WebSocketTestCase):
-    """Letting go of the device without closing the socket."""
+    """Letting go of the device without closing the socket.
+
+    Detaching the only client closes the port, so the answer arrives
+    alongside a `serial` frame saying it went - hence `key=`.
+    """
+
+    def detach(self, conn):
+        conn.send(json.dumps({'attach': False}))
+        return recv_json(conn, key='attach')
 
     def test_a_detached_client_stops_receiving(self):
         conn = self.ws_connect('/ws/' + ENDPOINT)
         recv_json(conn)
-        conn.send(json.dumps({'attach': False}))
-        self.assertEqual(recv_json(conn), {'attach': False})
+        self.assertEqual(self.detach(conn), {'attach': False})
         os.write(self.master_fd, b'not for you')
         conn.settimeout(1)
         with self.assertRaises(Exception):
@@ -167,10 +174,9 @@ class TestAttachingOverTheWire(WebSocketTestCase):
     def test_and_starts_again_when_it_comes_back(self):
         conn = self.ws_connect('/ws/' + ENDPOINT)
         recv_json(conn)
-        conn.send(json.dumps({'attach': False}))
-        recv_json(conn)
+        self.detach(conn)
         conn.send(json.dumps({'attach': True}))
-        self.assertEqual(recv_json(conn)['attach'], True)
+        self.assertEqual(recv_json(conn, key='attach')['attach'], True)
         os.write(self.master_fd, b'back')
         self.assertEqual(recv_binary(conn), b'back')
 
@@ -178,26 +184,24 @@ class TestAttachingOverTheWire(WebSocketTestCase):
         conn = self.ws_connect('/ws/' + ENDPOINT)
         recv_json(conn)
         self.drain_device()
-        conn.send(json.dumps({'attach': False}))
-        recv_json(conn)
+        self.detach(conn)
         conn.send_binary(b'ignored')
         self.assertEqual(read_device(self.master_fd, 7, timeout=1), b'')
 
     def test_and_it_is_told_why(self):
         conn = self.ws_connect('/ws/' + ENDPOINT)
         recv_json(conn)
-        conn.send(json.dumps({'attach': False}))
-        recv_json(conn)
+        self.detach(conn)
         conn.send_binary(b'ignored')
-        self.assertEqual(recv_json(conn)['error']['request'], 'data')
+        self.assertEqual(
+            recv_json(conn, key='error')['error']['request'], 'data')
 
     def test_the_port_closes_when_the_last_client_detaches(self):
         """The whole point: the socket stays, the device does not."""
         conn = self.ws_connect('/ws/' + ENDPOINT)
         recv_json(conn)
         self.assertTrue(self.serial_connected())
-        conn.send(json.dumps({'attach': False}))
-        recv_json(conn)
+        self.detach(conn)
         self.wait_for_serial(connected=False)
 
 

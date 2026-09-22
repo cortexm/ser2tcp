@@ -198,6 +198,9 @@ class SerialProxy():
         self._last_reopen = 0
         # Whether the last failed open has already been reported.
         self._open_warned = False
+        # The last device state the clients were told about; nothing is
+        # open yet, so that is what they would say if asked.
+        self._announced_connected = False
         self._write_progress_at = _time.time()
         self._certs_dir = certs_dir
         self._selector = selector
@@ -469,7 +472,27 @@ class SerialProxy():
             self._open_warned = False
             self._start_reader_thread_if_needed()
             self._register_serial()
+            self._announce_serial(True)
         return True
+
+    def _announce_serial(self, connected, reason=None):
+        """Tell everyone the device appeared or went away.
+
+        Every transition, not every call: the port opens whenever
+        somebody attaches and closes when the last of them lets go, so
+        a client watching this port - a monitor, or one that detached
+        but stayed - learns about it either way. Announcing what was
+        already announced would just repeat itself.
+        """
+        if connected == self._announced_connected:
+            return
+        self._announced_connected = connected
+        for server in self._servers:
+            if connected:
+                server.on_serial_found()
+            else:
+                server.on_serial_lost(reason)
+        self._notify_monitor_serial(connected, reason)
 
     def _cannot_open(self, err):
         """Report a failed open, once per absence.
@@ -512,7 +535,7 @@ class SerialProxy():
         if self._serial and not self.has_connections():
             self._close_device()
 
-    def _close_device(self):
+    def _close_device(self, reason=None):
         """Let go of the device, whoever is still waiting for it.
 
         disconnect() asks first; after an I/O error there is nothing
@@ -521,6 +544,9 @@ class SerialProxy():
         """
         if not self._serial:
             return
+        # Before the port goes: a socket server answers this by closing
+        # its clients, which is tidier while everything is still up.
+        self._announce_serial(False, reason)
         # Must come first: the selector cannot unregister a source
         # whose fileno() has already gone away.
         self._unregister_serial()
@@ -590,17 +616,14 @@ class SerialProxy():
             self._serial_failed()
 
     def _serial_failed(self, reason='device disappeared'):
-        """Close the port after an I/O error and say so.
+        """Close the port after an I/O error and say why.
 
         Each server decides what that means for its clients. A socket
         protocol drops them, because holding one open on a port that
         is gone only feeds it silence; a WebSocket client has a channel
         to be told on, so it keeps its socket and waits.
         """
-        for server in self._servers:
-            server.on_serial_lost(reason)
-        self._notify_monitor_serial(False, reason)
-        self._close_device()
+        self._close_device(reason)
 
     def _reopen(self):
         """Try the device again while somebody is waiting for it.
@@ -608,17 +631,13 @@ class SerialProxy():
         Reopening used to need no code of its own: losing the port
         dropped every client, and the port came back when they
         reconnected. A WebSocket client that stays is the thing that
-        has to be waited for instead.
+        has to be waited for instead. connect() does the announcing.
         """
         now = _time.time()
         if now - self._last_reopen < self.REOPEN_INTERVAL:
             return
         self._last_reopen = now
-        if not self.connect():
-            return
-        for server in self._servers:
-            server.on_serial_found()
-        self._notify_monitor_serial(True)
+        self.connect()
 
     def handle_event(self, fileobj, mask):
         """Owner dispatch for the serial source"""

@@ -54,6 +54,11 @@ class ServerWebSocket():
         # Clients already told their data is going nowhere. One answer
         # per reason is enough - see _refuse_write().
         self._write_refused = set()
+        # Clients that have had their opening frame. Attaching can open
+        # the port, and opening it is announced to everybody - so
+        # without this a joining client's first frame could be that
+        # announcement rather than the greeting that explains it.
+        self._greeted = set()
         # The signal states every connection has been given, so a
         # report can carry the difference instead of the whole set.
         self._reported = None
@@ -265,6 +270,7 @@ class ServerWebSocket():
             self.detach(client)
             self._connections.remove(client)
             self._write_refused.discard(client)
+            self._greeted.discard(client)
             if not self._connections:
                 # Nobody left to hold a difference against.
                 self._reported = None
@@ -404,12 +410,33 @@ class ServerWebSocket():
         # Whatever the lines read says nothing about the device that
         # comes back, so the next report is a full set again.
         self._reported = None
-        self._broadcast_json(
-            {'serial': {'connected': False, 'reason': reason}})
+        state = {'connected': False}
+        if reason:
+            # Absent rather than null when the port was simply let go
+            # of: there is no failure to explain.
+            state['reason'] = reason
+        self._broadcast_json({'serial': state})
 
     def on_serial_found(self):
-        """The device is back"""
-        self._broadcast_json({'serial': {'connected': True}})
+        """The device is back, and here is what its lines read.
+
+        The report has to ride along: the poll only speaks up when
+        something changes, so a client whose signals were dropped when
+        the device went would wait for an edge that may never come.
+        """
+        msg = {'serial': {'connected': True}}
+        signals = self._current_signals()
+        if signals:
+            msg['signals'] = signals
+            self._reported = signals
+        self._broadcast_json(msg)
+
+    def _current_signals(self):
+        """The reported lines as they read now, or nothing if the
+        device is not open to be read"""
+        if not self._serial.is_connected:
+            return {}
+        return self._signals_dict(self._serial.get_signals())
 
     def send_signal_report(self, bitmask):
         """Report the lines that moved, to every connection.
@@ -443,6 +470,7 @@ class ServerWebSocket():
         # would have has_connections() vouch for clients that are gone.
         self._attached.clear()
         self._write_refused.clear()
+        self._greeted.clear()
         # Nobody has been told anything, so the next report is a full
         # set rather than a difference from what the last lot knew.
         self._reported = None
@@ -466,7 +494,9 @@ class ServerWebSocket():
             'serial': {'connected': bool(self._serial.is_connected)},
             'attach': client in self._attached,
         }
-        signals = self._signals_dict(self._serial.get_signals())
+        # Nothing to read off a device that is not open, and all-low
+        # badges for one that is gone are a lie with a tidy face.
+        signals = self._current_signals()
         if signals:
             # No key at all means nothing is reported, so a client
             # knows to show no indicators rather than six dead ones.
@@ -478,6 +508,7 @@ class ServerWebSocket():
                 # move this - the state may have changed since the last
                 # broadcast, and the others have not heard about it.
                 self._reported = signals
+        self._greeted.add(client)
         self._send_json(client, msg)
 
     def _capabilities(self):
@@ -510,9 +541,13 @@ class ServerWebSocket():
             self.remove_connection(client)
 
     def _broadcast_json(self, msg):
-        """Send one text frame to every connection"""
+        """Send one text frame to every client that has been greeted"""
         text = _json.dumps(msg)
         for client in list(self._connections):
+            if client not in self._greeted:
+                # Still joining: its greeting states all of this, and
+                # arriving first it would have nothing to change.
+                continue
             try:
                 client.ws_send(text)
             except OSError:

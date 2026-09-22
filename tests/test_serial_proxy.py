@@ -27,6 +27,9 @@ def _mock_init(self, config=None, log=None):
     self._out_buffer = bytearray()
     self._read_paused = False
     self._last_drop_warning = 0
+    self._last_reopen = 0
+    self._open_warned = False
+    self._announced_connected = False
 
 
 def _make_port_info(device, vid=None, pid=None, serial_number=None,
@@ -547,9 +550,10 @@ class TestSerialErrorsAreContained(unittest.TestCase):
         proxy._servers = [server]
         proxy._close_device = MagicMock()
         proxy.send(b'data')  # must not raise
-        # What that means for the clients is the server's to decide.
-        server.on_serial_lost.assert_called_once()
+        # Closing the device is what announces it; the reason travels
+        # with it, so a client can be told more than "it is gone".
         proxy._close_device.assert_called_once()
+        self.assertTrue(proxy._close_device.call_args[0][0])
 
     def test_successful_write_notifies_monitors(self):
         """And names whoever asked for it, so a monitor can say who."""

@@ -98,11 +98,20 @@ document.title = 'ser2tcp raw \u2014 ' + endpoint;
 
 let ws = null;
 let pingInterval = null;
-// Distinguishes "device unavailable / proxy refused" from "was connected,
-// link dropped" on close — feeds the right-side status text only; the
-// left-side endpoint name color is driven by the authoritative server-
-// reported port state via the filtered status stream.
+// Distinguishes "device unavailable / proxy refused" from "was
+// connected, link dropped" on close.
 let wsEverOpened = false;
+// Everything the page knows, all of it from the WebSocket. It used to
+// need a second connection - a filtered NDJSON status stream with its
+// own authentication - for the signal bar and the port state, and that
+// one retried every 2 s for ever and in silence once a session expired.
+let wsState = 'offline';
+let serialConnected = null;
+let signals = null;
+// Which lines this client may set, as the server worked it out. The bar
+// used to offer RTS and DTR wherever they were reported, including
+// where the server drops the request without a word.
+let settable = [];
 
 function connect() {
   if (ws) return;
@@ -125,23 +134,60 @@ function connect() {
   ws.onclose = ev => {
     ws = null;
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    // What we were told describes a connection we no longer have;
+    // stale badges are worse than none.
+    serialConnected = null;
+    signals = null;
+    settable = [];
+    renderSignals();
     if (wsEverOpened) {
       setStatus('offline');
       appendInfo('Disconnected (code: ' + ev.code + ')');
     } else {
       setStatus('error');
-      appendInfo('Cannot open connection (device unavailable?)');
+      appendInfo('Cannot open connection');
     }
   };
   ws.onmessage = ev => {
-    if (typeof ev.data === 'string') {
-      // Server still sends signal frames over WS (legacy path); we ignore
-      // them in favor of the server-authoritative status stream below,
-      // which works even when this WS is closed.
-      return;
-    }
+    if (typeof ev.data === 'string') return applyMessage(ev.data);
     appendData(new Uint8Array(ev.data), 'rx');
   };
+}
+
+// A text frame is one JSON object whose top-level keys are topics; a
+// frame may carry several, and unknown ones are ignored.
+function applyMessage(text) {
+  let msg;
+  try { msg = JSON.parse(text); } catch { return; }
+  if (msg.port) {
+    $('endpoint-name').title = [msg.port.device, msg.port.baudrate]
+      .filter(Boolean).join(' @ ');
+  }
+  if (msg.can) { settable = msg.can.signals || []; renderSignals(); }
+  if (msg.serial) {
+    const was = serialConnected;
+    serialConnected = !!msg.serial.connected;
+    // Only a change is news. The opening frame states the device
+    // state, and a client attaching can be told the port opened in
+    // the same breath - saying it twice reads like it happened twice.
+    if (was !== serialConnected) appendInfo(serialConnected
+      ? 'Device connected'
+      : 'Device disconnected' + (msg.serial.reason
+        ? ' (' + msg.serial.reason + ')' : ''));
+    // The lines say nothing about a device that is gone; the frame
+    // that says it came back brings their state with it.
+    if (!serialConnected) { signals = null; renderSignals(); }
+    applyPortState();
+  }
+  if (msg.signals) {
+    signals = Object.assign({}, signals, msg.signals);
+    renderSignals();
+  }
+  if (msg.error) {
+    appendInfo('Refused: '
+      + (msg.error.request ? msg.error.request + ': ' : '')
+      + msg.error.reason);
+  }
 }
 
 function disconnect() {
@@ -149,44 +195,10 @@ function disconnect() {
   if (ws) { ws.close(); ws = null; setStatus('offline'); }
 }
 
-// Whether the status stream is actually delivering: 'connecting' until
-// the first response, 'live' while it runs, 'down' once it fails.
-// Without it the page keeps showing the last thing it heard - a green
-// endpoint, lit signal badges, an inviting Connect button - after the
-// server it heard it from has gone away. Declared here because
-// setStatus() runs before the stream section is reached.
-let streamState = 'connecting';
-// Last state of this view's own WebSocket, so the button can be
-// re-evaluated when either side of the picture changes.
-let wsState = 'offline';
-// Latest port payload from the status stream. Declared up here with the
-// rest of the view state because updateConnectButton() reads it and runs
-// before the stream section is reached.
-let portCache = null;
-
-// Why connecting is impossible right now, or null when it is not.
-// Both the status text and the button ask this, so the page never says
-// "Disconnected" - true but useless - when the real answer is that
-// there is nothing on the other end to connect to. Two ways that
-// happens: the server is gone, or the server is there and says the
-// device is not.
-function blockedReason() {
-  if (streamState === 'down') {
-    return { short: 'No server', long: 'Server unreachable' };
-  }
-  if (portCache && portCache.state === 'error') {
-    return { short: 'No device', long: 'Device not connected' };
-  }
-  return null;
-}
-
-// setStatus records this view's WS subscription; the text beside it
-// shows that, or the blocking reason when there is one. Endpoint-name
-// color is driven by the server-reported port.state via
-// applyPortState().
 function setStatus(state) {
   wsState = state;
   updateStatus();
+  applyPortState();
 }
 
 function updateStatus() {
@@ -196,60 +208,75 @@ function updateStatus() {
     offline: 'Disconnected',
     error: 'Unavailable',
   };
-  // A live connection is its own answer; only explain an absence.
-  const blocked = wsState === 'online' ? null : blockedReason();
   const status = $('status');
-  status.textContent = blocked ? blocked.short
-    : (labels[wsState] || wsState);
-  status.title = blocked ? blocked.long : '';
+  // A live connection is its own answer; only explain an absence - and
+  // "Disconnected" is true but useless when the real answer is that
+  // there is nothing on the other end.
+  const blocked = wsState === 'online' && serialConnected === false;
+  status.textContent = blocked ? 'No device' : (labels[wsState] || wsState);
+  status.title = blocked ? 'Device not connected' : '';
   updateConnectButton();
 }
 
 function updateConnectButton() {
   const btn = $('btn-connect');
   if (wsState === 'online') {
-    // Disconnecting stays available whatever the server is doing -
-    // it only closes a socket on this side.
     btn.textContent = 'Disconnect';
     btn.className = 'btn-disconnect';
     btn.onclick = disconnect;
-    btn.disabled = false;
-    btn.title = '';
-    return;
+  } else {
+    btn.textContent = 'Connect';
+    btn.className = 'btn-connect';
+    btn.onclick = connect;
   }
-  btn.textContent = 'Connect';
-  btn.className = 'btn-connect';
-  btn.onclick = connect;
-  // Offering a click that can only fail is the same lie as a green
-  // endpoint.
-  const blocked = blockedReason();
-  btn.disabled = !!blocked;
-  btn.title = blocked ? blocked.long : '';
+  // Connecting is always worth a try now: a device that is not there
+  // is something the server tells us about and keeps retrying, not a
+  // reason to refuse the click.
+  btn.disabled = false;
+  btn.title = '';
 }
 
-// Server-driven signal bar. Renders from portCache.signals (populated by
-// the filtered status stream below). RTS/DTR remain clickable to toggle —
-// the click goes out via WS as a JSON control frame.
+function applyPortState() {
+  // Whether the port itself is healthy, which is not the same question
+  // as whether this view is subscribed. Nothing heard means we cannot
+  // vouch for it either way.
+  const state = wsState !== 'online' ? 'offline'
+    : serialConnected === null ? 'offline'
+      : serialConnected ? 'online' : 'error';
+  const ep = $('endpoint-name');
+  ep.classList.remove('endpoint-online', 'endpoint-offline', 'endpoint-error');
+  ep.classList.add(
+    state === 'online' ? 'endpoint-online'
+      : state === 'error' ? 'endpoint-error'
+      : 'endpoint-offline');
+  updateStatus();
+}
+
 function renderSignals() {
   const bar = $('signal-bar');
-  const sig = (portCache && portCache.signals) || {};
-  const names = Object.keys(sig);
+  const names = signals ? Object.keys(signals) : [];
+  // Nothing reported means this endpoint is not set up to report
+  // signals; a row of dead badges would say less than no row.
   if (!names.length) { bar.classList.add('hidden'); return; }
   bar.classList.remove('hidden');
   bar.innerHTML = '';
   names.forEach(name => {
-    const on = sig[name];
-    const clickable = name === 'rts' || name === 'dtr';
+    const on = signals[name];
+    // Clickable only where the server said this client may set it, and
+    // only while there is a connection to say it on. A badge that
+    // promises "click to toggle" and is silently dropped is worse than
+    // one that does not.
+    const clickable = settable.includes(name)
+      && ws && ws.readyState === WebSocket.OPEN;
     const badge = document.createElement('span');
     badge.textContent = name.toUpperCase();
     badge.className = 'signal-badge ' + (on ? 'signal-on' : 'signal-off')
       + (clickable ? ' signal-click' : '');
+    badge.title = name.toUpperCase()
+      + (clickable ? ': click to toggle' : ': read-only here');
     if (clickable) {
-      badge.title = name.toUpperCase() + ': click to toggle';
-      badge.onclick = () => {
-        if (ws && ws.readyState === WebSocket.OPEN)
-          ws.send(JSON.stringify({[name]: !on}));
-      };
+      badge.onclick = () => ws.send(
+        JSON.stringify({signals: {[name]: !on}}));
     }
     bar.appendChild(badge);
   });
@@ -329,82 +356,6 @@ updateStatus();
 $('input').focus();
 if (endpoint) connect();
 
-// --- Filtered status stream — server-authoritative port state + signals --
-
-function applyPortState() {
-  // Endpoint-name color reflects the actual port on the server, not our
-  // WS subscription. Right-side status text still tracks our WS state.
-  // A dead stream means we cannot vouch for anything: say so rather
-  // than leaving the last known state on screen looking current.
-  const state = streamState === 'down' ? 'error'
-    : (portCache && portCache.state) || 'offline';
-  const ep = $('endpoint-name');
-  ep.classList.remove('endpoint-online', 'endpoint-offline', 'endpoint-error');
-  ep.classList.add(
-    state === 'online' ? 'endpoint-online'
-      : state === 'error' ? 'endpoint-error'
-      : 'endpoint-offline');
-  ep.title = streamState === 'down'
-    ? 'Server unreachable' : 'Port state: ' + state;
-  updateStatus();
-}
-
-function applyStatusLine(line) {
-  if (Object.keys(line).length === 0) return; // heartbeat
-  if (line.port !== undefined) {
-    portCache = line.port ? Object.assign({}, line.port) : null;
-  } else if (line._removed) {
-    portCache = null;
-  } else if (line._delta && portCache) {
-    for (const [k, v] of Object.entries(line)) {
-      if (k === '_delta') continue;
-      if (v === null) delete portCache[k];
-      else portCache[k] = v;
-    }
-  } else {
-    return;
-  }
-  renderSignals();
-  applyPortState();
-}
-
-function startStatusStream() {
-  const headers = {};
-  if (token) headers['Authorization'] = 'Bearer ' + token;
-  const url = '/api/status?stream=1&endpoint=' + encodeURIComponent(endpoint);
-  fetch(url, { headers, cache: 'no-store' })
-    .then(async resp => {
-      if (!resp.ok || !resp.body) throw new Error('stream HTTP ' + resp.status);
-      streamState = 'live';
-      applyPortState();
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (!line.trim()) continue;
-          try { applyStatusLine(JSON.parse(line)); } catch {}
-        }
-      }
-      throw new Error('stream closed');
-    })
-    .catch(() => {
-      // Drop what we were told: it describes a server we can no longer
-      // reach, and stale signal badges are worse than none.
-      streamState = 'down';
-      portCache = null;
-      renderSignals();
-      applyPortState();
-      setTimeout(startStatusStream, 2000);
-    });
-}
-startStatusStream();
 </script>
 </body>
 </html>

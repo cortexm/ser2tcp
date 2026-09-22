@@ -90,10 +90,27 @@ class ServerMonitor():
         state = {'connected': bool(connected)}
         if reason and not connected:
             state['reason'] = reason
-        if not connected:
+        msg = {'serial': state}
+        if connected:
+            # The report has to ride along: the poll only speaks up on
+            # a change, so a watcher whose signals were dropped when
+            # the device went would wait for an edge that may not come.
+            signals = self._current_signals()
+            if signals:
+                msg['signals'] = signals
+                self._reported = signals
+        else:
             # The lines say nothing about a device that is gone.
             self._reported = None
-        self._broadcast_json({'serial': state})
+        self._broadcast_json(msg)
+
+    def _current_signals(self):
+        """The reported lines as they read now, or nothing if the
+        device is not open to be read"""
+        if not self._serial.is_connected:
+            return {}
+        return _control.signals_dict(
+            self._serial.get_signals(), self._reported_signals())
 
     def on_signals(self, bitmask):
         """Report the lines that moved, like an endpoint does"""
@@ -257,10 +274,10 @@ class ServerMonitor():
             'serial': {'connected': bool(self._serial.is_connected)},
             'peers': self._peer_list(),
         }
-        names = self._reported_signals()
-        if names:
-            signals = _control.signals_dict(
-                self._serial.get_signals(), names)
+        # Nothing to read off a device that is not open, and all-low
+        # badges for one that is gone are a lie with a tidy face.
+        signals = self._current_signals()
+        if signals:
             msg['signals'] = signals
             if self._reported is None:
                 self._reported = signals

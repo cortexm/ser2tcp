@@ -46,6 +46,7 @@ def _proxy():
     proxy._last_drop_warning = 0
     proxy._last_reopen = 0
     proxy._open_warned = False
+    proxy._announced_connected = True
     return proxy
 
 
@@ -116,6 +117,24 @@ class TestTellingAWebSocketClient(WebSocketDeviceTestCase):
         self.server.on_serial_found()
         self.assertEqual(_last(client), {'serial': {'connected': True}})
 
+    def test_and_what_the_lines_read_now(self):
+        """The poll only speaks up on a change, so a client whose
+        signals were dropped would wait for an edge that may not come.
+        """
+        server = ServerWebSocket(
+            {'protocol': 'websocket', 'endpoint': 'x',
+             'control': {'signals': ['rts']}},
+            self.serial, log=Mock())
+        client = _client()
+        server.add_connection(client)
+        server.on_serial_lost('gone')
+        self.serial.get_signals.return_value = 0b01
+        client.ws_send.reset_mock()
+        server.on_serial_found()
+        self.assertEqual(
+            _last(client),
+            {'serial': {'connected': True}, 'signals': {'rts': True}})
+
     def test_a_detached_client_hears_it_too(self):
         client = self.join()
         self.server.detach(client)
@@ -161,6 +180,17 @@ class TestConnectingWhileTheDeviceIsAway(WebSocketDeviceTestCase):
         self.assertEqual(
             _frames(client)[0]['serial'], {'connected': False})
 
+    def test_and_no_signal_state_is_invented_for_it(self):
+        """get_signals() answers 0 on a closed port; a row of all-low
+        badges is a lie with a tidy face."""
+        server = ServerWebSocket(
+            {'protocol': 'websocket', 'endpoint': 'x',
+             'control': {'signals': ['rts']}},
+            self.serial, log=Mock())
+        client = _client()
+        server.add_connection(client)
+        self.assertNotIn('signals', _frames(client)[0])
+
     def test_and_counts_as_wanting_it(self):
         """Somebody has to be waiting, or nothing reopens the port."""
         client = _client()
@@ -201,16 +231,6 @@ class TestReopeningThePort(unittest.TestCase):
         self.proxy.process_stale()
         self.proxy.connect.assert_not_called()
 
-    def test_the_servers_are_told_when_it_works(self):
-        self.proxy.connect = Mock(return_value=True)
-        self.proxy.process_stale()
-        self.server.on_serial_found.assert_called_once()
-
-    def test_and_not_when_it_does_not(self):
-        self.proxy.connect = Mock(return_value=False)
-        self.proxy.process_stale()
-        self.server.on_serial_found.assert_not_called()
-
     def test_it_is_not_tried_on_every_pass(self):
         """The loop turns over many times a second; a device that is
         unplugged is not going to be back by the next one."""
@@ -218,6 +238,52 @@ class TestReopeningThePort(unittest.TestCase):
         self.proxy.process_stale()
         self.proxy.process_stale()
         self.proxy.connect.assert_called_once()
+
+
+class TestAnnouncingTheTransition(unittest.TestCase):
+    """Every change of state, not every call.
+
+    The port opens whenever somebody attaches and closes when the last
+    of them lets go, so a client watching it - a monitor, or one that
+    detached but stayed - has to hear about both.
+    """
+
+    def setUp(self):
+        self.proxy = _proxy()
+        self.server = Mock()
+        self.proxy._servers = [self.server]
+        self.monitor = Mock()
+        self.proxy._monitors = [self.monitor]
+
+    def _open(self):
+        self.proxy._serial = None
+        self.proxy._register_serial = Mock()
+        self.proxy._start_reader_thread_if_needed = Mock()
+        with unittest.mock.patch('ser2tcp.serial_proxy._serial.Serial'):
+            return self.proxy.connect()
+
+    def test_opening_the_port_is_announced(self):
+        self.proxy._announced_connected = False
+        self._open()
+        self.server.on_serial_found.assert_called_once()
+        self.monitor.on_serial.assert_called_once_with(True, None)
+
+    def test_closing_it_is_announced_with_the_reason(self):
+        self.proxy._close_device('device disappeared')
+        self.server.on_serial_lost.assert_called_once_with(
+            'device disappeared')
+
+    def test_letting_go_of_it_is_announced_too(self):
+        """Nobody attached any more is as real an absence as an
+        unplugged cable, and a watcher has to see it."""
+        self.proxy._close_device()
+        self.server.on_serial_lost.assert_called_once_with(None)
+
+    def test_the_same_state_is_not_announced_twice(self):
+        self._open()
+        self.server.on_serial_found.reset_mock()
+        self._open()
+        self.server.on_serial_found.assert_not_called()
 
 
 class TestNotSayingItTwice(unittest.TestCase):

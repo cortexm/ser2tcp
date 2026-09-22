@@ -104,6 +104,9 @@ let pingInterval = null;
 // Who wrote the run currently being appended, so a change of writer
 // starts a new line. null = nothing written yet.
 let lastSource = null;
+// Whether the output already ends on a line break, so a change of
+// writer right after one does not leave a blank line behind.
+let atLineStart = true;
 // Tracks whether the current WS attempt actually reached the OPEN state.
 // On close we use this to distinguish "device unavailable / proxy refused"
 // (red dot) from "was connected, link dropped" (gray dot).
@@ -167,8 +170,15 @@ function applyMessage(text) {
   let msg;
   try { msg = JSON.parse(text); } catch { return; }
   if (msg.serial) {
+    const was = serialConnected;
     serialConnected = !!msg.serial.connected;
-    appendInfo(serialConnected ? 'Device connected' : 'Device disconnected');
+    // Only a change is news; the opening frame states the device
+    // state, and repeating it reads like it happened twice.
+    if (was !== serialConnected) appendInfo(
+      serialConnected ? 'Device connected' : 'Device disconnected');
+    // The lines say nothing about a device that is gone; the frame
+    // that says it came back brings their state with it.
+    if (!serialConnected) { signals = null; renderSignals(); }
     applyPortState();
   }
   if (msg.signals) {
@@ -293,8 +303,9 @@ function appendData(data, slot) {
   const out = $('output');
   const color = sourceColor(slot);
   const newRun = lastSource !== slot;
-  if (newRun && lastSource !== null) {
+  if (newRun && !atLineStart) {
     out.appendChild(document.createElement('br'));
+    atLineStart = true;
   }
   let text = newRun && $('show-source').checked ? sourceLabel(slot) : '';
   lastSource = slot;
@@ -305,8 +316,12 @@ function appendData(data, slot) {
       span.textContent = text;
       out.appendChild(span);
       text = '';
+      atLineStart = false;
     }
-    if (breakAfter) out.appendChild(document.createElement('br'));
+    if (breakAfter) {
+      out.appendChild(document.createElement('br'));
+      atLineStart = true;
+    }
   };
   for (let i = 0; i < data.length; i++) {
     const b = data[i];
@@ -340,12 +355,17 @@ function appendInfo(msg) {
   span.textContent = '--- ' + msg + ' ---\n';
   out.appendChild(span);
   lastSource = null;
+  atLineStart = true;     // the text above ends on one
   if ($('auto-scroll').checked) {
     out.scrollTop = out.scrollHeight;
   }
 }
 
-$('btn-clear').onclick = () => { $('output').innerHTML = ''; lastSource = null; };
+$('btn-clear').onclick = () => {
+  $('output').innerHTML = '';
+  lastSource = null;
+  atLineStart = true;
+};
 updateStatus();
 if (portName) connect();
 </script>

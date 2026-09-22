@@ -105,6 +105,16 @@ a device that is gone is discarded.
 {"serial": {"connected": true}}
 ```
 
+A frame saying the device came back carries `signals` alongside it, so
+the lines do not have to be waited for: reports only arrive on a change,
+and the first one after a reconnect may be a long way off.
+
+`reason` is there only when something went wrong. The port is also
+opened when the first client attaches and closed when the last one lets
+go, and both are reported the same way — so a client that detached but
+stayed, and anything watching the monitor, sees the device come and go
+with the people using it.
+
 Clients on TCP, TELNET, SSL and Unix sockets are disconnected instead,
 because those protocols have no channel to be told on. The monitor sees
 that as a peer disconnecting.
@@ -212,6 +222,11 @@ never has to send anything. Detaching keeps the WebSocket open and the
 `serial`, `signals` and `error` frames coming — it only gives up the
 data and the claim on the port. The server confirms with `{"attach":
 false}`, and the port closes if nobody else holds it.
+
+That close is itself a `serial` frame, and it comes **before** the
+confirmation, because it happened first. Match an answer by the key you
+asked about rather than assuming the next frame is it — the rule that
+applies to every frame here.
 
 For compatibility with earlier versions, `{"rts": true}` and
 `{"dtr": false}` are still accepted at the top level.
