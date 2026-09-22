@@ -85,6 +85,10 @@ class ServerMonitor():
             else self._slots.get(source, self.OVERFLOW)
         self._broadcast(bytes([slot]) + data)
 
+    def on_port_changed(self, info):
+        """Something about the port itself moved - re-send all of it"""
+        self._broadcast_json({'port': info})
+
     def on_serial(self, connected, reason=None):
         """The device went away, or came back"""
         state = {'connected': bool(connected)}

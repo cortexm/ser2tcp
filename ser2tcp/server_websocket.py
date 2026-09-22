@@ -400,6 +400,14 @@ class ServerWebSocket():
             except OSError:
                 self.remove_connection(client)
 
+    def on_port_changed(self, info):
+        """Something about the port itself moved - re-send all of it.
+
+        The topic is small and always complete, so a client replaces
+        what it holds instead of merging a partial object into it.
+        """
+        self._broadcast_json({'port': info})
+
     def on_serial_lost(self, reason):
         """The device went away; say so and keep everybody.
 

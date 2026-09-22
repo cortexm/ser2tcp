@@ -129,9 +129,10 @@ class TestDescribingThePort(unittest.TestCase):
     """One reader for both greetings, so an endpoint and a monitor
     describe the same port the same way."""
 
-    def _info(self, **config):
+    def _info(self, state='offline', **config):
         proxy = Mock()
         proxy.name = 'esp32'
+        proxy.state = state
         proxy.serial_config = config
         return port_info(proxy)
 
@@ -143,6 +144,41 @@ class TestDescribingThePort(unittest.TestCase):
     def test_a_port_found_by_usb_match_has_no_device_yet(self):
         """Resolved at connect time, so it can still be unknown."""
         self.assertIsNone(self._info(baudrate=9600)['device'])
+
+    def test_it_carries_how_the_port_is_doing(self):
+        """What a page colours the port's name by. Three states, not
+        two: "the device is unplugged" and "the device is there and
+        nobody has opened it" look the same to `serial.connected` and
+        are not the same thing at all."""
+        self.assertEqual(self._info(state='error')['state'], 'error')
+
+    def test_and_is_always_complete(self):
+        """The topic is re-sent whole when any of it changes, so a
+        client replaces what it holds instead of merging into it."""
+        self.assertEqual(
+            sorted(self._info()), ['baudrate', 'device', 'name', 'state'])
+
+
+class TestReportingTheState(WsTestCase):
+    """The port state is worked out by the HTTP wrapper, which has the
+    USB enumeration, and handed to the proxy to pass on."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = self.join()
+        self.client.ws_send.reset_mock()
+
+    def test_a_change_re_sends_the_whole_topic(self):
+        self.server.on_port_changed(
+            {'name': 'x', 'device': '/dev/y', 'baudrate': 9600,
+             'state': 'error'})
+        self.assertEqual(_last(self.client)['port']['state'], 'error')
+
+    def test_a_detached_client_hears_it_too(self):
+        self.server.detach(self.client)
+        self.client.ws_send.reset_mock()
+        self.server.on_port_changed({'state': 'online'})
+        self.assertIn('port', _last(self.client))
 
 
 class TestWhatThisClientMayDo(WsTestCase):

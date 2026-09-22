@@ -371,6 +371,19 @@ class HttpServerWrapper():
             self._ws_clients.pop(client, None)
         monitor.port_gone()
 
+    def refresh_port_states(self):
+        """Keep the port state current for WebSocket clients.
+
+        _broadcast_status() works it out already, but only while an
+        NDJSON client is listening - and a monitor open on its own is
+        nobody's status stream. Telling "unplugged" from "there but not
+        opened" needs the USB enumeration, which is cached for a second,
+        so asking every pass costs one read of it.
+        """
+        detected = self._build_detected_payload()
+        for proxy in self._serial_proxies:
+            proxy.set_state(self._compute_port_state(proxy, detected))
+
     def ping_websockets(self):
         """Keep live WebSockets from ageing out as if they were idle.
 
@@ -404,6 +417,8 @@ class HttpServerWrapper():
             server.maintenance()
         if self._auth:
             self._auth.cleanup()
+        if self._ws_clients:
+            self.refresh_port_states()
         self.ping_websockets()
         for monitor in list(self._monitor_servers.values()):
             monitor.process_stale()
@@ -469,6 +484,10 @@ class HttpServerWrapper():
                 self._error(client, 'Authorization required', 401)
                 return
         client.accept_websocket()
+        # Before the greeting, which carries the port state: with no
+        # WebSocket client until now, nothing has been keeping it up to
+        # date.
+        self.refresh_port_states()
         self._ws_clients[client] = ws_server
         ws_server.add_connection(client)
 
@@ -499,6 +518,7 @@ class HttpServerWrapper():
                 proxy, log=self._log)
         monitor = self._monitor_servers[port_name]
         client.accept_websocket()
+        self.refresh_port_states()
         self._ws_clients[client] = monitor
         monitor.add_connection(client)
 
@@ -842,7 +862,11 @@ class HttpServerWrapper():
                     bit = _control.SIGNAL_BITS[name]
                     signals[name] = bool(bitmask & (1 << bit))
                 port_info['signals'] = signals
-            port_info['state'] = self._compute_port_state(proxy, detected)
+            state = self._compute_port_state(proxy, detected)
+            # Handed back so everything that describes this port - the
+            # WebSocket `port` topic included - reads one answer.
+            proxy.set_state(state)
+            port_info['state'] = state
             if proxy.error:
                 # A port that never started. Say why, where the person
                 # who has to fix it will see it.

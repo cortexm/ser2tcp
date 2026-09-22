@@ -18,9 +18,16 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
   font-weight: 600;
   transition: color 0.15s;
 }
+/* What the name's colour means, and it is the port it describes, not
+   this page's subscription:
+     green  — open, data moving
+     blue   — the device is there, nobody has opened it
+     red    — the configured device is missing
+     grey   — no WebSocket, so we cannot vouch for any of the above */
 .toolbar .endpoint.endpoint-online  { color: #4c4; }
 .toolbar .endpoint.endpoint-offline { color: #7dd3fc; }
 .toolbar .endpoint.endpoint-error   { color: #e55; }
+.toolbar .endpoint.endpoint-down    { color: #777; }
 .toolbar button { padding: 0.3em 0.8em; border: 1px solid #555;
   border-radius: 4px; cursor: pointer; font-size: 0.85em;
   background: #383838; color: #ccc; }
@@ -87,6 +94,11 @@ let wantConnected = false;
 // one retried every 2 s for ever and in silence once a session expired.
 let wsState = 'offline';
 let serialConnected = null;
+// The port itself, as the server reports it: online / offline / error.
+// Not the same question as whether this page has a WebSocket, which is
+// why losing one greys the name rather than colouring it.
+let portState = null;
+let portDevice = '';
 let signals = null;
 // Which lines this client may set, as the server worked it out. The bar
 // used to offer RTS and DTR wherever they were reported, including
@@ -136,6 +148,7 @@ function connect() {
     // What we were told describes a connection we no longer have;
     // stale badges are worse than none.
     serialConnected = null;
+    portState = null;
     signals = null;
     settable = [];
     renderSignals();
@@ -153,8 +166,11 @@ function applyMessage(text) {
   let msg;
   try { msg = JSON.parse(text); } catch { return; }
   if (msg.port) {
-    $('endpoint-name').title = [msg.port.device, msg.port.baudrate]
+    // Always complete, so it replaces rather than merges.
+    portDevice = [msg.port.device, msg.port.baudrate]
       .filter(Boolean).join(' @ ');
+    portState = msg.port.state || null;
+    applyPortState();
   }
   if (msg.can) { settable = msg.can.signals || []; renderSignals(); }
   if (msg.serial) {
@@ -246,19 +262,23 @@ function updateConnectButton() {
   btn.title = '';
 }
 
+const PORT_STATE_TITLES = {
+  online: 'Port open, data moving',
+  offline: 'Device present, nobody has opened it',
+  error: 'Configured device is missing',
+  down: 'No connection to the server',
+};
+
 function applyPortState() {
-  // Whether the port itself is healthy, which is not the same question
-  // as whether this view is subscribed. Nothing heard means we cannot
-  // vouch for it either way.
-  const state = wsState !== 'online' ? 'offline'
-    : serialConnected === null ? 'offline'
-      : serialConnected ? 'online' : 'error';
+  // The port, not this page's subscription - except that without a
+  // WebSocket we cannot vouch for the port at all, and grey says so.
+  const state = wsState !== 'online' ? 'down' : (portState || 'offline');
   const ep = $('endpoint-name');
-  ep.classList.remove('endpoint-online', 'endpoint-offline', 'endpoint-error');
-  ep.classList.add(
-    state === 'online' ? 'endpoint-online'
-      : state === 'error' ? 'endpoint-error'
-      : 'endpoint-offline');
+  ep.classList.remove('endpoint-online', 'endpoint-offline',
+    'endpoint-error', 'endpoint-down');
+  ep.classList.add('endpoint-' + state);
+  ep.title = [PORT_STATE_TITLES[state] || state, portDevice]
+    .filter(Boolean).join(' — ');
   updateStatus();
 }
 

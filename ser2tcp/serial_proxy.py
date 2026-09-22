@@ -20,7 +20,9 @@ def port_info(proxy):
     """What is on the other end, as a WebSocket client is told it.
 
     One reader for the endpoint's greeting and the monitor's, so the
-    two describe the same port the same way.
+    two describe the same port the same way. Always complete: the
+    `port` topic is re-sent whole when any of it changes, which saves
+    a client from having to merge a partial object into one it holds.
     """
     config = proxy.serial_config or {}
     return {
@@ -29,6 +31,7 @@ def port_info(proxy):
         # match, so it can still be unknown here.
         'device': config.get('port'),
         'baudrate': config.get('baudrate'),
+        'state': proxy.state,
     }
 
 
@@ -83,6 +86,14 @@ class FailedProxy():
     def info(self):
         """What the configuration says is on the other end"""
         return port_info(self)
+
+    @property
+    def state(self):
+        """Nothing was built, so there is nothing to be wrong with"""
+        return 'error'
+
+    def set_state(self, state):
+        """Nothing to record: this one is only ever in error"""
 
     @property
     def is_connected(self):
@@ -201,6 +212,8 @@ class SerialProxy():
         # The last device state the clients were told about; nothing is
         # open yet, so that is what they would say if asked.
         self._announced_connected = False
+        # Nothing is open, and nobody has looked at the system yet.
+        self._state = 'offline'
         self._write_progress_at = _time.time()
         self._certs_dir = certs_dir
         self._selector = selector
@@ -427,6 +440,32 @@ class SerialProxy():
     def info(self):
         """What is on the other end, as a WebSocket client is told it"""
         return port_info(self)
+
+    @property
+    def state(self):
+        """How the port is doing, for colouring it: online, offline or
+        error.
+
+        Worked out by HttpServerWrapper and handed back here, because
+        telling "the device is unplugged" from "the device is there and
+        nobody has opened it" needs the USB enumeration it caches. Held
+        here so everything that describes this port reads one answer.
+        """
+        return self._state
+
+    def set_state(self, state):
+        """Record the state, and tell the clients when it moved"""
+        if state == self._state:
+            return
+        self._state = state
+        info = self.info
+        for server in self._servers:
+            server.on_port_changed(info)
+        for monitor in list(self._monitors):
+            try:
+                monitor.on_port_changed(info)
+            except Exception as e:
+                self._log.warning("Monitor callback error: %s", e)
 
     @property
     def is_connected(self):

@@ -33,6 +33,26 @@ def recv_binary(conn, timeout=5):
     raise AssertionError('no binary frame arrived')
 
 
+def binary_frames(conn, timeout=2):
+    """Every binary frame that turns up inside `timeout`, text ignored.
+
+    For asserting that the device's bytes are *not* arriving: text
+    frames keep coming whatever happens, so "nothing at all" is the
+    wrong thing to wait for.
+    """
+    out = []
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        conn.settimeout(max(0.1, deadline - time.time()))
+        try:
+            frame = conn.recv()
+        except Exception:
+            break
+        if isinstance(frame, bytes):
+            out.append(frame)
+    return out
+
+
 def recv_json(conn, timeout=5, key=None):
     """Return the next text frame, decoded, skipping binary ones.
 
@@ -167,9 +187,10 @@ class TestAttachingOverTheWire(WebSocketTestCase):
         recv_json(conn)
         self.assertEqual(self.detach(conn), {'attach': False})
         os.write(self.master_fd, b'not for you')
-        conn.settimeout(1)
-        with self.assertRaises(Exception):
-            conn.recv()
+        # Text frames still arrive - letting go of the last claim closes
+        # the port, which is a state change worth hearing about. What
+        # must not arrive is the device's bytes.
+        self.assertEqual(binary_frames(conn, timeout=1), [])
 
     def test_and_starts_again_when_it_comes_back(self):
         conn = self.ws_connect('/ws/' + ENDPOINT)
@@ -211,7 +232,7 @@ class TestBeingRefusedOverTheWire(WebSocketTestCase):
         conn = self.ws_connect('/ws/' + ENDPOINT)
         recv_json(conn)
         conn.send(json.dumps({'signals': {'cts': True}}))
-        error = recv_json(conn)['error']
+        error = recv_json(conn, key='error')['error']
         self.assertEqual(error['request'], 'signals')
         self.assertIn('cts', error['reason'])
 
@@ -219,7 +240,7 @@ class TestBeingRefusedOverTheWire(WebSocketTestCase):
         conn = self.ws_connect('/ws/' + ENDPOINT)
         recv_json(conn)
         conn.send('not json{')
-        self.assertIn('error', recv_json(conn))
+        self.assertIn('error', recv_json(conn, key='error'))
 
 
 class TestWebSocketControl(WebSocketTestCase):

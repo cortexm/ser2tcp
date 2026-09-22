@@ -65,7 +65,8 @@ The first frame, on an endpoint:
 
 ```json
 {
-  "port": {"name": "esp32", "device": "/dev/ttyUSB0", "baudrate": 115200},
+  "port": {"name": "esp32", "device": "/dev/ttyUSB0", "baudrate": 115200,
+           "state": "online"},
   "can": {"read": true, "write": true, "signals": ["rts"], "attach": true},
   "serial": {"connected": true},
   "signals": {"rts": true, "cts": false, "dsr": true},
@@ -75,8 +76,25 @@ The first frame, on an endpoint:
 
 ### `port`
 
-What is on the other end. Sent once; changes if the port is
-reconfigured.
+What is on the other end, and how it is doing. **Always complete** —
+it is re-sent whole whenever any of it changes, so replace what you
+hold rather than merging into it.
+
+`state` is what to colour the port by:
+
+| `state` | Meaning |
+|---------|---------|
+| `online` | The port is open and data can move |
+| `offline` | The device is there; nobody has opened it |
+| `error` | The configured device is missing — unplugged, or never there |
+
+`offline` and `error` both mean "not open", and telling them apart is
+the point: one is waiting, the other is broken. `serial.connected`
+cannot make that distinction, which is why this is separate from it.
+
+A fourth state belongs to the client alone: with no WebSocket, nothing
+here can be vouched for, and saying so is better than showing the last
+thing you heard as though it were current.
 
 ### `can`
 

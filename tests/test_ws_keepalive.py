@@ -28,6 +28,9 @@ def _wrapper():
     wrapper._auth = None
     wrapper._pending_reload = False
     wrapper._last_ws_ping = 0
+    wrapper._serial_proxies = []
+    wrapper._detect_cache = []
+    wrapper._detect_cache_at = 0.0
     return wrapper
 
 

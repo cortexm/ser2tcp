@@ -412,6 +412,11 @@ class Server():
     def on_serial_found(self):
         """Nothing to do: whoever wants the port will connect again"""
 
+    def on_port_changed(self, info):
+        """Nothing to do: these protocols carry serial data and nothing
+        else, so there is no way to describe a port over them"""
+        del info
+
     def close_connections(self):
         """close all clients"""
         while self._connections:
