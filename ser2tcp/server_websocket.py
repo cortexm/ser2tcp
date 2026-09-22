@@ -140,8 +140,10 @@ class ServerWebSocket():
     def attach(self, client):
         """Start carrying data for this client, opening the port.
 
-        Returns False when the port cannot take another user: the
-        client stays connected, because its control channel is still
+        Attaching means wanting the device, not having it: a device
+        that will not open is not a refusal, it is a `serial` frame and
+        a reopen to wait for. Only the port limit says no, and even
+        then the client stays connected - its control channel is still
         good and it has to be able to be told why.
         """
         if client not in self._connections:
@@ -153,11 +155,7 @@ class ServerWebSocket():
                 "Attach refused (port limit): %s /ws/%s",
                 self._client_addr(client), self._endpoint)
             return False
-        if not self._serial.connect():
-            self._log.info(
-                "Attach refused (port unavailable): %s /ws/%s",
-                self._client_addr(client), self._endpoint)
-            return False
+        self._serial.connect()
         self._attached.append(client)
         # Whatever it was told about its writes no longer holds.
         self._write_refused.discard(client)
@@ -189,18 +187,15 @@ class ServerWebSocket():
             return
         # Attached on arrival, so a client that only wants data still
         # has to do nothing - the change is what it may do afterwards.
-        # attach() is what asks the port limit and opens the device, so
-        # the two reasons it can fail are told apart by asking it which.
+        # A device that will not open no longer refuses it: the
+        # greeting says so, and the port is retried while it waits.
         self._connections.append(client)
         if not self.attach(client):
             self._connections.remove(client)
-            if not self._serial.can_add_connection():
-                self._log.info(
-                    "Client rejected (port limit): %s WEBSOCKET",
-                    self._client_addr(client))
-                client.ws_close(1013, 'Port limit reached')
-            else:
-                client.ws_close(1011, 'Serial port unavailable')
+            self._log.info(
+                "Client rejected (port limit): %s WEBSOCKET",
+                self._client_addr(client))
+            client.ws_close(1013, 'Port limit reached')
             return
         addr = self._client_addr(client)
         self._log.info(
@@ -398,6 +393,23 @@ class ServerWebSocket():
                 client.ws_send(data)
             except OSError:
                 self.remove_connection(client)
+
+    def on_serial_lost(self, reason):
+        """The device went away; say so and keep everybody.
+
+        The clients stay attached: attached means wanting the device,
+        and none of them changed its mind - that is what SerialProxy
+        waits for before trying the port again.
+        """
+        # Whatever the lines read says nothing about the device that
+        # comes back, so the next report is a full set again.
+        self._reported = None
+        self._broadcast_json(
+            {'serial': {'connected': False, 'reason': reason}})
+
+    def on_serial_found(self):
+        """The device is back"""
+        self._broadcast_json({'serial': {'connected': True}})
 
     def send_signal_report(self, bitmask):
         """Report the lines that moved, to every connection.

@@ -90,13 +90,16 @@ class TestConnections(unittest.TestCase):
         self.assertTrue(srv.has_connections())
         srv._serial.connect.assert_called_once()
 
-    def test_add_connection_serial_fail(self):
+    def test_add_connection_when_the_device_will_not_open(self):
+        """Accepted and told, not refused: the greeting says the device
+        is not there, and the port is retried while the client waits."""
         srv = make_ws_server()
         srv._serial.connect.return_value = False
+        srv._serial.is_connected = False
         client = make_ws_client()
         srv.add_connection(client)
-        self.assertEqual(len(srv.connections), 0)
-        client.ws_close.assert_called_once()
+        self.assertIn(client, srv.connections)
+        client.ws_close.assert_not_called()
 
     def test_remove_connection(self):
         srv = make_ws_server()

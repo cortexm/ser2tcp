@@ -538,17 +538,18 @@ class TestSerialErrorsAreContained(unittest.TestCase):
         proxy.set_dtr(True)
         proxy._log.warning.assert_not_called()
 
-    def test_write_failure_drops_clients_and_closes_the_port(self):
+    def test_write_failure_tells_the_servers_and_closes_the_port(self):
         proxy = self._make_proxy()
         proxy._serial = MagicMock()
         proxy._serial.fileno.side_effect = OSError('no fileno')
         proxy._serial.write.side_effect = OSError('device gone')
         server = MagicMock()
         proxy._servers = [server]
-        proxy.disconnect = MagicMock()
+        proxy._close_device = MagicMock()
         proxy.send(b'data')  # must not raise
-        server.close_connections.assert_called_once()
-        proxy.disconnect.assert_called_once()
+        # What that means for the clients is the server's to decide.
+        server.on_serial_lost.assert_called_once()
+        proxy._close_device.assert_called_once()
 
     def test_successful_write_notifies_monitors(self):
         """And names whoever asked for it, so a monitor can say who."""

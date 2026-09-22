@@ -10,12 +10,14 @@ end-to-end frame exchange worth having rather than assumed.
 import json
 import select
 import ssl
+import tempfile
 import time
 import os
 import unittest
 
 import websocket
 
+from tests.integration import base
 from tests.integration.test_serial import SerialPtyTestCase, read_device
 
 ENDPOINT = 'demo'
@@ -418,6 +420,108 @@ class TestWebSocketBackpressure(WebSocketTestCase):
         self.assertGreater(sent, 0)
         got = read_device(self.master_fd, sent, timeout=25)
         self.assertEqual(got[:len(got)], payload[:len(got)])
+
+
+class TestTheDeviceGoesAway(WebSocketTestCase):
+    """Closing the pty master makes the slave unreadable, which is what
+    unplugging a USB adapter looks like from here.
+
+    The device can only be taken away once, and the process is shared
+    by the whole class - so this is one test watching one event from
+    the three sides that answer it differently.
+    """
+
+    def unplug(self):
+        """Take the device away and wait for ser2tcp to notice"""
+        os.close(self.master_fd)
+        type(self).master_fd = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not self.serial_connected():
+                return
+            time.sleep(0.05)
+        raise AssertionError('ser2tcp still thinks the device is there')
+
+    def test_who_is_told_and_who_is_dropped(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        monitor = self.ws_connect('/ws/monitor/pty')
+        recv_json(monitor)
+        sock = self.connect()
+
+        self.unplug()
+
+        # The WebSocket client keeps its socket and is told why.
+        message = recv_json(conn, key='serial')
+        self.assertIs(message['serial']['connected'], False)
+        self.assertTrue(message['serial'].get('reason'))
+        # And still answers, which is the whole reason to keep it.
+        conn.send(json.dumps({'attach': False}))
+        self.assertEqual(recv_json(conn, key='attach'), {'attach': False})
+
+        # A monitor watches the port, so it hears about it too.
+        self.assertIs(
+            recv_json(monitor, key='serial')['serial']['connected'], False)
+
+        # TCP has no channel to be told on: closing is the message.
+        sock.settimeout(5)
+        self.assertEqual(sock.recv(64), b'')
+
+
+class TestTheDeviceArrivesLate(base.IntegrationTestCase):
+    """A port configured for a device that is not plugged in yet.
+
+    Being refused and being told are the same news, but only one of
+    them leaves a client able to wait for better - and something has
+    to be waiting, or nothing would reopen the port.
+    """
+
+    endpoint = 'late'
+
+    @classmethod
+    def build_config(cls):
+        cls.device = os.path.join(
+            tempfile.mkdtemp(prefix='ser2tcp-late-'), 'device')
+        return {
+            'ports': [{
+                'name': 'late',
+                'serial': {'port': cls.device, 'baudrate': 115200},
+                'servers': [
+                    {'protocol': 'websocket', 'endpoint': cls.endpoint},
+                ],
+            }],
+            'http': [{'address': '127.0.0.1', 'port': cls.port}],
+        }
+
+    def plug_in(self):
+        """Make the configured path lead to a real tty"""
+        master_fd, slave_fd = os.openpty()
+        self.addCleanup(os.close, slave_fd)
+        self.addCleanup(os.close, master_fd)
+        os.symlink(os.ttyname(slave_fd), self.device)
+        self.addCleanup(os.unlink, self.device)
+        return master_fd
+
+    def ws_connect(self):
+        conn = websocket.create_connection(
+            f'ws://127.0.0.1:{self.port}/ws/{self.endpoint}', timeout=10)
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_the_client_is_accepted_and_told(self):
+        conn = self.ws_connect()
+        hello = recv_json(conn)
+        self.assertEqual(hello['serial'], {'connected': False})
+
+    def test_and_told_again_once_the_device_turns_up(self):
+        conn = self.ws_connect()
+        recv_json(conn)
+        master_fd = self.plug_in()
+        self.assertEqual(
+            recv_json(conn, timeout=15, key='serial')['serial'],
+            {'connected': True})
+        os.write(master_fd, b'at last')
+        self.assertEqual(recv_binary(conn), b'at last')
 
 
 if __name__ == '__main__':

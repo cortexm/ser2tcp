@@ -272,8 +272,15 @@ WebSocket connections go through the HTTP server — no separate listening port 
 - The first frame carries everything; later ones only what changed
 - A client can let go of the serial port without closing the socket
   (`{"attach": false}`) and keeps being told about it
+- The device going away does not close the WebSocket — the client is
+  told, and told again when it comes back. A port is retried for as
+  long as somebody is attached, so a device that is not plugged in yet
+  is something to wait for rather than a connection error
 - Auth: per-server `token`, global user session, or both accepted
 - Web terminals available at `/xterm/<endpoint>` (VT100) and `/raw/<endpoint>` (colored hex)
+
+The full message format, for both `/ws/<endpoint>` and
+`/ws/monitor/<port-name>`, is in [README_WS_API.md](README_WS_API.md).
 
 #### Socket configuration
 

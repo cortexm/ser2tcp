@@ -85,6 +85,16 @@ class ServerMonitor():
             else self._slots.get(source, self.OVERFLOW)
         self._broadcast(bytes([slot]) + data)
 
+    def on_serial(self, connected, reason=None):
+        """The device went away, or came back"""
+        state = {'connected': bool(connected)}
+        if reason and not connected:
+            state['reason'] = reason
+        if not connected:
+            # The lines say nothing about a device that is gone.
+            self._reported = None
+        self._broadcast_json({'serial': state})
+
     def on_signals(self, bitmask):
         """Report the lines that moved, like an endpoint does"""
         names = self._reported_signals()

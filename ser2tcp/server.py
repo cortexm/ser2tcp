@@ -391,6 +391,20 @@ class Server():
                 "%s %s: cannot listen again: %s",
                 self._protocol, self._where(), err)
 
+    def on_serial_lost(self, reason):
+        """The device is gone, so these clients are too.
+
+        TCP, TELNET, SSL and Unix sockets carry serial data and nothing
+        else: there is no way to tell a client the device went away, so
+        holding it open would only feed it silence. Closing says it in
+        the only language those protocols have.
+        """
+        del reason      # nothing to say it with
+        self.close_connections()
+
+    def on_serial_found(self):
+        """Nothing to do: whoever wants the port will connect again"""
+
     def close_connections(self):
         """close all clients"""
         while self._connections:

@@ -183,6 +183,11 @@ class SerialProxy():
     # the whole process can stand still; with the read timeout above it
     # normally returns at once.
     READER_JOIN_TIMEOUT = 0.5
+    # How often to try a device that somebody is waiting for. The loop
+    # turns over many times a second and a port that is unplugged will
+    # not be back by the next pass - for a USB device this is roughly
+    # how long re-enumeration takes anyway.
+    REOPEN_INTERVAL = 2.0
 
     def __init__(self, config, log=None, certs_dir=None, selector=None):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
@@ -190,6 +195,9 @@ class SerialProxy():
         self._out_buffer = bytearray()
         self._read_paused = False
         self._last_drop_warning = 0
+        self._last_reopen = 0
+        # Whether the last failed open has already been reported.
+        self._open_warned = False
         self._write_progress_at = _time.time()
         self._certs_dir = certs_dir
         self._selector = selector
@@ -450,18 +458,32 @@ class SerialProxy():
                     self._serial_config['port'] = self.find_port_by_match(
                         self._match)
                 except ValueError as err:
-                    self._log.warning(err)
-                    return False
+                    return self._cannot_open(err)
             try:
                 self._serial = _serial.Serial(**self._serial_config)
             except (_serial.SerialException, OSError) as err:
-                self._log.warning(err)
-                return False
+                return self._cannot_open(err)
             self._log.info(
                 "Serial %s connected", self._serial_config['port'])
+            # Said once per absence, so the next one is news again.
+            self._open_warned = False
             self._start_reader_thread_if_needed()
             self._register_serial()
         return True
+
+    def _cannot_open(self, err):
+        """Report a failed open, once per absence.
+
+        A client waiting for a device that is unplugged has the port
+        retried for as long as it waits, which can be hours. Saying the
+        same thing every couple of seconds buries everything else.
+        """
+        if self._open_warned:
+            self._log.debug(err)
+        else:
+            self._log.warning(err)
+            self._open_warned = True
+        return False
 
     def has_connections(self):
         """Check if there are any active connections"""
@@ -486,23 +508,34 @@ class SerialProxy():
         return True
 
     def disconnect(self):
-        """Disconnect serial port, but if there are no active connections"""
+        """Close the port once nobody is holding it open"""
         if self._serial and not self.has_connections():
-            # Must come first: the selector cannot unregister a source
-            # whose fileno() has already gone away.
-            self._unregister_serial()
-            self._stop_reader_thread()
-            # Whatever is still queued belongs to a port that is gone.
-            self._out_buffer.clear()
-            if self._read_paused:
-                self._set_read_paused(False)
-            self._last_signals = None
-            self._serial.close()
-            self._serial = None
-            self._log.info(
-                "Serial %s disconnected", self._serial_config['port'])
-            if getattr(self, '_match', None):
-                del self._serial_config['port']
+            self._close_device()
+
+    def _close_device(self):
+        """Let go of the device, whoever is still waiting for it.
+
+        disconnect() asks first; after an I/O error there is nothing
+        left to ask about - the port is gone either way, and the
+        clients that want it back are what drives reopening it.
+        """
+        if not self._serial:
+            return
+        # Must come first: the selector cannot unregister a source
+        # whose fileno() has already gone away.
+        self._unregister_serial()
+        self._stop_reader_thread()
+        # Whatever is still queued belongs to a port that is gone.
+        self._out_buffer.clear()
+        if self._read_paused:
+            self._set_read_paused(False)
+        self._last_signals = None
+        self._serial.close()
+        self._serial = None
+        self._log.info(
+            "Serial %s disconnected", self._serial_config['port'])
+        if getattr(self, '_match', None):
+            del self._serial_config['port']
 
     def close(self):
         """Close socket and all connections"""
@@ -556,15 +589,36 @@ class SerialProxy():
             self._log.warning(err)
             self._serial_failed()
 
-    def _serial_failed(self):
-        """Drop every client and close the port after an I/O error.
+    def _serial_failed(self, reason='device disappeared'):
+        """Close the port after an I/O error and say so.
 
-        The clients are told by the disconnect; holding them open on a
-        port that is gone would only feed them silence.
+        Each server decides what that means for its clients. A socket
+        protocol drops them, because holding one open on a port that
+        is gone only feeds it silence; a WebSocket client has a channel
+        to be told on, so it keeps its socket and waits.
         """
         for server in self._servers:
-            server.close_connections()
-        self.disconnect()
+            server.on_serial_lost(reason)
+        self._notify_monitor_serial(False, reason)
+        self._close_device()
+
+    def _reopen(self):
+        """Try the device again while somebody is waiting for it.
+
+        Reopening used to need no code of its own: losing the port
+        dropped every client, and the port came back when they
+        reconnected. A WebSocket client that stays is the thing that
+        has to be waited for instead.
+        """
+        now = _time.time()
+        if now - self._last_reopen < self.REOPEN_INTERVAL:
+            return
+        self._last_reopen = now
+        if not self.connect():
+            return
+        for server in self._servers:
+            server.on_serial_found()
+        self._notify_monitor_serial(True)
 
     def handle_event(self, fileobj, mask):
         """Owner dispatch for the serial source"""
@@ -583,6 +637,8 @@ class SerialProxy():
         """Remove stale connections"""
         for server in self._servers:
             server.process_stale()
+        if self._serial is None and self.has_connections():
+            self._reopen()
         if self._out_buffer and self._serial_source is not self._serial:
             # A port with no usable fileno() is read through a reader
             # thread's socketpair, which says nothing about whether the
@@ -856,6 +912,14 @@ class SerialProxy():
         for monitor in list(self._monitors):
             try:
                 monitor.on_data(source, data)
+            except Exception as e:
+                self._log.warning("Monitor callback error: %s", e)
+
+    def _notify_monitor_serial(self, connected, reason=None):
+        """Tell the monitors the device went away, or came back"""
+        for monitor in list(self._monitors):
+            try:
+                monitor.on_serial(connected, reason)
             except Exception as e:
                 self._log.warning("Monitor callback error: %s", e)
 
