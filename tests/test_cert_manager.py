@@ -1082,24 +1082,30 @@ class TestDownloadRefusesAFileHoldingAKey(unittest.TestCase):
         with open(self.path, 'w', encoding='utf-8') as file:
             file.write(content)
 
+    def _append_key(self):
+        """Put the private key on the end of the certificate on disk"""
+        with open(self.path, encoding='utf-8') as file:
+            cert = file.read()
+        self._write(cert + self.key)
+
     def test_the_plain_certificate_downloads(self):
         self.assertIn('BEGIN CERTIFICATE',
                       self.mgr.read_public_file('x', 'cert.pem'))
 
     def test_a_key_appended_on_disk_is_not_handed_out(self):
-        self._write(open(self.path, encoding='utf-8').read() + self.key)
+        self._append_key()
         with self.assertRaises(CertManagerError):
             self.mgr.read_public_file('x', 'cert.pem')
 
     def test_the_refusal_names_the_file(self):
-        self._write(open(self.path, encoding='utf-8').read() + self.key)
+        self._append_key()
         with self.assertRaises(CertManagerError) as caught:
             self.mgr.read_public_file('x', 'cert.pem')
         self.assertIn('cert.pem', str(caught.exception))
 
     def test_the_listing_says_so_without_being_asked(self):
         """Otherwise the only symptom is a download that will not work"""
-        self._write(open(self.path, encoding='utf-8').read() + self.key)
+        self._append_key()
         info = self.mgr.get_bundle('x')['files']['cert.pem']
         self.assertTrue(info['private_key'])
 

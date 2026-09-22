@@ -82,6 +82,13 @@ class Server():
 
     def __init__(
             self, config, ser, log=None, certs_dir=None, selector=None):
+        # First, before anything that can raise: a config this refuses
+        # leaves a half-built object for __del__ to close, and close()
+        # asking about a socket that was never assigned turns a clear
+        # ConfigError into an AttributeError nobody can act on.
+        self._socket = None
+        self._ssl_context = None
+        self._connections = []
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._config = config
         self._serial = ser

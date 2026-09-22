@@ -350,6 +350,33 @@ class TestWebSocketAfterReconfiguration(WebSocketTestCase):
         os.write(self.master_fd, b'echo')
         self.assertEqual(recv_binary(conn), b'echo')
 
+    def test_a_watching_monitor_is_told_the_port_went(self):
+        """A monitor is built for one SerialProxy and was cached by
+        port name for ever, so a rebuild left it - and everyone who
+        connected afterwards - watching the proxy that had closed."""
+        monitor = self.ws_connect('/ws/monitor/pty')
+        recv_json(monitor)
+
+        status, body = self.put(
+            '/api/ports/' + self.port_id(), self.port_config())
+        self.assertEqual(status, 200, body)
+
+        self.assertIsNone(recv_json(monitor, key='port')['port'])
+
+    def test_and_a_monitor_opened_afterwards_still_sees_the_device(self):
+        self.ws_connect('/ws/monitor/pty')
+
+        status, body = self.put(
+            '/api/ports/' + self.port_id(), self.port_config())
+        self.assertEqual(status, 200, body)
+
+        monitor = self.ws_connect('/ws/monitor/pty')
+        recv_json(monitor)
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        os.write(self.master_fd, b'after the rebuild')
+        self.assertEqual(recv_binary(monitor)[1:], b'after the rebuild')
+
 
 
 class TestWebSocketBackpressure(WebSocketTestCase):

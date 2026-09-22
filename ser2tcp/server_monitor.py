@@ -139,12 +139,22 @@ class ServerMonitor():
             return
         self._refresh_peers()
 
-    def close(self):
+    def port_gone(self):
+        """The port this monitor watches is not there any more.
+
+        Said before the close rather than left to it: a close code is
+        a number, and a client that was watching a named port deserves
+        to hear the name stopped meaning anything.
+        """
+        self._broadcast_json({'port': None})
+        self.close('Port removed')
+
+    def close(self, reason='Server shutting down'):
         """Close all connections"""
         while self._connections:
             client = self._connections.pop()
             try:
-                client.ws_close(1001, 'Server shutting down')
+                client.ws_close(1001, reason)
             except OSError:
                 pass
         self._serial.remove_monitor(self)

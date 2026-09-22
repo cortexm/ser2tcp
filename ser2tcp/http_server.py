@@ -353,6 +353,24 @@ class HttpServerWrapper():
                 _uhttp_server.EVENT_COMPLETE, _uhttp_server.EVENT_REQUEST):
             self._handle_request(client)
 
+    def drop_monitor(self, port_name):
+        """Let go of the monitor for a port that is being taken apart.
+
+        A ServerMonitor holds the SerialProxy it was built for, and
+        these are cached by port name - so a rebuilt port left both
+        its watchers *and* anyone connecting afterwards bound to the
+        proxy that had been closed, watching a device nothing drives.
+        Neither ever saw another byte, and nothing said so.
+        """
+        if not port_name:
+            return
+        monitor = self._monitor_servers.pop(port_name, None)
+        if monitor is None:
+            return
+        for client in list(monitor.connections):
+            self._ws_clients.pop(client, None)
+        monitor.port_gone()
+
     def ping_websockets(self):
         """Keep live WebSockets from ageing out as if they were idle.
 
@@ -1437,6 +1455,9 @@ class HttpServerWrapper():
             self._error(client, id_error, 400)
             return
         old_proxy = self._serial_proxies[index]
+        # By the old name: a rename leaves the new one free for a
+        # monitor built against the proxy this is about to become.
+        self.drop_monitor(old_proxy.name)
         old_proxy.close()
         if self._server_manager:
             self._server_manager.remove_server(old_proxy)
@@ -1470,6 +1491,7 @@ class HttpServerWrapper():
             self._error(client, 'Port not found', 404)
             return
         old_proxy = self._serial_proxies[index]
+        self.drop_monitor(old_proxy.name)
         old_proxy.close()
         if self._server_manager:
             self._server_manager.remove_server(old_proxy)

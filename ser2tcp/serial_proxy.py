@@ -583,8 +583,17 @@ class SerialProxy():
         self._serial_interest = _selectors.EVENT_READ
 
     def _unregister_serial(self):
-        """Stop watching the port before it is closed"""
-        if self._serial_source is None:
+        """Stop watching the port before it is closed.
+
+        The same guard its counterpart has: _register_serial() will not
+        register without a selector, so this cannot happen in a running
+        process - but the asymmetry raised AttributeError out of
+        __del__ for anything built without one, which is a trap and
+        was burying real failures in test output.
+        """
+        if self._serial_source is None or self._selector is None:
+            self._serial_source = None
+            self._serial_interest = None
             return
         try:
             self._selector.unregister(self._serial_source)
