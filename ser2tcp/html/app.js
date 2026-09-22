@@ -1617,21 +1617,22 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   ssl.wrap.classList.remove('hidden');
   const sslDiv = ssl.wrap;
 
-  // Control fields
-  const ctlEnableCb = el('input', { type: 'checkbox', checked: !!srv.control });
-  const ctlEnableRow = el('div', { style: 'margin-bottom:6px' },
-    el('label', { class: 'checkbox-label' }, ctlEnableCb,
-      el('span', {}, ' Control protocol')));
-  // Which way data may flow. A checkbox could only say all or nothing,
-  // which is what `data` was; a config using `access` would have shown
-  // as ticked and been silently downgraded on save.
-  const accessSel = el('select', {},
-    el('option', { value: 'rw' }, 'Read and write'),
-    el('option', { value: 'ro' }, 'Read only (clients cannot write)'),
-    el('option', { value: 'wo' }, 'Write only (clients hear nothing)'),
-    el('option', { value: 'none' }, 'Neither (control protocol only)'));
-  accessSel.value = serverAccess(srv);
-  const dataRow = formRow('Data', accessSel);
+  // What this server offers a client, as three independent things
+  // rather than a list of the combinations. Read and write were a
+  // four-way dropdown whose options were the pairs spelled out, and
+  // control was a checkbox somewhere else - so the one rule tying
+  // them together, that a server has to do at least one of the three,
+  // lived in neither of them.
+  const access = serverAccess(srv);
+  const enableCb = (label, on) => {
+    const cb = el('input', { type: 'checkbox', checked: on });
+    return [cb, el('label', { class: 'checkbox-label' },
+      cb, el('span', {}, label))];
+  };
+  const [readCb, readLabel] = enableCb('Read', access === 'rw' || access === 'ro');
+  const [writeCb, writeLabel] = enableCb('Write', access === 'rw' || access === 'wo');
+  const [ctlCb, ctlLabel] = enableCb('Control', !!srv.control);
+  const dataRow = formRow('Enable', [readLabel, writeLabel, ctlLabel]);
 
   // Direction is shown by colour rather than by a word in front of
   // each group: six boxes and two labels do not fit on one line, and
@@ -1714,11 +1715,11 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
 
   const ctlDetails = el('div', { class: 'subgroup' },
     ctlDescEl, ctlMoreDetails, reportRow, writeRow, pollRow);
-  const ctlDiv = el('div', {}, ctlEnableRow, ctlDetails);
-  ctlEnableCb.onchange = () => {
-    ctlDetails.classList.toggle('hidden', !ctlEnableCb.checked);
+  const ctlDiv = el('div', {}, ctlDetails);
+  ctlCb.onchange = () => {
+    ctlDetails.classList.toggle('hidden', !ctlCb.checked);
   };
-  if (!ctlEnableCb.checked) ctlDetails.classList.add('hidden');
+  if (!ctlCb.checked) ctlDetails.classList.add('hidden');
 
   // IP filter
   const allowInput = el('input', {
@@ -1766,7 +1767,13 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     portRow.classList.toggle('hidden', isWs || isSocket);
     addrLabel.textContent = isSocket ? 'Path' : 'Address';
     sslDiv.classList.toggle('hidden', !isSsl);
-    ctlDiv.classList.toggle('hidden', isTelnet);
+    // TELNET has no room for it: the escape protocol's 0xFF is IAC.
+    ctlCb.disabled = isTelnet;
+    if (isTelnet) ctlCb.checked = false;
+    ctlLabel.title = isTelnet
+      ? 'Not available on TELNET — the escape byte 0xFF is IAC there'
+      : '';
+    ctlDiv.classList.toggle('hidden', isTelnet || !ctlCb.checked);
     ipDiv.classList.toggle('hidden', isSocket);
     ctlDescEl.innerHTML = '';
     if (isWs) {
@@ -1833,7 +1840,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
       get proto() { return protoSel.value; },
       protoSel, addrInput, portInput, epInput: wsEndpointInput,
       tokenInput: wsTokenInput, ssl,
-      ctlEnableCb, accessSel, writeRowCbs, reportCbs, pollSel,
+      readCb, writeCb, ctlCb, writeRowCbs, reportCbs, pollSel,
       allowInput, denyInput, maxConnInput,
       // What was configured before this box was opened. The form does
       // not have a field for everything a server can carry, and
@@ -1901,18 +1908,23 @@ function _collectPortConfig(form) {
       if (!sslVal) throw new Error('SSL server requires a bundle');
       srv.ssl = sslVal;
     }
+    const read = d.readCb.checked;
+    const write = d.writeCb.checked;
+    const control = proto !== 'telnet' && d.ctlCb.checked;
+    if (!read && !write && !control) {
+      // It would answer connections and then do nothing with them, and
+      // the server refuses to start such a thing. Say so here rather
+      // than letting the save come back as an error.
+      throw new Error(proto === 'telnet'
+        ? 'A server has to read or write, or it would do nothing'
+        : 'A server has to read, write or do control, '
+          + 'or it would do nothing');
+    }
     // The default carries no key, so an ordinary server stays as plain
     // in the file as it was before this existed.
-    const access = d.accessSel.value;
-    if (access === 'none' && !(proto !== 'telnet' && d.ctlEnableCb.checked)) {
-      // The server would do nothing at all, and refuses to start. Say so
-      // here rather than letting the save come back as an error.
-      throw new Error(
-        'A server that neither reads nor writes needs the control '
-        + 'protocol enabled, or it would do nothing');
-    }
+    const access = read && write ? 'rw' : read ? 'ro' : write ? 'wo' : 'none';
     if (access !== 'rw') srv.access = access;
-    if (proto !== 'telnet' && d.ctlEnableCb.checked) {
+    if (control) {
       const ctl = {};
       OUTPUT_SIGNALS.forEach(sig => {
         if (d.writeRowCbs[sig].checked) ctl[sig] = true;
