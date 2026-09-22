@@ -608,6 +608,12 @@ function doLogout() {
 const MATCH_ATTRS = ['vid', 'pid', 'serial_number', 'manufacturer', 'product', 'location'];
 const PROTOCOLS = ['TCP', 'TELNET', 'SSL', 'SOCKET', 'WEBSOCKET'];
 const CONTROL_SIGNALS = ['rts', 'dtr', 'cts', 'dsr', 'ri', 'cd'];
+// Which way each line runs. RTS and DTR are driven from this end, so
+// they are the only ones a client could ever be allowed to set; the
+// rest are the device talking back.
+const OUTPUT_SIGNALS = ['rts', 'dtr'];
+const INPUT_SIGNALS = CONTROL_SIGNALS.filter(
+  sig => !OUTPUT_SIGNALS.includes(sig));
 const BAUDRATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200,
   230400, 460800, 921600];
 const BYTESIZES = {8: 'EIGHTBITS', 7: 'SEVENBITS', 6: 'SIXBITS', 5: 'FIVEBITS'};
@@ -1627,29 +1633,64 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   accessSel.value = serverAccess(srv);
   const dataRow = formRow('Data', accessSel);
 
-  const writeRowCbs = {};
-  const writeLabels = ['rts', 'dtr'].map(sig => {
-    const cb = el('input', {
-      type: 'checkbox',
-      checked: !!(srv.control && srv.control[sig]),
-    });
-    writeRowCbs[sig] = cb;
-    return el('label', { class: 'checkbox-label', style: 'margin-right:10px' },
-      cb, el('span', {}, ' ' + sig.toUpperCase()));
-  });
-  const writeRow = formRow('Allow set', writeLabels);
+  // Direction is shown by colour rather than by a word in front of
+  // each group: six boxes and two labels do not fit on one line, and
+  // wrapping them scatters the row. The tooltip carries the meaning.
+  const isOut = sig => OUTPUT_SIGNALS.includes(sig);
+  const signalTitle = sig => sig.toUpperCase() + (isOut(sig)
+    ? ' — output, driven from here'
+    : ' — input, driven by the device');
+  const signalBox = (cb, sig) => el(
+    'label', {
+      class: 'checkbox-label signal-box ' + (isOut(sig) ? 'out' : 'in'),
+      title: signalTitle(sig),
+    },
+    cb, el('span', {}, sig.toUpperCase()));
+  // One container, so the row's own gap falls between the label and
+  // the set rather than between every box in it.
+  const signalSet = boxes => el('div', { class: 'signal-set' }, ...boxes);
 
+  // Report comes first: it is what decides the rest. A line nobody
+  // reports cannot usefully be set either - the terminal draws a badge
+  // only for the lines it is told about, so an allowed-but-unreported
+  // line is one you can neither see nor click.
   const reportCbs = {};
-  const reportLabels = CONTROL_SIGNALS.map(sig => {
+  const reportBox = sig => {
     const cb = el('input', {
       type: 'checkbox',
       checked: !!(srv.control && (srv.control.signals || []).includes(sig)),
     });
     reportCbs[sig] = cb;
-    return el('label', { class: 'checkbox-label', style: 'margin-right:10px' },
-      cb, el('span', {}, ' ' + sig.toUpperCase()));
+    cb.onchange = () => syncSettable();
+    return signalBox(cb, sig);
+  };
+  const reportRow = formRow('Report', signalSet(
+    [...OUTPUT_SIGNALS, ...INPUT_SIGNALS].map(reportBox)));
+
+  const writeRowCbs = {};
+  const writeLabels = OUTPUT_SIGNALS.map(sig => {
+    const cb = el('input', {
+      type: 'checkbox',
+      checked: !!(srv.control && srv.control[sig]),
+    });
+    writeRowCbs[sig] = cb;
+    return signalBox(cb, sig);
   });
-  const reportRow = formRow('Report', reportLabels);
+  const writeRow = formRow('Allow set', signalSet(writeLabels));
+
+  // A line can only be set if it is also reported.
+  function syncSettable() {
+    OUTPUT_SIGNALS.forEach(sig => {
+      const reported = reportCbs[sig].checked;
+      const cb = writeRowCbs[sig];
+      cb.disabled = !reported;
+      if (!reported) cb.checked = false;
+      cb.parentNode.title = reported ? signalTitle(sig)
+        : 'Report ' + sig.toUpperCase() + ' first — a line that is not '
+          + 'reported cannot be shown, so it cannot be clicked either';
+    });
+  }
+  syncSettable();
 
   const pollSel = el('select', { style: 'flex:0 0 auto;width:8em' });
   const pollOptions = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
@@ -1672,7 +1713,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     _buildCtlProtocolTable());
 
   const ctlDetails = el('div', { class: 'subgroup' },
-    ctlDescEl, ctlMoreDetails, writeRow, reportRow, pollRow);
+    ctlDescEl, ctlMoreDetails, reportRow, writeRow, pollRow);
   const ctlDiv = el('div', {}, ctlEnableRow, ctlDetails);
   ctlEnableCb.onchange = () => {
     ctlDetails.classList.toggle('hidden', !ctlEnableCb.checked);
@@ -1873,7 +1914,7 @@ function _collectPortConfig(form) {
     if (access !== 'rw') srv.access = access;
     if (proto !== 'telnet' && d.ctlEnableCb.checked) {
       const ctl = {};
-      ['rts', 'dtr'].forEach(sig => {
+      OUTPUT_SIGNALS.forEach(sig => {
         if (d.writeRowCbs[sig].checked) ctl[sig] = true;
       });
       const signals = [];

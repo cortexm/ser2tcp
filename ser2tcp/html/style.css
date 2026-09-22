@@ -678,6 +678,43 @@ a.kebab-item { display: block; text-decoration: none; }
   color: var(--text-faint);
   cursor: not-allowed;
 }
+/* Which way the line runs. RTS and DTR are driven from here; the rest
+   are the device talking back, and the difference decides what can be
+   done with them - so it is worth seeing rather than remembering.
+   Shown by colour: six boxes and two group labels do not fit on one
+   line, and wrapping them scatters the row. */
+.signal-set {
+  /* Six columns whether a row uses all of them or not, so the two
+     boxes in Allow set sit under the Report boxes they depend on -
+     and the shape of the row says at a glance that the other four
+     have no counterpart there. */
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  align-items: center;
+  gap: 8px;
+  /* Takes the width the field would, and drops below the label rather
+     than squeezing when there is not enough of it. */
+  flex: 1 1 18em;
+}
+.modal-body label.checkbox-label.signal-box {
+  gap: 5px;
+  /* Monospace so they read as line names rather than as words. */
+  font-family: monospace;
+  font-size: 13px;
+}
+.modal-body label.checkbox-label.signal-box.out {
+  color: var(--error);
+}
+.modal-body label.checkbox-label.signal-box.out input[type="checkbox"] {
+  accent-color: var(--error);
+}
+.modal-body label.checkbox-label.signal-box.in {
+  color: var(--accent);
+}
+/* Disabled still wins: it is the more useful thing to notice. */
+.modal-body label.checkbox-label.signal-box:has(input:disabled) {
+  color: var(--text-faint);
+}
 .modal-body label.checkbox-label:has(input:disabled) .card-subtitle {
   opacity: 0.6;
 }
