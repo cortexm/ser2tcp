@@ -31,13 +31,21 @@ def recv_binary(conn, timeout=5):
     raise AssertionError('no binary frame arrived')
 
 
-def recv_json(conn, timeout=5):
-    """Return the next text frame, decoded, skipping binary ones."""
+def recv_json(conn, timeout=5, key=None):
+    """Return the next text frame, decoded, skipping binary ones.
+
+    With `key`, skip on until a frame carries that topic: opening the
+    port samples the signal lines, so a report can arrive between what
+    a test asked for and what it is waiting to see.
+    """
     conn.settimeout(timeout)
     for _ in range(10):
         frame = conn.recv()
-        if isinstance(frame, str):
-            return json.loads(frame)
+        if not isinstance(frame, str):
+            continue
+        message = json.loads(frame)
+        if key is None or key in message:
+            return message
     raise AssertionError('no text frame arrived')
 
 
@@ -240,22 +248,64 @@ class TestWebSocketControl(WebSocketTestCase):
 
 
 class TestMonitorEndpoint(WebSocketTestCase):
-    """The read-only monitor tags each frame with its direction."""
+    """The read-only monitor tags each frame with whoever wrote it."""
 
-    DIR_TX = 1
-    DIR_RX = 2
+    DEVICE = 0
 
-    def test_monitor_sees_both_directions(self):
+    def test_the_device_writes_under_zero(self):
+        monitor = self.ws_connect('/ws/monitor/pty')
+        self.connect()
+        os.write(self.master_fd, b'rx side')
+        frame = recv_binary(monitor)
+        self.assertEqual(frame[0], self.DEVICE)
+        self.assertEqual(frame[1:], b'rx side')
+
+    def test_a_client_writes_under_its_slot(self):
         monitor = self.ws_connect('/ws/monitor/pty')
         sock = self.connect()
         sock.sendall(b'tx side')
         frame = recv_binary(monitor)
-        self.assertEqual(frame[0], self.DIR_TX)
+        self.assertNotEqual(frame[0], self.DEVICE)
         self.assertEqual(frame[1:], b'tx side')
-        os.write(self.master_fd, b'rx side')
-        frame = recv_binary(monitor)
-        self.assertEqual(frame[0], self.DIR_RX)
-        self.assertEqual(frame[1:], b'rx side')
+
+    def test_two_clients_are_told_apart(self):
+        """What a direction byte could never say on a shared line."""
+        monitor = self.ws_connect('/ws/monitor/pty')
+        first = self.connect()
+        second = self.connect()
+        first.sendall(b'from one')
+        one = recv_binary(monitor)
+        second.sendall(b'from two')
+        two = recv_binary(monitor)
+        self.assertEqual(one[1:], b'from one')
+        self.assertEqual(two[1:], b'from two')
+        self.assertNotEqual(one[0], two[0])
+
+    def test_the_peer_list_arrives_with_the_greeting(self):
+        self.connect()
+        monitor = self.ws_connect('/ws/monitor/pty')
+        hello = recv_json(monitor)
+        self.assertEqual(hello['port']['name'], 'pty')
+        self.assertIs(hello['can']['write'], False)
+        self.assertEqual(len(hello['peers']), 1)
+        self.assertEqual(hello['peers'][0]['protocol'], 'tcp')
+
+    def test_a_client_joining_is_announced(self):
+        monitor = self.ws_connect('/ws/monitor/pty')
+        recv_json(monitor)
+        self.connect()
+        message = recv_json(monitor, key='peer_connected')
+        self.assertEqual(len(message['peers']), 1)
+
+    def test_and_one_leaving(self):
+        monitor = self.ws_connect('/ws/monitor/pty')
+        recv_json(monitor)
+        sock = self.connect()
+        recv_json(monitor, key='peer_connected')
+        sock.close()
+        self.wait_for_connections(0)
+        message = recv_json(monitor, key='peer_disconnected')
+        self.assertEqual(message['peers'], [])
 
     def test_monitor_does_not_write_to_the_device(self):
         monitor = self.ws_connect('/ws/monitor/pty')

@@ -16,6 +16,22 @@ import ser2tcp.server as _server
 import ser2tcp.server_websocket as _server_websocket
 
 
+def port_info(proxy):
+    """What is on the other end, as a WebSocket client is told it.
+
+    One reader for the endpoint's greeting and the monitor's, so the
+    two describe the same port the same way.
+    """
+    config = proxy.serial_config or {}
+    return {
+        'name': proxy.name,
+        # Resolved at connect time when the port is found by USB
+        # match, so it can still be unknown here.
+        'device': config.get('port'),
+        'baudrate': config.get('baudrate'),
+    }
+
+
 def _format_signals(bitmask):
     """Render a signal bitmask as 'RTS=1 DTR=0 CTS=1 ...' for the log."""
     return ' '.join(
@@ -62,6 +78,11 @@ class FailedProxy():
     def match(self):
         """Return match criteria"""
         return self._serial_config.get('match')
+
+    @property
+    def info(self):
+        """What the configuration says is on the other end"""
+        return port_info(self)
 
     @property
     def is_connected(self):
@@ -392,6 +413,11 @@ class SerialProxy():
         return self._match
 
     @property
+    def info(self):
+        """What is on the other end, as a WebSocket client is told it"""
+        return port_info(self)
+
+    @property
     def is_connected(self):
         """Return True if serial port is connected"""
         return self._serial is not None
@@ -523,7 +549,7 @@ class SerialProxy():
             if data:
                 self._log.debug("(%s): %s", self._serial_config['port'], data)
                 self.send_to_connections(data)
-                self._notify_monitors(2, data)  # RX
+                self._notify_monitors(None, data)   # the device
             else:
                 raise OSError("Serial reader closed")
         except (OSError, _serial.SerialException) as err:
@@ -630,6 +656,7 @@ class SerialProxy():
         self._log_signal_change(bitmask)
         for server in self._servers:
             server.send_signal_report(bitmask)
+        self._notify_monitor_signals(bitmask)
         self._last_signals = bitmask
 
     def _log_signal_change(self, bitmask):
@@ -673,9 +700,14 @@ class SerialProxy():
             if self._has_control_servers:
                 for server in self._servers:
                     server.send_signal_report(bitmask)
+                self._notify_monitor_signals(bitmask)
 
-    def send(self, data):
-        """Queue data for the serial port and write what it will take"""
+    def send(self, data, source=None):
+        """Queue data for the serial port and write what it will take.
+
+        `source` is the connection that asked for it, carried only so a
+        monitor can say which client wrote what. None means us.
+        """
         if not self._serial or not data:
             return
         room = self.WRITE_BUFFER_LIMIT - len(self._out_buffer)
@@ -691,7 +723,7 @@ class SerialProxy():
             self._write_progress_at = _time.time()
         self._out_buffer.extend(data)
         # Monitors see what was accepted for the device, in order.
-        self._notify_monitors(1, bytes(data))  # TX
+        self._notify_monitors(source, bytes(data))
         self.flush_serial()
 
     def _warn_dropped(self, count):
@@ -809,24 +841,33 @@ class SerialProxy():
         for server in self._servers:
             server.set_read_paused(paused)
 
-    def add_monitor(self, callback):
-        """Register monitor callback - receives (direction, data)"""
-        if callback not in self._monitors:
-            self._monitors.append(callback)
+    def add_monitor(self, monitor):
+        """Register a monitor - on_data(source, data), on_signals(mask)"""
+        if monitor not in self._monitors:
+            self._monitors.append(monitor)
 
-    def remove_monitor(self, callback):
-        """Unregister monitor callback"""
-        if callback in self._monitors:
-            self._monitors.remove(callback)
+    def remove_monitor(self, monitor):
+        """Unregister a monitor"""
+        if monitor in self._monitors:
+            self._monitors.remove(monitor)
 
-    def _notify_monitors(self, direction, data):
-        """Notify all monitors - direction: 1=TX, 2=RX"""
-        if self._monitors:
-            self._log.debug(
-                "Monitor notify: dir=%d len=%d monitors=%d",
-                direction, len(data), len(self._monitors))
-        for callback in list(self._monitors):
+    def _notify_monitors(self, source, data):
+        """Pass traffic on, saying who produced it (None = the device)"""
+        for monitor in list(self._monitors):
             try:
-                callback(direction, data)
+                monitor.on_data(source, data)
+            except Exception as e:
+                self._log.warning("Monitor callback error: %s", e)
+
+    def _notify_monitor_signals(self, bitmask):
+        """Pass a signal reading on to the monitors.
+
+        Monitors are not in _servers - they watch a port rather than
+        serve it - so the broadcast that reaches every server has to
+        reach them separately.
+        """
+        for monitor in list(self._monitors):
+            try:
+                monitor.on_signals(bitmask)
             except Exception as e:
                 self._log.warning("Monitor callback error: %s", e)

@@ -1,8 +1,39 @@
 """Connection"""
 
+import itertools as _itertools
 import logging as _logging
 import selectors as _selectors
 import time as _time
+
+_CONNECTION_IDS = _itertools.count(1)
+_CONNECTION_ID_ATTR = '_ser2tcp_conn_id'
+
+
+def connection_id(con):
+    """A stable id for one client connection, assigned on first sight.
+
+    Connections cannot be addressed by position: a client hanging up
+    shifts every connection after it, so a request to drop one lands on
+    another. The id is stuck to the object, which is why this works the
+    same for the connections we own and for the uhttp ones behind a
+    WebSocket.
+
+    It lives here rather than beside its first caller because the
+    monitor names the same connections to its own clients, and
+    server_monitor cannot import http_server - that import runs the
+    other way.
+    """
+    existing = getattr(con, _CONNECTION_ID_ATTR, None)
+    if isinstance(existing, str) and existing:
+        return existing
+    assigned = str(next(_CONNECTION_IDS))
+    try:
+        setattr(con, _CONNECTION_ID_ATTR, assigned)
+    except (AttributeError, TypeError):
+        # Nothing to attach it to; it will not be addressable, but the
+        # listing still has to say something.
+        return ''
+    return assigned
 
 
 class Connection():
@@ -47,7 +78,8 @@ class Connection():
         them - four copies would be four chances to forget one.
         """
         if data and self._can_write:
-            self._serial.send(data)
+            # Named as the source so a monitor can say who wrote it.
+            self._serial.send(data, self)
 
     def __del__(self):
         self.close()

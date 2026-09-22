@@ -134,7 +134,8 @@ class TestConnectionSsl(unittest.TestCase):
         """Data should be forwarded to serial"""
         conn, serial, _, _ = self._make_connection()
         conn.on_received(b'hello')
-        serial.send.assert_called_once_with(b'hello')
+        # Named as the source, so a monitor can say who wrote it.
+        serial.send.assert_called_once_with(b'hello', conn)
 
     def test_send_adds_to_buffer(self):
         """Send should add data to buffer"""

@@ -32,7 +32,7 @@ def _serial():
     # something JSON can carry.
     serial.is_connected = True
     serial.name = 'test'
-    serial.serial_config = {'port': '/dev/null', 'baudrate': 9600}
+    serial.info = {'name': 'test', 'device': '/dev/null', 'baudrate': 9600}
     return serial
 
 

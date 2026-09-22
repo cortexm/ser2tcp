@@ -1,7 +1,6 @@
 """HTTP server integration with uhttp"""
 
 import ipaddress as _ipaddress
-import itertools as _itertools
 import json as _json
 import logging as _logging
 import os as _os
@@ -16,6 +15,7 @@ import uhttp.server as _uhttp_server
 
 import ser2tcp.cert_manager as _cert_manager
 import ser2tcp.config_ids as _config_ids
+import ser2tcp.connection as _connection
 import ser2tcp.http_auth as _http_auth
 import ser2tcp.connection_control as _control
 import ser2tcp.ip_filter as _ip_filter
@@ -29,30 +29,8 @@ HTML_DIR = _pathlib.Path(__file__).parent / 'html'
 # configured - they must never find their way back into config.json.
 _REPORTED_ONLY_KEYS = ('id', 'rev', 'error')
 
-_CONNECTION_IDS = _itertools.count(1)
-_CONNECTION_ID_ATTR = '_ser2tcp_conn_id'
-
-
-def connection_id(con):
-    """A stable id for one client connection, assigned on first sight.
-
-    Connections cannot be addressed by position: a client hanging up
-    shifts every connection after it, so a request to drop one lands on
-    another. The id is stuck to the object, which is why this works the
-    same for the connections we own and for the uhttp ones behind a
-    WebSocket.
-    """
-    existing = getattr(con, _CONNECTION_ID_ATTR, None)
-    if isinstance(existing, str) and existing:
-        return existing
-    assigned = str(next(_CONNECTION_IDS))
-    try:
-        setattr(con, _CONNECTION_ID_ATTR, assigned)
-    except (AttributeError, TypeError):
-        # Nothing to attach it to; it will not be addressable, but the
-        # listing still has to say something.
-        return ''
-    return assigned
+# Defined in connection.py, where the monitor can reach it too.
+connection_id = _connection.connection_id
 
 
 def _describe_detected(info):

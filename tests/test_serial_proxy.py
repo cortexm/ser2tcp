@@ -15,6 +15,7 @@ from ser2tcp.serial_proxy import SerialProxy, _format_signals
 def _mock_init(self, config=None, log=None):
     """Mock init that sets required attributes for __del__"""
     self._servers = []
+    self._monitors = []
     self._serial = None
     self._selector = None
     self._serial_source = None
@@ -550,12 +551,24 @@ class TestSerialErrorsAreContained(unittest.TestCase):
         proxy.disconnect.assert_called_once()
 
     def test_successful_write_notifies_monitors(self):
+        """And names whoever asked for it, so a monitor can say who."""
         proxy = self._make_proxy()
         proxy._serial = MagicMock()
-        seen = []
-        proxy._monitors = [lambda direction, data: seen.append((direction, data))]
-        proxy.send(b'data')
-        self.assertEqual(seen, [(1, b'data')])
+        writer = object()
+        monitor = MagicMock()
+        proxy._monitors = [monitor]
+        proxy.send(b'data', writer)
+        monitor.on_data.assert_called_once_with(writer, b'data')
+
+    def test_and_the_device_is_named_by_nobody(self):
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        proxy._serial.read.return_value = b'from the device'
+        proxy._serial.in_waiting = 15
+        monitor = MagicMock()
+        proxy._monitors = [monitor]
+        proxy._process_serial_data()
+        monitor.on_data.assert_called_once_with(None, b'from the device')
 
 
 class TestSignalLogging(unittest.TestCase):

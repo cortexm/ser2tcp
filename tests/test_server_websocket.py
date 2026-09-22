@@ -32,9 +32,8 @@ def make_ws_server(
 def make_serial_mock():
     """A mock serial proxy a WebSocket server can greet a client about.
 
-    The greeting frame describes the port, so `name` and
-    `serial_config` have to be something JSON can carry - a bare Mock
-    is not.
+    The greeting frame describes the port, so `info` has to be
+    something JSON can carry - a bare Mock is not.
     """
     serial = Mock()
     serial.connect.return_value = True
@@ -43,6 +42,7 @@ def make_serial_mock():
     serial.is_connected = True
     serial.name = 'test'
     serial.serial_config = {'port': '/dev/null', 'baudrate': 9600}
+    serial.info = {'name': 'test', 'device': '/dev/null', 'baudrate': 9600}
     return serial
 
 
@@ -210,7 +210,8 @@ class TestDataForwarding(unittest.TestCase):
         client.ws_is_text = False
         srv.add_connection(client)
         srv.process_message(client)
-        srv._serial.send.assert_called_with(b'\x01\x02\x03')
+        # Named as the source, so a monitor can say who wrote it.
+        srv._serial.send.assert_called_with(b'\x01\x02\x03', client)
 
     def test_receive_binary_ignored_when_data_disabled(self):
         srv = make_ws_server(

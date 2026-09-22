@@ -289,7 +289,8 @@ class ServerWebSocket():
         elif client not in self._attached:
             self._refuse_write(client, 'not attached')
         else:
-            self._serial.send(data)
+            # Named as the source so a monitor can say who wrote it.
+            self._serial.send(data, client)
 
     def _process_text_message(self, client, text):
         """Act on a JSON frame from a client.
@@ -448,7 +449,7 @@ class ServerWebSocket():
         needs no rule for which is which.
         """
         msg = {
-            'port': self._port_info(),
+            'port': self._serial.info,
             'can': self._capabilities(),
             'serial': {'connected': bool(self._serial.is_connected)},
             'attach': client in self._attached,
@@ -466,17 +467,6 @@ class ServerWebSocket():
                 # broadcast, and the others have not heard about it.
                 self._reported = signals
         self._send_json(client, msg)
-
-    def _port_info(self):
-        """What is on the other end of this endpoint"""
-        config = self._serial.serial_config or {}
-        return {
-            'name': self._serial.name,
-            # Resolved at connect time when the port is found by USB
-            # match, so it can still be unknown here.
-            'device': config.get('port'),
-            'baudrate': config.get('baudrate'),
-        }
 
     def _capabilities(self):
         """What this client may do, not what the protocol has.
@@ -498,12 +488,7 @@ class ServerWebSocket():
 
     def _signals_dict(self, bitmask):
         """The reported lines, in the order the config named them"""
-        signals = {}
-        for name in self._ctl_signals:
-            bit = _control.SIGNAL_BITS.get(name)
-            if bit is not None:
-                signals[name] = bool(bitmask & (1 << bit))
-        return signals
+        return _control.signals_dict(bitmask, self._ctl_signals)
 
     def _send_json(self, client, msg):
         """Send one text frame, reaping a client that has gone"""

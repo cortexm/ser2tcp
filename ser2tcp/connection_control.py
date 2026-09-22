@@ -23,6 +23,21 @@ SIGNAL_NAMES = ('rts', 'dtr', 'cts', 'dsr', 'ri', 'cd')
 SIGNAL_BITS = {name: i for i, name in enumerate(SIGNAL_NAMES)}
 
 
+def signals_dict(bitmask, names):
+    """The named lines as booleans, in the order they were given.
+
+    One reader for every JSON signal report - an endpoint's and a
+    monitor's - so the two can never disagree about which bit is which.
+    An unknown name is left out rather than guessed at.
+    """
+    signals = {}
+    for name in names:
+        bit = SIGNAL_BITS.get(name)
+        if bit is not None:
+            signals[name] = bool(bitmask & (1 << bit))
+    return signals
+
+
 def wrap_control(connection_class, control_config, can_read=True,
         can_write=True):
     """Wrap a connection class with control protocol handling.

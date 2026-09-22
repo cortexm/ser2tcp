@@ -72,13 +72,14 @@ class TestControlProtocol(unittest.TestCase):
         """Plain data should be forwarded to serial"""
         conn, serial = self._make_connection()
         conn.on_received(b'hello')
-        serial.send.assert_called_once_with(b'hello')
+        # Named as the source, so a monitor can say who wrote it.
+        serial.send.assert_called_once_with(b'hello', conn)
 
     def test_receive_ff_ff_literal(self):
         """FF FF should become single 0xFF"""
         conn, serial = self._make_connection()
         conn.on_received(b'\xff\xff')
-        serial.send.assert_called_once_with(bytes([0xff]))
+        serial.send.assert_called_once_with(bytes([0xff]), conn)
 
     def test_receive_rts_low(self):
         conn, serial = self._make_connection(rts=True)
@@ -134,13 +135,13 @@ class TestControlProtocol(unittest.TestCase):
         conn.on_received(data)
         serial.set_rts.assert_called_once_with(True)
         # serial.send should be called with combined clean data
-        serial.send.assert_called_once_with(b'ABCD')
+        serial.send.assert_called_once_with(b'ABCD', conn)
 
     def test_receive_split_escape(self):
         """Escape byte at end of chunk, command in next chunk"""
         conn, serial = self._make_connection(rts=True)
         conn.on_received(b'AB\xff')
-        serial.send.assert_called_once_with(b'AB')
+        serial.send.assert_called_once_with(b'AB', conn)
         serial.send.reset_mock()
         conn.on_received(bytes([CMD_RTS_HIGH]))
         serial.set_rts.assert_called_once_with(True)
@@ -182,7 +183,7 @@ class TestControlProtocol(unittest.TestCase):
         self.assertEqual(conn.socket().sent_data, b'\xff\xff')
         # Incoming FF FF still produces literal 0xFF
         conn.on_received(b'\xff\xff')
-        serial.send.assert_called_once_with(bytes([0xff]))
+        serial.send.assert_called_once_with(bytes([0xff]), conn)
 
     def test_class_name(self):
         """Wrapped class should have descriptive name"""

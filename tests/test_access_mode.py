@@ -150,8 +150,8 @@ class TestWhatReachesTheDevice(unittest.TestCase):
         self.serial = Mock()
         # The frame a new client is greeted with describes the port.
         self.serial.is_connected = True
-        self.serial.name = 'test'
-        self.serial.serial_config = {'port': '/dev/null', 'baudrate': 9600}
+        self.serial.info = {
+            'name': 'test', 'device': '/dev/null', 'baudrate': 9600}
         return ServerWebSocket(config, self.serial, log=Mock())
 
     def _client(self, text=False, server=None):
@@ -170,8 +170,10 @@ class TestWhatReachesTheDevice(unittest.TestCase):
 
     def test_rw_passes_input_on(self):
         server = self._ws()
-        server.process_message(self._client(server=server))
-        self.serial.send.assert_called_once_with(b'hello')
+        client = self._client(server=server)
+        server.process_message(client)
+        # Named as the source, so a monitor can say who wrote it.
+        self.serial.send.assert_called_once_with(b'hello', client)
 
     def test_ro_does_not(self):
         server = self._ws(access='ro')
@@ -180,8 +182,9 @@ class TestWhatReachesTheDevice(unittest.TestCase):
 
     def test_wo_does(self):
         server = self._ws(access='wo', control={'rts': True})
-        server.process_message(self._client(server=server))
-        self.serial.send.assert_called_once_with(b'hello')
+        client = self._client(server=server)
+        server.process_message(client)
+        self.serial.send.assert_called_once_with(b'hello', client)
 
     def test_rw_sends_to_clients(self):
         server = self._ws()
@@ -214,7 +217,7 @@ class TestAConnectionThatMayNotWrite(unittest.TestCase):
     def test_tcp_writes_by_default(self):
         con = self._connection(ConnectionTcp)
         con.on_received(b'hello')
-        self.serial.send.assert_called_once_with(b'hello')
+        self.serial.send.assert_called_once_with(b'hello', con)
 
     def test_tcp_read_only_does_not_write(self):
         con = self._connection(ConnectionTcp, can_write=False)
@@ -251,7 +254,7 @@ class TestTheControlWrapperRespectsIt(unittest.TestCase):
     def test_data_reaches_the_device(self):
         con = self._connection()
         con.on_received(b'hi')
-        self.serial.send.assert_called_once_with(b'hi')
+        self.serial.send.assert_called_once_with(b'hi', con)
 
     def test_read_only_keeps_data_off_the_device(self):
         con = self._connection(can_write=False)

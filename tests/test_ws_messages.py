@@ -15,6 +15,7 @@ import json
 import unittest
 from unittest.mock import Mock
 
+from ser2tcp.serial_proxy import port_info
 from ser2tcp.server_websocket import ServerWebSocket
 
 
@@ -30,7 +31,8 @@ def _serial(**extra):
     serial.get_signals.return_value = 0
     serial.is_connected = True
     serial.name = 'esp32'
-    serial.serial_config = {'port': '/dev/ttyUSB0', 'baudrate': 115200}
+    serial.info = {
+        'name': 'esp32', 'device': '/dev/ttyUSB0', 'baudrate': 115200}
     for key, value in extra.items():
         setattr(serial, key, value)
     return serial
@@ -122,10 +124,25 @@ class TestTheFirstFrame(WsTestCase):
         hello = _last(self.join())
         self.assertNotIn('signals', hello)
 
+
+class TestDescribingThePort(unittest.TestCase):
+    """One reader for both greetings, so an endpoint and a monitor
+    describe the same port the same way."""
+
+    def _info(self, **config):
+        proxy = Mock()
+        proxy.name = 'esp32'
+        proxy.serial_config = config
+        return port_info(proxy)
+
+    def test_the_device_and_its_speed(self):
+        info = self._info(port='/dev/ttyUSB0', baudrate=115200)
+        self.assertEqual(info['device'], '/dev/ttyUSB0')
+        self.assertEqual(info['baudrate'], 115200)
+
     def test_a_port_found_by_usb_match_has_no_device_yet(self):
-        self.serial.serial_config = {'baudrate': 9600}
-        hello = _last(self.join())
-        self.assertIsNone(hello['port']['device'])
+        """Resolved at connect time, so it can still be unknown."""
+        self.assertIsNone(self._info(baudrate=9600)['device'])
 
 
 class TestWhatThisClientMayDo(WsTestCase):

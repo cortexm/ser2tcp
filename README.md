@@ -761,6 +761,9 @@ With IP filtering:
 | POST | `/api/certs/generate-client` | admin | Generate mTLS client cert (returns PEM, not stored on server) |
 | GET | `/xterm/<endpoint>` | no | WebSocket VT100 terminal |
 | GET | `/raw/<endpoint>` | no | WebSocket raw terminal |
+| GET | `/monitor/<port-name>` | no | Read-only traffic monitor |
+| GET | `/ws/<endpoint>` | yes | WebSocket serial endpoint |
+| GET | `/ws/monitor/<port-name>` | yes | WebSocket traffic monitor |
 
 Auth levels: `no` = public, `yes` = any authenticated user, `admin` = admin user/token only.
 

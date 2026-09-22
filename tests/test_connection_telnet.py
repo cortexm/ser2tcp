@@ -58,13 +58,14 @@ class TestConnectionTelnet(unittest.TestCase):
         """Plain data should be forwarded to serial"""
         conn, serial = self._make_connection()
         conn.on_received(b'hello')
-        serial.send.assert_called_once_with(bytearray(b'hello'))
+        # Named as the source, so a monitor can say who wrote it.
+        serial.send.assert_called_once_with(bytearray(b'hello'), conn)
 
     def test_on_received_escaped_iac(self):
         """Escaped IAC (0xff 0xff) should become single 0xff"""
         conn, serial = self._make_connection()
         conn.on_received(b'\xff\xff')
-        serial.send.assert_called_once_with(bytes((0xff,)))
+        serial.send.assert_called_once_with(bytes((0xff,)), conn)
 
     def test_on_received_telnet_will_command(self):
         """TELNET WILL command should not be forwarded"""
@@ -124,14 +125,16 @@ class TestConnectionTelnet(unittest.TestCase):
         conn, serial = self._make_connection()
         conn.on_received(bytes((0xff, 0xfa, 0x22, 0x01, 0xff, 0xf0)))
         conn.on_received(b'hello')
-        serial.send.assert_called_once_with(bytearray(b'hello'))
+        # Named as the source, so a monitor can say who wrote it.
+        serial.send.assert_called_once_with(bytearray(b'hello'), conn)
 
     def test_data_after_subnegotiation_in_the_same_packet(self):
         """The end of a subnegotiation and data can share one recv()"""
         conn, serial = self._make_connection()
         conn.on_received(
             bytes((0xff, 0xfa, 0x22, 0x01, 0xff, 0xf0)) + b'hello')
-        serial.send.assert_called_once_with(bytearray(b'hello'))
+        # Named as the source, so a monitor can say who wrote it.
+        serial.send.assert_called_once_with(bytearray(b'hello'), conn)
 
     def test_subnegotiation_payload_is_collected(self):
         """Everything between SB and SE is handed over, and only that"""
@@ -154,7 +157,7 @@ class TestConnectionTelnet(unittest.TestCase):
         handler.assert_called_once_with(bytearray((0x22, 0x01, 0x02)))
         serial.send.assert_not_called()
         conn.on_received(b'after')
-        serial.send.assert_called_once_with(bytearray(b'after'))
+        serial.send.assert_called_once_with(bytearray(b'after'), conn)
 
     def test_escaped_iac_inside_subnegotiation_is_a_literal_byte(self):
         """IAC IAC inside SB is data, not the start of a command"""
@@ -171,7 +174,8 @@ class TestConnectionTelnet(unittest.TestCase):
         conn, serial = self._make_connection()
         conn.on_received(bytes((0xff, 0xf0)))
         conn.on_received(b'hello')
-        serial.send.assert_called_once_with(bytearray(b'hello'))
+        # Named as the source, so a monitor can say who wrote it.
+        serial.send.assert_called_once_with(bytearray(b'hello'), conn)
 
     def test_two_subnegotiations_in_a_row(self):
         """State from the first must not leak into the second"""
@@ -184,7 +188,7 @@ class TestConnectionTelnet(unittest.TestCase):
             [call.args[0] for call in handler.call_args_list],
             [bytearray((0x22, 0x01)), bytearray((0x18, 0x02))])
         conn.on_received(b'ok')
-        serial.send.assert_called_once_with(bytearray(b'ok'))
+        serial.send.assert_called_once_with(bytearray(b'ok'), conn)
 
     def test_initial_negotiation_sent(self):
         """Initial TELNET negotiation should be sent on connect"""
