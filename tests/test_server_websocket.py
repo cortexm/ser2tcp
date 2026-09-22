@@ -21,14 +21,29 @@ def make_ws_server(
         config['control'] = control
     if max_connections is not None:
         config['max_connections'] = max_connections
-    serial = Mock()
-    serial.connect.return_value = True
-    serial.get_signals.return_value = 0
+    serial = make_serial_mock()
     serial.disconnect = Mock()
     serial.send = Mock()
     serial.set_rts = Mock()
     serial.set_dtr = Mock()
     return ServerWebSocket(config, serial, log=Mock())
+
+
+def make_serial_mock():
+    """A mock serial proxy a WebSocket server can greet a client about.
+
+    The greeting frame describes the port, so `name` and
+    `serial_config` have to be something JSON can carry - a bare Mock
+    is not.
+    """
+    serial = Mock()
+    serial.connect.return_value = True
+    serial.can_add_connection.return_value = True
+    serial.get_signals.return_value = 0
+    serial.is_connected = True
+    serial.name = 'test'
+    serial.serial_config = {'port': '/dev/null', 'baudrate': 9600}
+    return serial
 
 
 def make_ws_client(addr=('127.0.0.1', 12345)):
@@ -149,14 +164,13 @@ class TestMaxConnections(unittest.TestCase):
 
     def test_port_level_limit(self):
         """Port-level max_connections limits total across servers"""
-        serial = Mock()
+        serial = make_serial_mock()
         # A port that counts its users, like the real one. A fixed list
         # of answers would run out: the limit is asked once to take a
         # slot and again to explain a refusal.
         users = []
         serial.can_add_connection = Mock(side_effect=lambda: len(users) < 2)
         serial.connect = Mock(side_effect=lambda: users.append(1) or True)
-        serial.get_signals = Mock(return_value=0)
         config = {'protocol': 'websocket', 'endpoint': 'test', 'max_connections': 0}
         srv = ServerWebSocket(config, serial)
         c1 = make_ws_client(('127.0.0.1', 1))
@@ -298,14 +312,16 @@ class TestControl(unittest.TestCase):
         srv.send_signal_report(0b01)  # rts only
         msg1 = json.loads(c1.ws_send.call_args[0][0])
         msg2 = json.loads(c2.ws_send.call_args[0][0])
-        self.assertTrue(msg1['signals']['rts'])
-        self.assertFalse(msg1['signals']['dtr'])
+        # Only the line that moved: both were told the whole set when
+        # they arrived, so dtr staying low is not news.
+        self.assertEqual(msg1, {'signals': {'rts': True}})
         self.assertEqual(msg1, msg2)
 
     def test_send_signal_report_no_control(self):
         srv = make_ws_server()  # no control
         client = make_ws_client()
         srv.add_connection(client)
+        client.ws_send.reset_mock()  # clear the greeting
         srv.send_signal_report(0b01)  # should be no-op
         client.ws_send.assert_not_called()
 
@@ -340,11 +356,9 @@ class TestWebSocketBackpressure(unittest.TestCase):
     """
 
     def _server(self):
-        serial = Mock()
-        serial.can_add_connection.return_value = True
-        serial.connect.return_value = True
         return ServerWebSocket(
-            {'protocol': 'websocket', 'endpoint': 'dev'}, serial, log=Mock())
+            {'protocol': 'websocket', 'endpoint': 'dev'},
+            make_serial_mock(), log=Mock())
 
     def _client(self):
         client = Mock()
@@ -397,7 +411,7 @@ class TestWebSocketBackpressure(unittest.TestCase):
         server.add_connection(client)
         server.set_read_paused(True)
         server.send(b'from the device')
-        client.ws_send.assert_called_once_with(b'from the device')
+        client.ws_send.assert_called_with(b'from the device')
 
     def test_a_socket_that_went_away_is_not_a_problem(self):
         server = self._server()

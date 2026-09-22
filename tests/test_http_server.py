@@ -2036,6 +2036,10 @@ class TestApiDisconnectWebSocket(unittest.TestCase):
         serial = Mock()
         serial.can_add_connection.return_value = True
         serial.connect.return_value = True
+        # The frame a new client is greeted with describes the port.
+        serial.is_connected = True
+        serial.name = 'dev'
+        serial.serial_config = {'port': '/dev/ttyUSB0', 'baudrate': 9600}
         ws_server = ServerWebSocket(
             {'protocol': 'websocket', 'endpoint': 'dev'}, serial, log=Mock())
         ws_client = Mock()

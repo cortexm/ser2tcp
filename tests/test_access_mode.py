@@ -148,6 +148,10 @@ class TestWhatReachesTheDevice(unittest.TestCase):
         config = {'protocol': 'websocket', 'endpoint': 'x'}
         config.update(extra)
         self.serial = Mock()
+        # The frame a new client is greeted with describes the port.
+        self.serial.is_connected = True
+        self.serial.name = 'test'
+        self.serial.serial_config = {'port': '/dev/null', 'baudrate': 9600}
         return ServerWebSocket(config, self.serial, log=Mock())
 
     def _client(self, text=False, server=None):
@@ -183,7 +187,7 @@ class TestWhatReachesTheDevice(unittest.TestCase):
         server = self._ws()
         client = self._client(server=server)
         server.send(b'from device')
-        client.ws_send.assert_called_once_with(b'from device')
+        client.ws_send.assert_called_with(b'from device')
 
     def test_wo_sends_nothing_to_clients(self):
         server = self._ws(access='wo', control={'rts': True})

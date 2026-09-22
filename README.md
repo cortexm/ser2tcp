@@ -267,8 +267,11 @@ WebSocket connections go through the HTTP server — no separate listening port 
 - Accessible at `ws://host:port/ws/my-device` (or `wss://` for HTTPS)
 - Available on all configured HTTP servers
 - Binary frames carry raw serial data (bidirectional)
-- Text frames carry JSON control messages: `{"rts": true}`, `{"signals": {...}}`
-- Signal state sent automatically on connect, then only on change
+- Text frames carry JSON: the port it reached, what the client may do,
+  whether the device is there, signal states, and errors
+- The first frame carries everything; later ones only what changed
+- A client can let go of the serial port without closing the socket
+  (`{"attach": false}`) and keeps being told about it
 - Auth: per-server `token`, global user session, or both accepted
 - Web terminals available at `/xterm/<endpoint>` (VT100) and `/raw/<endpoint>` (colored hex)
 

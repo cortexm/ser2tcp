@@ -36,12 +36,14 @@ class ServerWebSocket():
         # Parse control config
         self._ctl_rts = False
         self._ctl_dtr = False
-        self._ctl_signals = set()
+        self._ctl_signals = ()
         if self._control:
             self._ctl_rts = bool(self._control.get('rts'))
             self._ctl_dtr = bool(self._control.get('dtr'))
             signals = self._control.get('signals', [])
-            self._ctl_signals = set(s.lower() for s in signals)
+            # Ordered, so a report reads the way the config was written.
+            self._ctl_signals = tuple(
+                dict.fromkeys(str(s).lower() for s in signals))
         self._ip_filter = _ip_filter.create_filter(config, log=log)
         self._connections = []
         # Who is actually using the device. A connection is a control
@@ -49,6 +51,12 @@ class ServerWebSocket():
         # the port open. Kept as a separate list rather than a flag on
         # the client because uhttp owns those objects.
         self._attached = []
+        # Clients already told their data is going nowhere. One answer
+        # per reason is enough - see _refuse_write().
+        self._write_refused = set()
+        # The signal states every connection has been given, so a
+        # report can carry the difference instead of the whole set.
+        self._reported = None
         # Set while the serial port is behind and clients must wait.
         self._read_paused = False
         self._log.info(
@@ -151,6 +159,8 @@ class ServerWebSocket():
                 self._client_addr(client), self._endpoint)
             return False
         self._attached.append(client)
+        # Whatever it was told about its writes no longer holds.
+        self._write_refused.discard(client)
         if self._read_paused:
             # Joined while the port is behind: wait like the others.
             self._apply_read_paused(client)
@@ -195,8 +205,7 @@ class ServerWebSocket():
         addr = self._client_addr(client)
         self._log.info(
             "Client connected: %s WEBSOCKET /ws/%s", addr, self._endpoint)
-        if self._control:
-            self._send_signals_to(client)
+        self._send_hello(client)
 
     def set_read_paused(self, paused):
         """Stop or resume reading every client on this endpoint.
@@ -260,6 +269,10 @@ class ServerWebSocket():
             # claim it had already given up.
             self.detach(client)
             self._connections.remove(client)
+            self._write_refused.discard(client)
+            if not self._connections:
+                # Nobody left to hold a difference against.
+                self._reported = None
             self._log.info(
                 "Client disconnected: %s WEBSOCKET", addr)
 
@@ -269,24 +282,101 @@ class ServerWebSocket():
         if not data:
             return
         if client.ws_is_text:
-            if self._control:
-                self._process_control_message(client, data.decode('utf-8'))
-        elif self._can_write and client in self._attached:
+            self._process_text_message(
+                client, data.decode('utf-8', 'replace'))
+        elif not self._can_write:
+            self._refuse_write(client, 'this endpoint does not write')
+        elif client not in self._attached:
+            self._refuse_write(client, 'not attached')
+        else:
             self._serial.send(data)
 
-    def _process_control_message(self, client, msg):
-        """Process JSON control message from client"""
+    def _process_text_message(self, client, text):
+        """Act on a JSON frame from a client.
+
+        Every key is looked at, because one frame may carry several
+        topics - and anything refused is answered, because a request
+        dropped in silence cannot be told from one that worked.
+        """
         try:
-            data = _json.loads(msg)
+            msg = _json.loads(text)
         except (ValueError, TypeError):
-            self._log.warning("Invalid JSON control message")
+            self._send_error(client, None, 'not valid JSON')
             return
-        if not isinstance(data, dict):
+        if not isinstance(msg, dict):
+            self._send_error(client, None, 'expected a JSON object')
             return
-        if 'rts' in data and self._ctl_rts:
-            self._serial.set_rts(bool(data['rts']))
-        if 'dtr' in data and self._ctl_dtr:
-            self._serial.set_dtr(bool(data['dtr']))
+        if 'attach' in msg:
+            self._request_attach(client, msg['attach'])
+        signals = msg.get('signals')
+        if isinstance(signals, dict):
+            self._request_signals(client, signals)
+        elif signals is not None:
+            self._send_error(client, 'signals', 'expected an object')
+        # Older clients name a line at the top level instead.
+        legacy = dict((key, msg[key]) for key in ('rts', 'dtr') if key in msg)
+        if legacy:
+            self._request_signals(client, legacy)
+
+    def _request_attach(self, client, wanted):
+        """Take or give up the claim on the port, and say which it is.
+
+        The answer reports the state that resulted rather than the one
+        asked for, so a refusal needs no separate frame to correct it.
+        """
+        reply = {}
+        if wanted:
+            if not self.attach(client):
+                reply['error'] = {
+                    'request': 'attach',
+                    'reason': 'the serial port cannot take another client',
+                }
+        else:
+            self.detach(client)
+        reply['attach'] = client in self._attached
+        self._send_json(client, reply)
+
+    def _request_signals(self, client, wanted):
+        """Set the lines this client may set, refusing the rest by name"""
+        answered = {}
+        refused = []
+        for name, value in wanted.items():
+            name = str(name).lower()
+            if name == 'rts' and self._ctl_rts:
+                self._serial.set_rts(bool(value))
+            elif name == 'dtr' and self._ctl_dtr:
+                self._serial.set_dtr(bool(value))
+            else:
+                refused.append(name)
+                continue
+            if name not in self._ctl_signals:
+                # Settable but not reported: set_rts()/set_dtr() only
+                # broadcast what the config says to report, so without
+                # this the client that asked would hear nothing back.
+                answered[name] = bool(value)
+        reply = {}
+        if answered:
+            reply['signals'] = answered
+        if refused:
+            reply['error'] = {
+                'request': 'signals',
+                'reason': '%s cannot be set here' % ', '.join(refused),
+            }
+        if reply:
+            self._send_json(client, reply)
+
+    def _refuse_write(self, client, reason):
+        """Say why data was dropped, once per client and reason.
+
+        A client that ignores what `can` told it may stream for as long
+        as it likes; answering every frame would turn its mistake into
+        a flood of ours. The note is dropped when the client attaches,
+        so the next refusal is news again.
+        """
+        if client in self._write_refused:
+            return
+        self._write_refused.add(client)
+        self._send_error(client, 'data', reason)
 
     # uhttp owns these sockets: it registers them in the shared
     # selector and drives their reads and writes. Nothing to do here
@@ -309,16 +399,24 @@ class ServerWebSocket():
                 self.remove_connection(client)
 
     def send_signal_report(self, bitmask):
-        """Send signal report to all connections as JSON text frame"""
+        """Report the lines that moved, to every connection.
+
+        Only the difference: a client is handed the whole set when it
+        arrives, so repeating the lines that did not move costs a frame
+        and says nothing. A detached client is told as well - it gave
+        up the data, not the channel.
+        """
         if not self._control:
             return
-        msg = self._bitmask_to_json(bitmask)
-        text = _json.dumps(msg)
-        for client in list(self._connections):
-            try:
-                client.ws_send(text)
-            except OSError:
-                self.remove_connection(client)
+        signals = self._signals_dict(bitmask)
+        changed = signals
+        if self._reported is not None:
+            changed = dict(
+                (name, value) for name, value in signals.items()
+                if self._reported.get(name) != value)
+        self._reported = signals
+        if changed:
+            self._broadcast_json({'signals': changed})
 
     def close_connections(self):
         """Close all WebSocket connections"""
@@ -331,29 +429,104 @@ class ServerWebSocket():
         # Nobody is holding the port any more; leaving the list behind
         # would have has_connections() vouch for clients that are gone.
         self._attached.clear()
+        self._write_refused.clear()
+        # Nobody has been told anything, so the next report is a full
+        # set rather than a difference from what the last lot knew.
+        self._reported = None
         self._serial.disconnect()
 
     def close(self):
         """Close all connections"""
         self.close_connections()
 
-    def _send_signals_to(self, client):
-        """Send current signal state to a single client"""
-        bitmask = self._serial.get_signals()
-        msg = self._bitmask_to_json(bitmask)
-        try:
-            client.ws_send(_json.dumps(msg))
-        except OSError:
-            pass
+    def _send_hello(self, client):
+        """Everything a new client needs, in one frame.
 
-    def _bitmask_to_json(self, bitmask):
-        """Convert signal bitmask to JSON dict filtered by config"""
+        One frame rather than four, so nothing renders a half-built
+        state: the opening message and a later change have the same
+        shape, and a client that dispatches on the keys it recognises
+        needs no rule for which is which.
+        """
+        msg = {
+            'port': self._port_info(),
+            'can': self._capabilities(),
+            'serial': {'connected': bool(self._serial.is_connected)},
+            'attach': client in self._attached,
+        }
+        signals = self._signals_dict(self._serial.get_signals())
+        if signals:
+            # No key at all means nothing is reported, so a client
+            # knows to show no indicators rather than six dead ones.
+            msg['signals'] = signals
+            if self._reported is None:
+                # First client on an empty endpoint: what it was just
+                # handed is what the audience knows, so the next report
+                # can be a difference from it. A later joiner must not
+                # move this - the state may have changed since the last
+                # broadcast, and the others have not heard about it.
+                self._reported = signals
+        self._send_json(client, msg)
+
+    def _port_info(self):
+        """What is on the other end of this endpoint"""
+        config = self._serial.serial_config or {}
+        return {
+            'name': self._serial.name,
+            # Resolved at connect time when the port is found by USB
+            # match, so it can still be unknown here.
+            'device': config.get('port'),
+            'baudrate': config.get('baudrate'),
+        }
+
+    def _capabilities(self):
+        """What this client may do, not what the protocol has.
+
+        The UI used to offer a clickable RTS badge wherever control
+        existed, including where the server drops the request.
+        """
+        settable = []
+        if self._ctl_rts:
+            settable.append('rts')
+        if self._ctl_dtr:
+            settable.append('dtr')
+        return {
+            'read': self._can_read,
+            'write': self._can_write,
+            'signals': settable,
+            'attach': True,
+        }
+
+    def _signals_dict(self, bitmask):
+        """The reported lines, in the order the config named them"""
         signals = {}
         for name in self._ctl_signals:
             bit = _control.SIGNAL_BITS.get(name)
             if bit is not None:
                 signals[name] = bool(bitmask & (1 << bit))
-        return {'signals': signals}
+        return signals
+
+    def _send_json(self, client, msg):
+        """Send one text frame, reaping a client that has gone"""
+        try:
+            client.ws_send(_json.dumps(msg))
+        except OSError:
+            self.remove_connection(client)
+
+    def _broadcast_json(self, msg):
+        """Send one text frame to every connection"""
+        text = _json.dumps(msg)
+        for client in list(self._connections):
+            try:
+                client.ws_send(text)
+            except OSError:
+                self.remove_connection(client)
+
+    def _send_error(self, client, request, reason):
+        """Answer a request that could not be carried out"""
+        error = {'reason': reason}
+        if request:
+            error['request'] = request
+        self._send_json(client, {'error': error})
 
     def _client_addr(self, client):
         """Return formatted client address string"""

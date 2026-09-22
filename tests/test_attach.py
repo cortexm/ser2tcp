@@ -28,6 +28,11 @@ def _serial():
     # Read when a control-enabled endpoint greets a new client; a Mock
     # here would be bit-shifted and raise.
     serial.get_signals.return_value = 0
+    # The greeting frame describes the port, so these have to be
+    # something JSON can carry.
+    serial.is_connected = True
+    serial.name = 'test'
+    serial.serial_config = {'port': '/dev/null', 'baudrate': 9600}
     return serial
 
 
@@ -71,7 +76,7 @@ class TestConnectingAttaches(AttachTestCase):
     def test_it_receives_the_device(self):
         client = self.join()
         self.server.send(b'hello')
-        client.ws_send.assert_called_once_with(b'hello')
+        client.ws_send.assert_called_with(b'hello')
 
 
 class TestDetaching(AttachTestCase):
@@ -233,6 +238,7 @@ class TestWhatTheDeviceSeesWithNobodyAttached(AttachTestCase):
     def test_a_detached_client_is_not_sent_anything(self):
         client = self.join()
         self.server.detach(client)
+        client.ws_send.reset_mock()     # clear the greeting
         self.server.send(b'noise')
         self.assertEqual(client.ws_send.call_count, 0)
 

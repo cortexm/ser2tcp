@@ -112,6 +112,102 @@ class TestWebSocketDataPath(WebSocketTestCase):
                 f'ws://127.0.0.1:{self.port}/ws/nosuch', timeout=5)
 
 
+class TestTheGreetingOverTheWire(WebSocketTestCase):
+    """The first frame has to arrive unasked, before anything else.
+
+    Everything the terminal pages need used to come from a second
+    connection - a filtered NDJSON stream with its own authentication.
+    """
+
+    def test_it_describes_the_port(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        hello = recv_json(conn)
+        self.assertEqual(hello['port']['name'], 'pty')
+        self.assertEqual(hello['port']['device'], self.pty_path)
+
+    def test_it_says_the_device_is_there(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        self.assertEqual(recv_json(conn)['serial'], {'connected': True})
+
+    def test_it_says_what_this_client_may_do(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        can = recv_json(conn)['can']
+        self.assertIs(can['read'], True)
+        self.assertIs(can['write'], True)
+        self.assertEqual(sorted(can['signals']), ['dtr', 'rts'])
+
+    def test_and_that_it_is_attached(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        self.assertIs(recv_json(conn)['attach'], True)
+
+
+class TestAttachingOverTheWire(WebSocketTestCase):
+    """Letting go of the device without closing the socket."""
+
+    def test_a_detached_client_stops_receiving(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        conn.send(json.dumps({'attach': False}))
+        self.assertEqual(recv_json(conn), {'attach': False})
+        os.write(self.master_fd, b'not for you')
+        conn.settimeout(1)
+        with self.assertRaises(Exception):
+            conn.recv()
+
+    def test_and_starts_again_when_it_comes_back(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        conn.send(json.dumps({'attach': False}))
+        recv_json(conn)
+        conn.send(json.dumps({'attach': True}))
+        self.assertEqual(recv_json(conn)['attach'], True)
+        os.write(self.master_fd, b'back')
+        self.assertEqual(recv_binary(conn), b'back')
+
+    def test_what_a_detached_client_types_is_not_forwarded(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        self.drain_device()
+        conn.send(json.dumps({'attach': False}))
+        recv_json(conn)
+        conn.send_binary(b'ignored')
+        self.assertEqual(read_device(self.master_fd, 7, timeout=1), b'')
+
+    def test_and_it_is_told_why(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        conn.send(json.dumps({'attach': False}))
+        recv_json(conn)
+        conn.send_binary(b'ignored')
+        self.assertEqual(recv_json(conn)['error']['request'], 'data')
+
+    def test_the_port_closes_when_the_last_client_detaches(self):
+        """The whole point: the socket stays, the device does not."""
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        self.assertTrue(self.serial_connected())
+        conn.send(json.dumps({'attach': False}))
+        recv_json(conn)
+        self.wait_for_serial(connected=False)
+
+
+class TestBeingRefusedOverTheWire(WebSocketTestCase):
+
+    def test_a_line_that_may_not_be_set_is_answered(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        conn.send(json.dumps({'signals': {'cts': True}}))
+        error = recv_json(conn)['error']
+        self.assertEqual(error['request'], 'signals')
+        self.assertIn('cts', error['reason'])
+
+    def test_a_frame_that_is_not_json_is_answered(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        conn.send('not json{')
+        self.assertIn('error', recv_json(conn))
+
+
 class TestWebSocketControl(WebSocketTestCase):
 
     def test_signals_are_sent_on_connect(self):
