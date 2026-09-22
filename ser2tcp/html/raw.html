@@ -97,10 +97,12 @@ $('endpoint-name').textContent = '/ws/' + endpoint;
 document.title = 'ser2tcp raw \u2014 ' + endpoint;
 
 let ws = null;
-let pingInterval = null;
 // Distinguishes "device unavailable / proxy refused" from "was
 // connected, link dropped" on close.
 let wsEverOpened = false;
+// Whether the page is meant to be connected. A link that dropped is
+// worth picking up again; one the user hung up is not.
+let wantConnected = false;
 // Everything the page knows, all of it from the WebSocket. It used to
 // need a second connection - a filtered NDJSON status stream with its
 // own authentication - for the signal bar and the port state, and that
@@ -115,6 +117,7 @@ let settable = [];
 
 function connect() {
   if (ws) return;
+  wantConnected = true;
   wsEverOpened = false;
   setStatus('connecting');
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -125,15 +128,9 @@ function connect() {
   ws.onopen = () => {
     wsEverOpened = true;
     setStatus('online'); appendInfo('Connected');
-    // Server's KEEP_ALIVE_TIMEOUT is 15 s — ping more often than that or
-    // an idle connection gets torn down with "network connection lost".
-    pingInterval = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send('');
-    }, 10000);
   };
   ws.onclose = ev => {
     ws = null;
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     // What we were told describes a connection we no longer have;
     // stale badges are worse than none.
     serialConnected = null;
@@ -191,9 +188,21 @@ function applyMessage(text) {
 }
 
 function disconnect() {
-  if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+  wantConnected = false;
   if (ws) { ws.close(); ws = null; setStatus('offline'); }
 }
+
+// A page in a background tab can lose its connection even now - the
+// laptop slept, the network went, the server restarted. Coming back
+// into view, or getting the network back, is the moment to find out
+// and to pick it up again.
+function reconnectIfWanted() {
+  if (wantConnected && !ws && endpoint) connect();
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) reconnectIfWanted();
+});
+window.addEventListener('online', reconnectIfWanted);
 
 function setStatus(state) {
   wsState = state;

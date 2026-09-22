@@ -279,10 +279,14 @@ opening state and every change after it.
 
 ## Keeping the connection open
 
-An idle WebSocket is closed by the server after its keep-alive timeout.
-A client with nothing to send should send an empty text frame well
-inside it.
+**The server pings; nothing is required of a client that has nothing to
+say.** A browser answers a ping in its own network stack rather than in
+JavaScript, so a page needs no keep-alive timer — and a timer would not
+help anyway, since browsers throttle them in background tabs. A
+non-browser client only has to answer pings, which every WebSocket
+library does for you.
 
-Browsers throttle timers in background tabs, so a page that pings on an
-interval will eventually be closed while it is not visible. Reconnect
-when the page becomes visible again rather than relying on the timer.
+A connection can still be lost — a slept machine, a network that went,
+a restarted server. Reconnect when the page becomes visible again
+(`visibilitychange`) rather than on a timer, and leave a connection the
+user closed on purpose closed.

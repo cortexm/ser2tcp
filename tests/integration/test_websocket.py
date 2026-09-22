@@ -426,6 +426,35 @@ class TestWebSocketBackpressure(WebSocketTestCase):
         self.assertEqual(got[:len(got)], payload[:len(got)])
 
 
+class TestAQuietConnection(WebSocketTestCase):
+    """uhttp closes a WebSocket that has been quiet for its keep-alive
+    timeout, 15 s. A terminal in a background tab is quiet - a browser
+    throttles its timers - so it was closed for it.
+
+    The client here sends nothing at all and does not even look at the
+    socket: the pong that keeps it open comes from the websocket
+    library's own read of the ping, which is as close as a test gets to
+    a browser answering in its network stack.
+    """
+
+    def test_it_is_not_closed_for_being_quiet(self):
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        recv_json(conn)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            # recv() answers pings on its own; anything it returns is
+            # incidental. Timing out is the point - nothing is sent.
+            conn.settimeout(2)
+            try:
+                conn.recv()
+            except Exception:
+                pass
+            if not conn.connected:
+                self.fail('the server closed a connection that answered')
+        os.write(self.master_fd, b'still here')
+        self.assertEqual(recv_binary(conn), b'still here')
+
+
 class TestTheDeviceGoesAway(WebSocketTestCase):
     """Closing the pty master makes the slave unreadable, which is what
     unplugging a USB adapter looks like from here.

@@ -80,6 +80,22 @@ class FailedHttpServer():
 class HttpServerWrapper():
     """Wrapper around uhttp.HttpServer compatible with ServersManager"""
 
+    # How often a WebSocket is pinged. Derived from the idle deadline
+    # it exists to beat, so the two cannot drift apart: three chances
+    # before a quiet connection would be closed.
+    WS_PING_INTERVAL = _uhttp_server.KEEP_ALIVE_TIMEOUT / 3.0
+
+    @staticmethod
+    def ws_keep_alive_timeout():
+        """How long uhttp lets a WebSocket go quiet before closing it.
+
+        It is the HTTP keep-alive deadline: uhttp's maintenance() puts
+        a WebSocket on the same clock as an idle keep-alive connection,
+        and raising that one would loosen HTTP keep-alive as well,
+        which is a different thing entirely.
+        """
+        return _uhttp_server.KEEP_ALIVE_TIMEOUT
+
     def __init__(self, configs, serial_proxies, log=None,
             config_path=None, configuration=None,
             server_manager=None, selector=None):
@@ -117,6 +133,7 @@ class HttpServerWrapper():
             else _os.path.expanduser('~/.config/ser2tcp')
         self._cert_manager = _cert_manager.CertManager(cfg_dir, log=self._log)
         self._ws_clients = {}  # uhttp client -> ServerWebSocket or ServerMonitor
+        self._last_ws_ping = 0
         self._monitor_servers = {}  # port name -> ServerMonitor
         # (HttpServer, IpFilter or None, config, SSLContext or None)
         self._servers = []
@@ -336,6 +353,31 @@ class HttpServerWrapper():
                 _uhttp_server.EVENT_COMPLETE, _uhttp_server.EVENT_REQUEST):
             self._handle_request(client)
 
+    def ping_websockets(self):
+        """Keep live WebSockets from ageing out as if they were idle.
+
+        uhttp measures a WebSocket by the keep-alive clock, and a
+        browser throttles a background tab's timers to about a minute -
+        so a terminal in another tab was closed for being quiet, and
+        the page showed "offline" and did nothing about it.
+
+        A ping rather than a longer deadline, because it tells a
+        throttled tab from a peer that has gone: a browser answers in
+        its own network stack, not in JavaScript, so the answer is not
+        throttled - and sending does not count as activity in uhttp,
+        only receiving, so a client that cannot answer still ages out.
+        """
+        now = _time.time()
+        if now - self._last_ws_ping < self.WS_PING_INTERVAL:
+            return
+        self._last_ws_ping = now
+        for client in list(self._ws_clients):
+            try:
+                client.ws_ping()
+            except OSError:
+                # Already gone; process_stale() reaps it.
+                pass
+
     def process_stale(self):
         """Cleanup expired sessions and handle pending reload"""
         # Keep-alive and header timeouts have no event to ride on, so
@@ -344,6 +386,7 @@ class HttpServerWrapper():
             server.maintenance()
         if self._auth:
             self._auth.cleanup()
+        self.ping_websockets()
         for monitor in list(self._monitor_servers.values()):
             monitor.process_stale()
         if self._pending_reload:
