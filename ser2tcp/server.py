@@ -22,6 +22,54 @@ class ConfigError(Exception):
     """Configuration error exception"""
 
 
+# Which way data may flow on a server, as (can_read, can_write) — read
+# being the device talking to the client.
+ACCESS_MODES = {
+    'rw': (True, True),
+    'ro': (True, False),
+    'wo': (False, True),
+    'none': (False, False),
+}
+
+# What `data` used to say. It could only express the two ends of that
+# range, which is why `access` replaced it.
+_DATA_ALIAS = {True: 'rw', False: 'none'}
+
+
+def access_name(can_read, can_write):
+    """The mode name for a pair of direction flags"""
+    for name, flags in ACCESS_MODES.items():
+        if flags == (can_read, can_write):
+            return name
+    return 'rw'
+
+
+def parse_access(config):
+    """Return (can_read, can_write) for a server config.
+
+    Raises ValueError on a mode that cannot be read, or on a config that
+    says two different things: picking one of them silently is how a
+    configuration comes to mean less than it says, which is the same
+    mistake the IP filter used to make with an unreadable rule.
+    """
+    mode = config.get('access')
+    if mode is not None:
+        if not isinstance(mode, str) or mode.lower() not in ACCESS_MODES:
+            raise ValueError(
+                f"access must be one of {', '.join(ACCESS_MODES)}, "
+                f"got {mode!r}")
+        mode = mode.lower()
+    if 'data' in config:
+        alias = _DATA_ALIAS[bool(config['data'])]
+        if mode is not None and mode != alias:
+            raise ValueError(
+                f"data: {bool(config['data'])} and access: '{mode}' "
+                f"disagree - data is the older spelling of "
+                f"access: '{alias}'")
+        mode = alias
+    return ACCESS_MODES[mode or 'rw']
+
+
 class Server():
     """Server connection manager"""
 
@@ -47,7 +95,10 @@ class Server():
         self._send_timeout = self._config.get('send_timeout')
         self._buffer_limit = self._config.get('buffer_limit')
         self._control = self._config.get('control')
-        self._data_enabled = self._config.get('data', True)
+        self._can_read, self._can_write = parse_access(self._config)
+        # Kept for the places that only ask "is any data moving" — the
+        # control wrapper and the status payload.
+        self._data_enabled = self._can_read or self._can_write
         self._max_connections = self._config.get('max_connections', 0)
         self._ip_filter = _ip_filter.create_filter(self._config, log=self._log)
         self._ssl_context = None
@@ -61,7 +112,8 @@ class Server():
             raise ConfigError('Unknown protocol %s' % self._protocol)
         if not self._data_enabled and not self._control:
             raise ConfigError(
-                '"data": false requires "control" configuration')
+                'a server that neither reads nor writes requires '
+                '"control" configuration')
         if self._control and self._protocol == 'TELNET':
             raise ConfigError(
                 'Control protocol not supported with TELNET')
@@ -150,8 +202,18 @@ class Server():
 
     @property
     def data_enabled(self):
-        """Return True if data forwarding is enabled"""
+        """Return True if data moves in either direction"""
         return self._data_enabled
+
+    @property
+    def can_read(self):
+        """Return True if the device's output reaches clients"""
+        return self._can_read
+
+    @property
+    def can_write(self):
+        """Return True if a client may send to the device"""
+        return self._can_write
 
     @property
     def max_connections(self):
@@ -206,9 +268,11 @@ class Server():
         if self._ssl_context:
             kwargs['ssl_context'] = self._ssl_context
         connection_class = self.CONNECTIONS[self._protocol]
+        kwargs['can_write'] = self._can_write
         if self._control:
             connection_class = _connection_control.wrap_control(
-                connection_class, self._control, self._data_enabled)
+                connection_class, self._control,
+                can_read=self._can_read, can_write=self._can_write)
         try:
             connection = connection_class(**kwargs)
         except _connection_ssl.SslHandshakeError as err:
@@ -461,7 +525,7 @@ class Server():
 
     def send(self, data):
         """Send data to all connections"""
-        if not self._data_enabled:
+        if not self._can_read:
             return
         for con in self._connections:
             con.send(data)

@@ -8,8 +8,9 @@ class ConnectionTcp(_connection.Connection):
 
     def __init__(
             self, connection, ser, send_timeout=None, buffer_limit=None,
-            log=None):
-        super().__init__(connection, send_timeout, buffer_limit, log)
+            log=None, can_write=True):
+        super().__init__(
+            connection, send_timeout, buffer_limit, log, can_write)
         self._serial = ser
         self._log_connected()
 
@@ -18,5 +19,4 @@ class ConnectionTcp(_connection.Connection):
 
     def on_received(self, data):
         """Received data from client"""
-        if data:
-            self._serial.send(data)
+        self.to_serial(data)

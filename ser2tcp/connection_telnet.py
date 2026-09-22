@@ -33,8 +33,9 @@ class ConnectionTelnet(_connection.Connection):
 
     def __init__(
             self, connection, ser, send_timeout=None, buffer_limit=None,
-            log=None):
-        super().__init__(connection, send_timeout, buffer_limit, log)
+            log=None, can_write=True):
+        super().__init__(
+            connection, send_timeout, buffer_limit, log, can_write)
         self._serial = ser
         # Send initial telnet negotiation
         self.send(bytes((self.TELNET_IAC, self.TELNET_DO, 0x22)))
@@ -62,7 +63,7 @@ class ConnectionTelnet(_connection.Connection):
 
     def _send_data(self, data):
         if self._telnet_state is None:
-            self._serial.send(data)
+            self.to_serial(data)
         elif self._telnet_state == self.TELNET_SB:
             self._subnegotiation_frame.extend(data)
 

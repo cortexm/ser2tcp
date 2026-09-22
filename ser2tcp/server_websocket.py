@@ -25,11 +25,13 @@ class ServerWebSocket():
             raise _server.ConfigError(
                 'WebSocket server requires endpoint')
         self._token = config.get('token')
-        self._data_enabled = config.get('data', True)
+        self._can_read, self._can_write = _server.parse_access(config)
+        self._data_enabled = self._can_read or self._can_write
         self._control = config.get('control')
         if not self._data_enabled and not self._control:
             raise _server.ConfigError(
-                'WebSocket "data": false requires "control" config')
+                'a WebSocket that neither reads nor writes requires '
+                '"control" config')
         self._max_connections = config.get('max_connections', 0)
         # Parse control config
         self._ctl_rts = False
@@ -79,8 +81,18 @@ class ServerWebSocket():
 
     @property
     def data_enabled(self):
-        """Return True if data forwarding is enabled"""
+        """Return True if data moves in either direction"""
         return self._data_enabled
+
+    @property
+    def can_read(self):
+        """Return True if the device's output reaches clients"""
+        return self._can_read
+
+    @property
+    def can_write(self):
+        """Return True if a client may send to the device"""
+        return self._can_write
 
     @property
     def ip_filter(self):
@@ -192,7 +204,7 @@ class ServerWebSocket():
         if client.ws_is_text:
             if self._control:
                 self._process_control_message(client, data.decode('utf-8'))
-        elif self._data_enabled:
+        elif self._can_write:
             self._serial.send(data)
 
     def _process_control_message(self, client, msg):
@@ -221,7 +233,7 @@ class ServerWebSocket():
 
     def send(self, data):
         """Send serial data to all connections as binary frames"""
-        if not self._data_enabled:
+        if not self._can_read:
             return
         for client in list(self._connections):
             try:

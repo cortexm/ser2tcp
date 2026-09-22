@@ -24,7 +24,7 @@ class ConnectionSsl(_connection_tcp.ConnectionTcp):
 
     def __init__(
             self, connection, ser, send_timeout=None, buffer_limit=None,
-            log=None, ssl_context=None):
+            log=None, ssl_context=None, can_write=True):
         sock, addr = connection
         self._socket = None
         try:
@@ -34,7 +34,8 @@ class ConnectionSsl(_connection_tcp.ConnectionTcp):
             sock.close()
             raise SslHandshakeError(f"SSL handshake failed: {err}") from err
         super().__init__(
-            (ssl_sock, addr), ser, send_timeout, buffer_limit, log)
+            (ssl_sock, addr), ser, send_timeout, buffer_limit, log,
+            can_write)
         self._handshake_done = False
         # What the TLS layer last asked to wait for, or None once the
         # handshake is over and ordinary interest rules apply again.

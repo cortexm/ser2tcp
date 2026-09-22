@@ -574,9 +574,25 @@ const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 // Every server setting the editor has a field for. These are rebuilt
 // from the form on save; anything else is carried over untouched.
 const FORM_OWNED_SERVER_KEYS = [
-  'address', 'port', 'endpoint', 'token', 'ssl', 'data', 'control',
-  'allow', 'deny', 'max_connections',
+  'address', 'port', 'endpoint', 'token', 'ssl', 'access', 'data',
+  'control', 'allow', 'deny', 'max_connections',
 ];
+
+// `data` is the older spelling of `access`, and the server refuses a
+// config that carries both and means different things by them. The
+// editor writes `access`, so it has to take `data` with it — leaving
+// the old key behind is how saving a port would break it.
+function serverAccess(srv) {
+  if (srv.access) return srv.access;
+  return srv.data === false ? 'none' : 'rw';
+}
+
+const ACCESS_LABELS = {
+  rw: 'read/write',
+  ro: 'read only — clients cannot write to the device',
+  wo: 'write only — clients are not sent the device output',
+  none: 'control only',
+};
 
 // The same idea for an HTTP server: these come from the form, the rest
 // of the entry - an IP filter, anything added later - is carried over.
@@ -926,6 +942,15 @@ function renderServerRow(srv, portId, srvIdx, portState) {
   head.appendChild(document.createTextNode(addrText));
   li.appendChild(head);
 
+  // Which way data may flow, on every protocol — a read-only TCP server
+  // is as worth saying as a read-only WebSocket. Only when it is not
+  // the default, so an ordinary row stays uncluttered.
+  const access = serverAccess(srv);
+  if (access !== 'rw') {
+    li.appendChild(el('div', { class: 'server-row-detail' },
+      ACCESS_LABELS[access] || access));
+  }
+
   // WebSocket: clickable URL + terminal links
   if (proto === 'WEBSOCKET') {
     const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -941,7 +966,9 @@ function renderServerRow(srv, portId, srvIdx, portState) {
       },
     }, wsUrl);
     li.appendChild(urlEl);
-    if (srv.data !== false) {
+    // A terminal needs to hear the device; write-only and control-only
+    // endpoints would open and then sit silent forever.
+    if (access === 'rw' || access === 'ro') {
       // Skip Terminal / Raw when the configured device isn't present —
       // clicking them would just fail to open a serial connection.
       if (portState !== 'error') {
@@ -966,8 +993,6 @@ function renderServerRow(srv, portId, srvIdx, portState) {
             }, 'Raw')));
         }
       }
-    } else {
-      li.appendChild(el('div', { class: 'server-row-detail' }, 'control only'));
     }
   }
 
@@ -1506,10 +1531,16 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const ctlEnableRow = el('div', { style: 'margin-bottom:6px' },
     el('label', { class: 'checkbox-label' }, ctlEnableCb,
       el('span', {}, ' Control protocol')));
-  const dataCb = el('input', { type: 'checkbox', checked: srv.data !== false });
-  const dataRow = el('div', { style: 'margin-bottom:6px' },
-    el('label', { class: 'checkbox-label' }, dataCb,
-      el('span', {}, ' Forward serial data')));
+  // Which way data may flow. A checkbox could only say all or nothing,
+  // which is what `data` was; a config using `access` would have shown
+  // as ticked and been silently downgraded on save.
+  const accessSel = el('select', {},
+    el('option', { value: 'rw' }, 'Read and write'),
+    el('option', { value: 'ro' }, 'Read only (clients cannot write)'),
+    el('option', { value: 'wo' }, 'Write only (clients hear nothing)'),
+    el('option', { value: 'none' }, 'Neither (control protocol only)'));
+  accessSel.value = serverAccess(srv);
+  const dataRow = formRow('Data', accessSel);
 
   const writeRowCbs = {};
   const writeLabels = ['rts', 'dtr'].map(sig => {
@@ -1556,7 +1587,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     _buildCtlProtocolTable());
 
   const ctlDetails = el('div', { class: 'subgroup' },
-    dataRow, ctlDescEl, ctlMoreDetails, writeRow, reportRow, pollRow);
+    ctlDescEl, ctlMoreDetails, writeRow, reportRow, pollRow);
   const ctlDiv = el('div', {}, ctlEnableRow, ctlDetails);
   ctlEnableCb.onchange = () => {
     ctlDetails.classList.toggle('hidden', !ctlEnableCb.checked);
@@ -1590,6 +1621,10 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   box.appendChild(addrRow);
   box.appendChild(portRow);
   box.appendChild(sslDiv);
+  // Which way data flows is not a control-protocol setting: a plain TCP
+  // server can be read-only. It used to live inside the control section
+  // because `data: false` was only legal with control configured.
+  box.appendChild(dataRow);
   box.appendChild(ctlDiv);
   box.appendChild(ipDiv);
   box.appendChild(maxConnRow);
@@ -1672,7 +1707,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
       get proto() { return protoSel.value; },
       protoSel, addrInput, portInput, epInput: wsEndpointInput,
       tokenInput: wsTokenInput, ssl,
-      ctlEnableCb, dataCb, writeRowCbs, reportCbs, pollSel,
+      ctlEnableCb, accessSel, writeRowCbs, reportCbs, pollSel,
       allowInput, denyInput, maxConnInput,
       // What was configured before this box was opened. The form does
       // not have a field for everything a server can carry, and
@@ -1740,8 +1775,18 @@ function _collectPortConfig(form) {
       if (!sslVal) throw new Error('SSL server requires a bundle');
       srv.ssl = sslVal;
     }
+    // The default carries no key, so an ordinary server stays as plain
+    // in the file as it was before this existed.
+    const access = d.accessSel.value;
+    if (access === 'none' && !(proto !== 'telnet' && d.ctlEnableCb.checked)) {
+      // The server would do nothing at all, and refuses to start. Say so
+      // here rather than letting the save come back as an error.
+      throw new Error(
+        'A server that neither reads nor writes needs the control '
+        + 'protocol enabled, or it would do nothing');
+    }
+    if (access !== 'rw') srv.access = access;
     if (proto !== 'telnet' && d.ctlEnableCb.checked) {
-      if (!d.dataCb.checked) srv.data = false;
       const ctl = {};
       ['rts', 'dtr'].forEach(sig => {
         if (d.writeRowCbs[sig].checked) ctl[sig] = true;

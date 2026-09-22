@@ -13,9 +13,15 @@ class Connection():
 
     def __init__(
             self, connection, send_timeout=None, buffer_limit=None,
-            log=None):
+            log=None, can_write=True):
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._socket, self._addr = connection
+        # Set by the subclasses that own a device; the base only needs
+        # it to refuse a write.
+        self._serial = None
+        # False on a read-only server: this client may listen but must
+        # not disturb the line.
+        self._can_write = can_write
         self._selector = None
         self._owner = None
         self._interest = None
@@ -32,6 +38,16 @@ class Connection():
             self._buffer_limit = buffer_limit
         else:
             self._buffer_limit = self.DEFAULT_BUFFER_LIMIT
+
+    def to_serial(self, data):
+        """Hand data to the device, unless this client may not write.
+
+        Every socket protocol writes to the port from its own
+        on_received(), so the check lives here rather than in each of
+        them - four copies would be four chances to forget one.
+        """
+        if data and self._can_write:
+            self._serial.send(data)
 
     def __del__(self):
         self.close()

@@ -23,19 +23,26 @@ SIGNAL_NAMES = ('rts', 'dtr', 'cts', 'dsr', 'ri', 'cd')
 SIGNAL_BITS = {name: i for i, name in enumerate(SIGNAL_NAMES)}
 
 
-def wrap_control(connection_class, control_config, data_enabled=True):
+def wrap_control(connection_class, control_config, can_read=True,
+        can_write=True):
     """Wrap a connection class with control protocol handling.
 
     Returns a new class that escapes 0xFF in outgoing data and parses
     escape sequences in incoming data for signal control commands.
-    When data_enabled=False, only control commands are processed,
-    0xFF escaping is skipped and data bytes are ignored.
+
+    The two directions are separate: `can_read` decides whether the
+    device's output is escaped and forwarded, `can_write` whether data
+    bytes from the client reach the device. Control commands are not
+    data and work in either case - a read-only server may still be
+    allowed to toggle RTS, and that is `control`'s business, not this
+    one's.
     """
     signals = control_config.get('signals', [])
     signal_set = set(s.lower() for s in signals)
     rts_enabled = bool(control_config.get('rts'))
     dtr_enabled = bool(control_config.get('dtr'))
-    forward_data = data_enabled
+    forward_data = can_read
+    accept_data = can_write
 
     class ControlConnection(connection_class):
 
@@ -46,6 +53,7 @@ def wrap_control(connection_class, control_config, data_enabled=True):
             self._ctl_rts = rts_enabled
             self._ctl_dtr = dtr_enabled
             self._ctl_data = forward_data
+            self._ctl_accept = accept_data
 
         def send(self, data):
             """Send data with 0xFF escaped (skipped when data disabled)"""
@@ -76,16 +84,15 @@ def wrap_control(connection_class, control_config, data_enabled=True):
                     continue
                 if ESCAPE in data:
                     index = data.index(ESCAPE)
-                    if self._ctl_data and index > 0:
+                    if self._ctl_accept and index > 0:
                         clean.extend(data[:index])
                     del data[:index + 1]
                     self._ctl_escape = True
                 else:
-                    if self._ctl_data:
+                    if self._ctl_accept:
                         clean.extend(data)
                     break
-            if clean:
-                self._serial.send(bytes(clean))
+            self.to_serial(bytes(clean))
 
         def _process_control_cmd(self, cmd, clean):
             """Process a control command byte after 0xFF escape"""

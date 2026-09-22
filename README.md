@@ -182,13 +182,51 @@ Match attributes: `vid`, `pid`, `serial_number`, `manufacturer`, `product`, `loc
 | `endpoint` | WebSocket URL path (websocket only), must be unique | required* |
 | `token` | Per-server auth token (websocket only) | - |
 | `ssl` | SSL configuration (required for `ssl` protocol) | - |
-| `data` | Forward serial data (default true), `false` = control-only | true |
+| `access` | Which way data may flow: `rw`, `ro`, `wo`, `none` | `rw` |
+| `data` | Older spelling of `access` — `false` means `none` | true |
 | `control` | Signal control configuration | - |
 | `send_timeout` | Disconnect client if data cannot be sent within this time (seconds) | 5.0 |
 | `buffer_limit` | Maximum send buffer size per client (bytes), `null` for unlimited | null |
 | `max_connections` | Maximum clients per server (0 = unlimited) | 0 |
 
 \* `address`/`port` required for tcp/telnet/ssl; `address` for socket; `endpoint` for websocket
+
+#### Access mode
+
+`access` says which way data may flow on a server. A port can carry
+several servers with different modes at once — a read-write one for the
+application, a read-only one for a logger, and so on.
+
+| `access` | Receives what the device sends | May write to the device |
+|----------|--------------------------------|-------------------------|
+| `rw` *(default)* | yes | yes |
+| `ro` | yes | **no** |
+| `wo` | **no** | yes |
+| `none` | no | no |
+
+```json
+{
+    "servers": [
+        {"protocol": "tcp", "address": "0.0.0.0", "port": 10001},
+        {"protocol": "tcp", "address": "0.0.0.0", "port": 10002,
+         "access": "ro"}
+    ]
+}
+```
+
+Anything a read-only client sends is discarded — it does not reach the
+device and it is not passed on to the other clients either. A write-only
+client is never sent the device's output, while the others still are.
+
+`none` is for a server that exists only for its control protocol, so it
+requires `control` to be configured; without it the server would do
+nothing at all and is refused at startup.
+
+Works on TCP, TELNET, SSL, WebSocket and Unix socket servers.
+
+> `data` is the older spelling and still works: `"data": false` means
+> `"access": "none"`, `"data": true` means `"access": "rw"`. Giving both
+> and having them disagree is refused rather than resolved silently.
 
 #### Port-level connection limit
 

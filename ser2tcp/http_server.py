@@ -787,8 +787,9 @@ class HttpServerWrapper():
                         srv_info['port'] = server.config['port']
                     if 'ssl' in server.config:
                         srv_info['ssl'] = server.config['ssl']
-                if not server.data_enabled:
-                    srv_info['data'] = False
+                if not (server.can_read and server.can_write):
+                    srv_info['access'] = _server.access_name(
+                        server.can_read, server.can_write)
                 if server.control:
                     srv_info['control'] = server.control
                 if server.max_connections:
@@ -1254,8 +1255,15 @@ class HttpServerWrapper():
             proto = srv['protocol'].upper()
             if proto not in ('TCP', 'TELNET', 'SSL', 'SOCKET', 'WEBSOCKET'):
                 return f'Unknown protocol: {srv["protocol"]}'
-            if not srv.get('data', True) and 'control' not in srv:
-                return '"data": false requires "control" config'
+            # Parse it the way the server will, so the API never accepts
+            # a value that would then stop the port from starting.
+            try:
+                can_read, can_write = _server.parse_access(srv)
+            except ValueError as err:
+                return str(err)
+            if not (can_read or can_write) and 'control' not in srv:
+                return ('a server that neither reads nor writes requires '
+                        '"control" config')
             if proto == 'WEBSOCKET':
                 if 'endpoint' not in srv:
                     return 'WebSocket endpoint required'
@@ -2346,8 +2354,10 @@ class HttpServerWrapper():
 
     def _handle_api_certs_generate_client(self, client, user):
         """Generate a client cert signed by a CA bundle. Returns cert+key+ca
-        as PEM strings; not stored server-side. The UI packages them as a
-        download (zip or .p12) for the human to install on the client."""
+        as PEM strings; not stored server-side. The UI offers each of them
+        and the three concatenated (cert, key, CA - what OpenSSL expects
+        from a single file) to download or copy. No .p12: that would mean
+        a password, and a key that survives the response."""
         if not self._require_admin(client, user):
             return
         data = client.data or {}
