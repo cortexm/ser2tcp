@@ -150,7 +150,9 @@ function connect() {
       appendInfo('Disconnected (code: ' + ev.code + ')');
     } else {
       setStatus('error');
-      appendInfo('Cannot open connection (device unavailable?)');
+      // Not the device: a monitor connects to a configured port
+      // whether or not anything is on the other end of it.
+      appendInfo('Cannot open connection (no such port?)');
     }
   };
   ws.onmessage = ev => {

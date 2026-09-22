@@ -571,12 +571,23 @@ body.stream-down .card-detected.card-detected-configured {
   font-family: inherit;
 }
 .kebab-item:hover { background: var(--bg-alt); }
+a.kebab-item { display: block; text-decoration: none; }
+.kebab-item.kebab-disabled {
+  display: block;
+  color: var(--text-faint);
+  cursor: default;
+}
+.kebab-item.kebab-disabled:hover { background: none; }
 .kebab-item.btn-accent  { color: var(--accent); }
 .kebab-item.btn-accent:hover  { background: var(--accent); color: #fff; }
 .kebab-item.btn-warning { color: var(--warning); }
 .kebab-item.btn-warning:hover { background: var(--warning); color: #fff; }
 .kebab-item.btn-success { color: var(--success); }
-.kebab-item.btn-success:hover { background: var(--success); color: #fff; }
+/* Dark on the fill, not white. The other two fills are dark enough to
+   carry white text; green is not — white on #4ade80 measures 1.74:1,
+   which is a label you have to squint at. Near-black gives 10.8:1 in
+   the dark theme and 5.7:1 in the light one. */
+.kebab-item.btn-success:hover { background: var(--success); color: #111; }
 .kebab-item.btn-danger  { color: var(--error); }
 .kebab-item.btn-danger:hover  { background: var(--error); color: #fff; }
 

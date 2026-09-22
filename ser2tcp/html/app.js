@@ -211,7 +211,12 @@ function attachAutocomplete(input, getOptions) {
   return wrap;
 }
 
-// Generic kebab (3-dot) menu — `actions` is array of {label, cls, onclick}.
+// Generic kebab (3-dot) menu. Each action is {label, cls} plus one of:
+//   onclick — a button
+//   href    — a real link, so it can be opened in a new tab, middle-
+//             clicked or copied, which a button cannot be
+//   reason  — inert, and says why, which is more use than an item that
+//             is simply missing
 function kebabMenu(actions) {
   const wrap = el('div', { class: 'kebab-menu' });
   const btnEl = el('button', {
@@ -223,15 +228,28 @@ function kebabMenu(actions) {
     + '<circle cx="12" cy="19" r="2"/></svg>';
   const pop = el('div', { class: 'kebab-pop', hidden: true });
   for (const a of actions) {
-    const item = el('button', {
-      type: 'button',
-      class: 'kebab-item' + (a.cls ? ' ' + a.cls : ''),
-      onclick: e => {
-        e.stopPropagation();
-        pop.hidden = true;
-        a.onclick();
-      },
-    }, a.label);
+    const cls = 'kebab-item' + (a.cls ? ' ' + a.cls : '');
+    let item;
+    if (a.reason) {
+      // Without its colour class: an item that cannot be used should
+      // not keep the emphasis of one that can.
+      item = el('span', { class: 'kebab-item kebab-disabled',
+        title: a.reason }, a.label);
+    } else if (a.href) {
+      item = el('a', {
+        class: cls, href: a.href, target: '_blank', rel: 'noopener',
+        onclick: () => { pop.hidden = true; },
+      }, a.label);
+    } else {
+      item = el('button', {
+        type: 'button', class: cls,
+        onclick: e => {
+          e.stopPropagation();
+          pop.hidden = true;
+          a.onclick();
+        },
+      }, a.label);
+    }
     pop.appendChild(item);
   }
   btnEl.onclick = e => {
@@ -921,15 +939,22 @@ function renderPortCard(port, index) {
   const titleText = port.name || ser.port || ('Port ' + (index + 1));
   const titleSpan = el('span', { class: 'card-title' }, titleText);
   const headerRow = el('div', { class: 'card-header-row' }, titleSpan);
+  // Monitor is there whatever the port is doing: it watches the line,
+  // and waiting for a device to turn up is a thing you open it to do.
+  // It needs a name because that is what the route is keyed by.
+  const actions = [port.name
+    ? { label: 'Monitor', cls: 'btn-success',
+        href: '/monitor/' + encodeURIComponent(port.name) }
+    : { label: 'Monitor', reason: 'the port needs a name to be monitored' }];
   if (isAdmin) {
-    headerRow.appendChild(kebabMenu([
+    actions.push(
       { label: 'Edit', cls: 'btn-accent',
         onclick: () => navigate('/ports/' + encodeURIComponent(id)
           + '/edit') },
       { label: 'Delete', cls: 'btn-danger',
-        onclick: () => confirmDeletePort(id, titleText) },
-    ]));
+        onclick: () => confirmDeletePort(id, titleText) });
   }
+  headerRow.appendChild(kebabMenu(actions));
   card.appendChild(headerRow);
 
   // Subtitle: device path or match
@@ -974,17 +999,6 @@ function renderPortCard(port, index) {
   // card here — moved to the terminal/raw/monitor page toolbars where
   // they're more actionable in context. Those pages report and toggle
   // them over their own WebSocket, not through the API.
-
-  // Monitor link — only useful when the serial proxy is actually
-  // connected and producing TX/RX traffic (state === 'online'). Hidden
-  // when the device is missing (red) or just configured but idle (grey).
-  if (port.name && state === 'online') {
-    card.appendChild(el('div', { class: 'ws-links' },
-      el('a', {
-        href: '/monitor/' + encodeURIComponent(port.name),
-        target: '_blank', rel: 'noopener',
-      }, 'Monitor')));
-  }
 
   // Server list — Terminal / Raw links inside need to know the port
   // state to gate themselves (hidden when the device isn't on the
