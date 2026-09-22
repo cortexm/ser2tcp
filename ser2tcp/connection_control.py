@@ -23,6 +23,33 @@ SIGNAL_NAMES = ('rts', 'dtr', 'cts', 'dsr', 'ri', 'cd')
 SIGNAL_BITS = {name: i for i, name in enumerate(SIGNAL_NAMES)}
 
 
+DEFAULT_POLL_INTERVAL = 0.1
+
+
+def reported_signals(control):
+    """The lines a control config asks to have reported, in its order.
+
+    Empty when there is no control, or control that names none: either
+    way nobody is waiting to hear about the lines, and that is what
+    decides whether they are worth sampling at all.
+    """
+    if not control:
+        return ()
+    names = control.get('signals') or ()
+    return tuple(dict.fromkeys(str(name).lower() for name in names))
+
+
+def poll_interval(control):
+    """How often a control config wants the lines sampled"""
+    if not control:
+        return DEFAULT_POLL_INTERVAL
+    interval = control.get('poll_interval')
+    if isinstance(interval, (int, float)) and not isinstance(interval, bool) \
+            and interval > 0:
+        return float(interval)
+    return DEFAULT_POLL_INTERVAL
+
+
 def signals_dict(bitmask, names):
     """The named lines as booleans, in the order they were given.
 

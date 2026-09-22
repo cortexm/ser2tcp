@@ -230,8 +230,6 @@ class SerialProxy():
         self._monitors = []
         self._last_signals = None
         self._last_signal_poll = 0
-        self._signal_poll_interval = 0.1
-        self._has_control_servers = False
         self._id = config.get('id')
         self._name = config.get('name', '')
         self._max_connections = config.get('max_connections', 0)
@@ -254,13 +252,6 @@ class SerialProxy():
             # second time, and appear in no status anywhere.
             self.close()
             raise
-        # Detect control-enabled servers and set poll interval
-        for server in self._servers:
-            if server.control:
-                self._has_control_servers = True
-                interval = server.control.get('poll_interval')
-                if interval is not None:
-                    self._signal_poll_interval = interval
 
     def _build_servers(self, server_configs, log):
         """Create every server this port serves"""
@@ -799,31 +790,51 @@ class SerialProxy():
     def process_signals(self):
         """Poll serial signals, broadcast changes and log transitions.
 
-        Polling normally earns its ioctls only when some server has
-        control enabled and wants the reports. Debug logging is the
-        other reason to look: without this the input signals (CTS, DSR,
-        RI, CD) never change as far as the log is concerned, because
-        nothing was sampling them.
+        The rate comes from whoever is actually waiting to hear: the
+        shortest interval among the servers that have clients on them
+        and report some line. A server nobody is connected to asks for
+        nothing, and a server with a longer interval never gets a turn
+        of its own - by the time it is due, the faster one has sampled
+        and everybody has been told.
+
+        Debug logging is the other reason to look: without it the input
+        signals (CTS, DSR, RI, CD) never change as far as the log is
+        concerned, because nothing was sampling them.
         """
         if not self._serial:
             return
-        if not self._has_control_servers \
-                and not self._log.isEnabledFor(_logging.DEBUG):
+        watchers = self._signal_watchers()
+        if not watchers and not self._log.isEnabledFor(_logging.DEBUG):
             return
+        interval = min(
+            (_control.poll_interval(server.control) for server in watchers),
+            default=_control.DEFAULT_POLL_INTERVAL)
         now = _time.time()
-        if now - self._last_signal_poll < self._signal_poll_interval:
+        if now - self._last_signal_poll < interval:
             return
         self._last_signal_poll = now
         bitmask = self.get_signals()
         if bitmask != self._last_signals:
             self._log_signal_change(bitmask)
             self._last_signals = bitmask
-            # Sampling for the log alone stays observational: a port
-            # with no control server has nobody to report to.
-            if self._has_control_servers:
+            # Sampling for the log alone stays observational: with
+            # nobody waiting there is nobody to report to.
+            if watchers:
                 for server in self._servers:
                     server.send_signal_report(bitmask)
                 self._notify_monitor_signals(bitmask)
+
+    def _signal_watchers(self):
+        """The servers waiting to hear about the lines.
+
+        Both halves matter. A server with no `control` is not watching
+        anything; a control server with nobody connected to it is an
+        empty room, and sampling for it is ioctls spent on no one.
+        """
+        return [
+            server for server in self._servers
+            if server.connections and _control.reported_signals(server.control)
+        ]
 
     def send(self, data, source=None):
         """Queue data for the serial port and write what it will take.

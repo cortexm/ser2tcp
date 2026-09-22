@@ -41,8 +41,6 @@ def _proxy():
     proxy._read_paused = False
     proxy._last_signals = None
     proxy._last_signal_poll = 0
-    proxy._signal_poll_interval = 0.1
-    proxy._has_control_servers = False
     proxy._last_drop_warning = 0
     proxy._last_reopen = 0
     proxy._open_warned = False
@@ -212,6 +210,7 @@ class TestReopeningThePort(unittest.TestCase):
         self.proxy._serial = None
         self.server = Mock()
         self.server.has_connections.return_value = True
+        self.server.control = None          # not watching the lines
         self.proxy._servers = [self.server]
 
     def test_it_is_tried_while_somebody_is_waiting(self):

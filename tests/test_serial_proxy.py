@@ -32,6 +32,34 @@ def _mock_init(self, config=None, log=None):
     self._announced_connected = False
 
 
+def _watching_server(**control):
+    """A server with a client on it, waiting to hear about the lines.
+
+    Both halves are what makes it a watcher: control that names a line,
+    and somebody connected to hear about it.
+    """
+    server = MagicMock()
+    server.connections = [object()]
+    server.control = dict({'signals': ['rts']}, **control)
+    return server
+
+
+def _idle_server():
+    """Set up for control, but nobody is connected to it"""
+    server = MagicMock()
+    server.connections = []
+    server.control = {'signals': ['rts']}
+    return server
+
+
+def _plain_server():
+    """A client on it, but no control: not watching the lines"""
+    server = MagicMock()
+    server.connections = [object()]
+    server.control = None
+    return server
+
+
 def _make_port_info(device, vid=None, pid=None, serial_number=None,
         manufacturer=None, product=None, location=None):
     """Create mock ListPortInfo"""
@@ -279,11 +307,12 @@ class TestSignalControl(unittest.TestCase):
         proxy = SerialProxy.__new__(SerialProxy)
         _mock_init(proxy)
         proxy._log = MagicMock()
+        # Debug sampling is its own reason to poll; these are about
+        # the other one, so leave it off.
+        proxy._log.isEnabledFor.return_value = False
         proxy._serial_config = {'port': '/dev/ttyUSB0'}
         proxy._last_signals = 0
         proxy._last_signal_poll = 0
-        proxy._signal_poll_interval = 0.1
-        proxy._has_control_servers = False
         proxy._name = ''
         proxy._match = None
         return proxy
@@ -343,9 +372,7 @@ class TestSignalControl(unittest.TestCase):
         proxy._serial.dsr = False
         proxy._serial.ri = False
         proxy._serial.cd = False
-        proxy._has_control_servers = True
-        proxy._signal_poll_interval = 0
-        mock_server = MagicMock()
+        mock_server = _watching_server()
         proxy._servers = [mock_server]
         proxy._last_signals = 0  # different from current
         proxy.process_signals()
@@ -360,9 +387,7 @@ class TestSignalControl(unittest.TestCase):
         proxy._serial.dsr = False
         proxy._serial.ri = False
         proxy._serial.cd = False
-        proxy._has_control_servers = True
-        proxy._signal_poll_interval = 0
-        mock_server = MagicMock()
+        mock_server = _watching_server()
         proxy._servers = [mock_server]
         proxy._last_signals = 0  # same as current
         proxy.process_signals()
@@ -371,11 +396,61 @@ class TestSignalControl(unittest.TestCase):
     def test_process_signals_skipped_without_control(self):
         proxy = self._make_proxy()
         proxy._serial = MagicMock()
-        proxy._has_control_servers = False
-        mock_server = MagicMock()
+        mock_server = _plain_server()
         proxy._servers = [mock_server]
         proxy.process_signals()
         mock_server.send_signal_report.assert_not_called()
+
+    def test_a_control_server_nobody_is_on_is_not_polled_for(self):
+        """An empty room asks for nothing, and the ioctls would be
+        spent on no one."""
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        proxy.get_signals = MagicMock(return_value=0b1)
+        mock_server = _idle_server()
+        proxy._servers = [mock_server]
+        proxy.process_signals()
+        proxy.get_signals.assert_not_called()
+        mock_server.send_signal_report.assert_not_called()
+
+    def test_the_rate_comes_from_the_fastest_watcher(self):
+        """The slower one never gets a turn of its own: by the time it
+        is due, the faster has sampled and everybody has been told."""
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        proxy.get_signals = MagicMock(return_value=0b1)
+        fast = _watching_server(poll_interval=0.05)
+        slow = _watching_server(poll_interval=5.0)
+        proxy._servers = [fast, slow]
+        proxy._last_signal_poll = time.time() - 0.1   # past 0.05, not 5
+        proxy.process_signals()
+        proxy.get_signals.assert_called_once()
+
+    def test_and_a_server_nobody_is_on_does_not_slow_it_down(self):
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        proxy.get_signals = MagicMock(return_value=0b1)
+        idle = _idle_server()
+        idle.control = {'signals': ['rts'], 'poll_interval': 5.0}
+        proxy._servers = [_watching_server(poll_interval=0.05), idle]
+        proxy._last_signal_poll = time.time() - 0.1
+        proxy.process_signals()
+        proxy.get_signals.assert_called_once()
+
+    def test_everyone_is_told_at_the_fast_rate(self):
+        """Including the server that asked for less: it said how often
+        it wants to hear at least, not at most."""
+        proxy = self._make_proxy()
+        proxy._serial = MagicMock()
+        proxy.get_signals = MagicMock(return_value=0b1)
+        fast = _watching_server(poll_interval=0.05)
+        slow = _watching_server(poll_interval=5.0)
+        proxy._servers = [fast, slow]
+        proxy._last_signals = 0
+        proxy._last_signal_poll = time.time() - 0.1
+        proxy.process_signals()
+        fast.send_signal_report.assert_called_once()
+        slow.send_signal_report.assert_called_once()
 
 
 class TestSerialReaderThread(unittest.TestCase):
@@ -593,8 +668,7 @@ class TestSignalLogging(unittest.TestCase):
         proxy._monitors = []
         proxy._last_signals = None
         proxy._last_signal_poll = 0
-        proxy._signal_poll_interval = 0
-        proxy._has_control_servers = control
+        proxy._servers = [_watching_server()] if control else []
         proxy._serial = MagicMock()
         return proxy
 
@@ -636,6 +710,7 @@ class TestSignalLogging(unittest.TestCase):
         proxy.get_signals = MagicMock(return_value=0)
         proxy.process_signals()
         proxy.get_signals.return_value = 1 << 2  # CTS high
+        proxy._last_signal_poll = 0     # past the interval, not through it
         proxy.process_signals()
         self.assertIn(
             '(/dev/ttyUSB0): signals RTS=0 DTR=0 CTS=1 DSR=0 RI=0 CD=0',

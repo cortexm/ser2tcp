@@ -235,7 +235,11 @@ function applyMessage(text) {
     applyPortState();
   }
   if (msg.signals) {
-    signals = Object.assign({}, signals, msg.signals);
+    // An empty object means nothing is reported any more - the last
+    // client of the control server left, so the lines stopped being
+    // sampled and anything on screen would sit frozen.
+    signals = Object.keys(msg.signals).length
+      ? Object.assign({}, signals, msg.signals) : null;
     renderSignals();
   }
   if (msg.peer_connected) appendInfo(describePeer(msg.peer_connected) + ' joined');

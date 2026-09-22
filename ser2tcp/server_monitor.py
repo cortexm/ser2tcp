@@ -36,8 +36,11 @@ class ServerMonitor():
         # be named after it has gone from the port's own lists.
         self._slots = {}
         self._known = {}
-        # What the watchers have been told about the signal lines.
+        # What the watchers have been told about the signal lines, and
+        # which lines those are - the set follows the servers that have
+        # clients, so it changes under us as they come and go.
         self._reported = None
+        self._watched = ()
 
     @property
     def connections(self):
@@ -142,6 +145,7 @@ class ServerMonitor():
             # the port for.
             return
         self._refresh_peers()
+        self._refresh_signals()
 
     def port_gone(self):
         """The port this monitor watches is not there any more.
@@ -203,11 +207,32 @@ class ServerMonitor():
                 'peers': self._peer_list(present),
             })
 
+    def _refresh_signals(self):
+        """Follow the set being watched as clients come and go.
+
+        Which lines are reported is not fixed for a port: it is the
+        union over the servers that have somebody on them, so the last
+        control client leaving ends it. Nothing polls once that
+        happens, so this walk is the only thing left to notice - and a
+        watcher left holding indicators for a set nobody reports would
+        show them frozen for ever.
+        """
+        names = self._reported_signals()
+        if names == self._watched:
+            return
+        self._watched = names
+        signals = self._current_signals()
+        self._reported = signals or None
+        # An empty object says "no lines are reported now", which is a
+        # different thing from a frame that simply carries no signals.
+        self._broadcast_json({'signals': signals})
+
     def _forget_peers(self):
         """Nobody is watching, so nothing is being kept track of"""
         self._slots.clear()
         self._known.clear()
         self._reported = None
+        self._watched = ()
 
     def _peer_list(self, present=None):
         """Everyone on this port, across every server it has"""
@@ -291,6 +316,7 @@ class ServerMonitor():
         # Nothing to read off a device that is not open, and all-low
         # badges for one that is gone are a lie with a tidy face.
         signals = self._current_signals()
+        self._watched = self._reported_signals()
         if signals:
             msg['signals'] = signals
             if self._reported is None:
@@ -298,18 +324,20 @@ class ServerMonitor():
         self._send_json(client, msg)
 
     def _reported_signals(self):
-        """The lines any server on this port is set up to report.
+        """The lines somebody on this port is actually watching.
 
-        A monitor has no control configuration of its own. Showing
-        every line regardless would mean six indicators on a port
-        nobody asked to watch the signals of - and a row of dead ones
-        says less than no row at all.
+        A monitor has no control configuration of its own, so it
+        follows the servers - and only those with clients on them,
+        which is the same rule that decides whether the lines get
+        sampled at all. Watching what nobody is reporting would mean
+        indicators that never move, and a row of dead ones says less
+        than no row.
         """
         names = set()
         for server in self._serial.servers:
-            control = server.control or {}
-            for name in control.get('signals', ()):
-                names.add(str(name).lower())
+            if not server.connections:
+                continue
+            names.update(_control.reported_signals(server.control))
         return tuple(
             name for name in _control.SIGNAL_NAMES if name in names)
 

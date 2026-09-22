@@ -154,7 +154,17 @@ Only the lines that changed:
 Which lines are reported is set by the server's `control.signals`
 configuration. **If the first frame has no `signals` key, nothing is
 being reported** — a client should then show no signal indicators at
-all. Sent in monitor mode too.
+all.
+
+How often they are sampled comes from the servers that have clients on
+them: the shortest `poll_interval` among them. A server asking for a
+longer one still hears at the shorter rate — it said how often it wants
+to hear at least.
+
+On the monitor the set is the union over those same servers, so it
+changes as clients come and go. An **empty** `signals` object means
+nothing is being reported any more; drop whatever you were showing
+rather than leaving it frozen.
 
 ### `peers`
 

@@ -406,8 +406,14 @@ class TestAPeerBehindAProxy(MonitorTestCase):
 
 
 class TestSignalsOnTheMonitor(MonitorTestCase):
+    """A monitor has no control config of its own: it follows the
+    servers, and only those with somebody on them."""
 
     control = {'signals': ['rts', 'cts']}
+
+    def setUp(self):
+        super().setUp()
+        self.join()          # somebody on the control server
 
     def test_the_configured_lines_arrive_with_the_greeting(self):
         self.proxy._signals = 0b000101       # rts + cts
@@ -429,6 +435,35 @@ class TestSignalsOnTheMonitor(MonitorTestCase):
         before = len(client.sent)
         self.proxy.notify_signals(0b000001)
         self.assertEqual(len(client.sent), before)
+
+
+class TestSignalsNobodyIsWatching(MonitorTestCase):
+    """Control on the server, but nobody connected to it.
+
+    Nothing samples the lines then, so a monitor showing indicators
+    would show them frozen for as long as it stayed open.
+    """
+
+    control = {'signals': ['rts', 'cts']}
+
+    def test_the_greeting_carries_none(self):
+        self.proxy._signals = 0b000101
+        self.assertNotIn('signals', last(self.watch()))
+
+    def test_and_they_appear_when_somebody_joins(self):
+        client = self.watch()
+        self.proxy._signals = 0b000101
+        self.join()
+        self.srv.process_stale()
+        self.assertEqual(last(client)['signals'], {'rts': True, 'cts': True})
+
+    def test_and_go_again_when_the_last_one_leaves(self):
+        peer = self.join()
+        client = self.watch()
+        self.leave(peer)
+        # An empty object, which is "nothing is reported now" - not the
+        # same as a frame that simply carries no signals.
+        self.assertEqual(last(client), {'signals': {}})
 
 
 class TestSignalsNobodyAskedFor(MonitorTestCase):
