@@ -1223,12 +1223,12 @@ function _nextFreePort(start) {
 }
 
 function showPortEditor(id, query) {
-  // Wait for portsStatus from the stream: the form needs the detected
-  // device list and the port/endpoint conflict sets, which come from it.
-  if (!portsStatus) {
-    setTimeout(() => showPortEditor(id, query), 50);
-    return;
-  }
+  // The form needs the detected device list and the port/endpoint
+  // conflict sets, and those come from the status stream - which
+  // pushes. There is nothing to wait for with a clock: the first
+  // snapshot calls route() itself, so this runs again on its own, and
+  // until then the stream-down banner says why the page is empty.
+  if (!portsStatus) return;
   // The configuration, not the status. The status says what is
   // happening; the editor writes back what was configured, and the two
   // are not the same document - it reports no IP filters, no WebSocket
@@ -1934,20 +1934,44 @@ function _buildCtlProtocolTable() {
 // ===========================================================================
 let currentUsers = [];
 let currentTokens = [];
+// Whether the lists above have been fetched, which is not the same as
+// whether they hold anything: no users and no tokens is a valid
+// configuration, so their length says nothing about it.
+let usersLoaded = false;
 
 function showUsers() {
   if (!isAdmin) { navigate('/ports'); return; }
   show('users-view');
-  loadUsers();
+  loadUsers().catch(e => console.error(e));
+}
+
+// Open an editor once the data it needs has arrived.
+//
+// Not a timer. These editors used to call themselves again every 50 ms
+// until the data showed up, which asks "do I have any?" where it means
+// "has the load finished?" - so a configuration with no tokens span
+// the loop for ever at two requests a turn, and went on spinning after
+// the user had navigated away, because a timeout has no idea which
+// page scheduled it. Waiting on the load answers the right question,
+// happens once, and has somewhere to put a failure.
+function whenLoaded(load, open) {
+  const from = location.hash;
+  load().then(() => {
+    // Gone somewhere else in the meantime: nothing to open.
+    if (location.hash === from) open();
+  }).catch(e => modalError(String(e)));
 }
 
 function loadUsers() {
-  Promise.all([
+  return Promise.all([
     api('GET', '/api/users').catch(() => []),
     api('GET', '/api/tokens').catch(() => []),
   ]).then(([users, tokens]) => {
     currentUsers = users;
     currentTokens = tokens;
+    // Set even when both came back empty. "None configured" is an
+    // answer, and reading it as "not yet" is what span the retry.
+    usersLoaded = true;
     renderUsersActions();
     renderUsersList();
   });
@@ -2046,13 +2070,17 @@ function confirmDeleteToken(tokenId) {
 function showUserEditor(login) {
   if (!isAdmin) { navigate('/users'); return; }
   // We may not have currentUsers loaded if entered via direct hash
-  if (login !== null && !currentUsers.length) {
-    loadUsers();
-    setTimeout(() => showUserEditor(login), 50);
+  if (login !== null && !usersLoaded) {
+    whenLoaded(loadUsers, () => showUserEditor(login));
     return;
   }
   const isNew = login === null;
-  const user = isNew ? {} : currentUsers.find(u => u.login === login) || {};
+  const user = isNew ? {} : currentUsers.find(u => u.login === login);
+  // An id that is not in the list used to fall back to an empty record,
+  // so a stale link offered a blank form with a Delete button on it.
+  // Nobody ever saw it: getting here meant the retry loop had given up
+  // waiting, and it never did.
+  if (!isNew && !user) return navigate('/users');
   const firstUser = currentUsers.length === 0;
 
   const loginInput = el('input', { type: 'text', value: user.login || '',
@@ -2112,13 +2140,13 @@ async function _saveUser(login, loginInput, passInput, adminCb) {
 // ----- Token editor -----
 function showTokenEditor(tokenId) {
   if (!isAdmin) { navigate('/users'); return; }
-  if (tokenId !== null && !currentTokens.length) {
-    loadUsers();
-    setTimeout(() => showTokenEditor(tokenId), 50);
+  if (tokenId !== null && !usersLoaded) {
+    whenLoaded(loadUsers, () => showTokenEditor(tokenId));
     return;
   }
   const isNew = tokenId === null;
-  const tok = isNew ? {} : currentTokens.find(t => t.token === tokenId) || {};
+  const tok = isNew ? {} : currentTokens.find(t => t.token === tokenId);
+  if (!isNew && !tok) return navigate('/users');
   const tokenValue = tok.token || crypto.randomUUID();
 
   const nameInput = el('input', { type: 'text', value: tok.name || '',
@@ -2185,15 +2213,21 @@ let currentSettings = null;
 
 function showSettings() {
   show('settings-view');
-  loadSettings();
+  loadSettings().catch(logFailure);
 }
 
 function loadSettings() {
-  api('GET', '/api/settings').then(data => {
+  return api('GET', '/api/settings').then(data => {
     currentSettings = data;
     renderSettingsActions();
     renderSettingsList();
-  }).catch(e => { if (e !== 'unauthorized') console.error(e); });
+  });
+}
+
+// What the list views want from a failed load: a line in the console.
+// An editor wants to be told, so it says so itself.
+function logFailure(err) {
+  if (err !== 'unauthorized') console.error(err);
 }
 
 function renderSettingsActions() {
@@ -2288,8 +2322,7 @@ function renderHttpCard(srv, index) {
 function showSessionEditor() {
   if (!isAdmin) { navigate('/settings'); return; }
   if (!currentSettings) {
-    loadSettings();
-    setTimeout(() => showSessionEditor(), 50);
+    whenLoaded(loadSettings, showSessionEditor);
     return;
   }
   const t = currentSettings.session_timeout;
@@ -2377,8 +2410,7 @@ function _buildSslFields(currentSsl, bundles) {
 function showHttpEditor(id) {
   if (!isAdmin) { navigate('/settings'); return; }
   if (!currentSettings) {
-    loadSettings();
-    setTimeout(() => showHttpEditor(id), 50);
+    whenLoaded(loadSettings, () => showHttpEditor(id));
     return;
   }
   // Fetch bundle list each time so newly created bundles show up, and
@@ -2498,15 +2530,15 @@ const PUBLIC_CERT_FILES = ['cert.pem', 'ca.pem'];
 function showCertificates() {
   if (!isAdmin) { navigate('/ports'); return; }
   show('certificates-view');
-  loadCerts();
+  loadCerts().catch(logFailure);
 }
 
 function loadCerts() {
-  api('GET', '/api/certs').then(data => {
+  return api('GET', '/api/certs').then(data => {
     currentCerts = data;
     renderCertsActions();
     renderCertsList();
-  }).catch(e => { if (e !== 'unauthorized') console.error(e); });
+  });
 }
 
 function renderCertsActions() {
@@ -2623,8 +2655,7 @@ function confirmDeleteCertBundle(name) {
 function showCertEditor(name) {
   if (!isAdmin) { navigate('/certificates'); return; }
   if (name !== null && !currentCerts) {
-    loadCerts();
-    setTimeout(() => showCertEditor(name), 50);
+    whenLoaded(loadCerts, () => showCertEditor(name));
     return;
   }
   const isNew = name === null;
