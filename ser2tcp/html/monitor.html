@@ -39,10 +39,16 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
   background: #2b4b6f; color: #cfe6ff; border-color: #3d6c9e;
 }
 .toolbar .toggle-btn.on:hover { background: #35597f; }
+/* One width for both labels, or the button jumps as it toggles and
+   the ones beside it shuffle along with it. */
+.toolbar .btn-pause { min-width: 5.5em; }
 .toolbar .btn-pause.paused {
   background: #b8860b; color: #fff; border-color: #b8860b;
 }
 .toolbar .btn-pause.paused:hover { background: #a0760a; }
+/* The only button here that destroys anything. */
+.toolbar .btn-clear { color: #e88; border-color: #744; }
+.toolbar .btn-clear:hover { background: #e55; color: #fff; border-color: #e55; }
 .toolbar .spacer { flex: 1; }
 .toolbar .status { font-size: 0.85em; color: #aaa; }
 .toolbar a { color: #4a9eff; text-decoration: none; font-size: 0.85em; }
@@ -68,6 +74,9 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
   font-size: 14px; line-height: 1.4; white-space: pre-wrap;
   word-break: break-all; background: #1e1e1e; }
 .info { color: #888; font-style: italic; }
+/* Dim, because it is not traffic. The output is monospace and the
+   stamp is a fixed 12 characters, so the lines column up on their own. */
+.stamp { color: #666; }
 </style>
 </head>
 <body>
@@ -77,12 +86,16 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
   <span class="signal-bar hidden" id="signal-bar"></span>
   <span class="peer-bar hidden" id="peer-bar"></span>
   <span class="spacer"></span>
+  <button type="button" id="btn-time" class="toggle-btn on"
+    aria-pressed="true">Time</button>
   <button type="button" id="btn-source" class="toggle-btn"
     aria-pressed="false">Source</button>
   <button type="button" id="btn-scroll" class="toggle-btn on"
     aria-pressed="true">Auto-scroll</button>
   <button type="button" id="btn-pause" class="btn-pause">Pause</button>
-  <button id="btn-clear">Clear</button>
+  <button type="button" id="btn-copy">Copy</button>
+  <button type="button" id="btn-save">Save</button>
+  <button type="button" id="btn-clear" class="btn-clear">Clear</button>
 </div>
 
 <div id="output"></div>
@@ -120,6 +133,10 @@ let lastSource = null;
 // Whether the output already ends on a line break, so a change of
 // writer right after one does not leave a blank line behind.
 let atLineStart = true;
+// The day the last stamp was written on. A stamp says the time and
+// nothing else, so the date has to be announced when it turns over -
+// otherwise a log left running overnight reads as one long day.
+let lastDate = null;
 // Tracks whether the current WS attempt actually reached the OPEN state.
 // On close we use this to distinguish "device unavailable / proxy refused"
 // (red dot) from "was connected, link dropped" (gray dot).
@@ -188,7 +205,17 @@ function applyMessage(text) {
   try { msg = JSON.parse(text); } catch { return; }
   if (msg.port) {
     // Always complete, so it replaces rather than merges.
+    const was = portState;
     portState = msg.port.state || null;
+    // Whether the device exists on the system at all, which is not the
+    // same question as whether the port is open - one is the cable,
+    // the other is whether anybody is using it.
+    if (was !== null && portState !== null) {
+      const there = portState !== 'error';
+      if (there !== (was !== 'error')) {
+        appendInfo(there ? 'Device plugged in' : 'Device unplugged');
+      }
+    }
     applyPortState();
   }
   if (msg.serial) {
@@ -196,8 +223,12 @@ function applyMessage(text) {
     serialConnected = !!msg.serial.connected;
     // Only a change is news; the opening frame states the device
     // state, and repeating it reads like it happened twice.
-    if (was !== serialConnected) appendInfo(
-      serialConnected ? 'Device connected' : 'Device disconnected');
+    if (was !== serialConnected) appendInfo(serialConnected
+      ? 'Device connected'
+      // The reason separates "the last client let go of it" from
+      // "it was pulled out", which is the whole difference.
+      : 'Device disconnected' + (msg.serial.reason
+        ? ' (' + msg.serial.reason + ')' : ''));
     // The lines say nothing about a device that is gone; the frame
     // that says it came back brings their state with it.
     if (!serialConnected) { signals = null; renderSignals(); }
@@ -264,10 +295,16 @@ function setPaused(value) {
   const btn = $('btn-pause');
   btn.textContent = paused ? 'Resume' : 'Pause';
   btn.classList.toggle('paused', paused);
-  if (!paused && missed) {
-    appendInfo(missed + ' bytes arrived while paused');
-    missed = 0;
+  if (paused) {
+    // In the log, because the log is what gets copied and saved: a
+    // gap nobody wrote down looks like a quiet line.
+    appendInfo('Paused');
+    return;
   }
+  appendInfo(missed
+    ? 'Resumed — ' + missed + ' bytes arrived while paused'
+    : 'Resumed');
+  missed = 0;
 }
 
 function setToggle(id, on) {
@@ -315,22 +352,64 @@ function renderPeers() {
 }
 
 function sourceLabel(slot) {
-  if (slot === DEVICE) return '[dev]';
+  if (slot === DEVICE) return '[dev] ';
   const peer = peers.find(p => p.slot === slot);
   return '[' + (peer ? peer.protocol + ' ' + slot : slot) + '] ';
+}
+
+function pad(value, width) {
+  return String(value).padStart(width, '0');
+}
+
+// When the line is being written, not when the byte was sent: a run
+// carries many bytes and they arrive together. Good enough to line
+// traffic up against a log somewhere else, which is what it is for.
+function now() {
+  const d = new Date();
+  return {
+    date: d.getFullYear() + '-' + pad(d.getMonth() + 1, 2)
+      + '-' + pad(d.getDate(), 2),
+    time: pad(d.getHours(), 2) + ':' + pad(d.getMinutes(), 2) + ':'
+      + pad(d.getSeconds(), 2) + '.' + pad(d.getMilliseconds(), 3),
+  };
+}
+
+// Open a line: the date when the day turned over, then the stamp.
+// Called once something is certain to be written on the line, so an
+// empty run never leaves a stamp with nothing after it.
+function beginLine(out) {
+  if (!toggleOn('btn-time')) return;
+  const at = now();
+  if (at.date !== lastDate) {
+    lastDate = at.date;
+    const day = document.createElement('span');
+    day.className = 'info';
+    day.textContent = '--- ' + at.date + ' ---\n';
+    out.appendChild(day);
+  }
+  const stamp = document.createElement('span');
+  stamp.className = 'stamp';
+  stamp.textContent = at.time + ' ';
+  out.appendChild(stamp);
 }
 
 function appendData(data, slot) {
   if (paused) { missed += data.length; return; }
   const out = $('output');
   const color = sourceColor(slot);
-  const newRun = lastSource !== slot;
-  if (newRun && !atLineStart) {
+  if (lastSource !== slot && !atLineStart) {
     out.appendChild(document.createElement('br'));
     atLineStart = true;
   }
-  let text = newRun && toggleOn('btn-source') ? sourceLabel(slot) : '';
   lastSource = slot;
+  let text = '';
+  let opening = atLineStart;
+  const open = () => {
+    if (!opening) return;
+    opening = false;
+    beginLine(out);
+    if (toggleOn('btn-source')) text += sourceLabel(slot);
+  };
   const flush = breakAfter => {
     if (text) {
       const span = document.createElement('span');
@@ -343,10 +422,12 @@ function appendData(data, slot) {
     if (breakAfter) {
       out.appendChild(document.createElement('br'));
       atLineStart = true;
+      opening = true;
     }
   };
   for (let i = 0; i < data.length; i++) {
     const b = data[i];
+    open();
     if (b >= 0x20 && b < 0x7f) {
       text += String.fromCharCode(b);
       continue;
@@ -356,13 +437,7 @@ function appendData(data, slot) {
     // a break after it as well, so text traffic reads as text instead
     // of one unbroken run.
     text += '\\x' + b.toString(16).padStart(2, '0').toUpperCase();
-    if (b === 0x0a) {
-      flush(true);
-      // Only when something follows, or the run ends on a stray prefix.
-      if (i + 1 < data.length && toggleOn('btn-source')) {
-        text = sourceLabel(slot);
-      }
-    }
+    if (b === 0x0a) flush(true);
   }
   flush(false);
   if (toggleOn('btn-scroll')) {
@@ -372,6 +447,10 @@ function appendData(data, slot) {
 
 function appendInfo(msg) {
   const out = $('output');
+  // Its own line: glued to the end of a half-written run it would read
+  // as something the device said.
+  if (!atLineStart) out.appendChild(document.createElement('br'));
+  beginLine(out);
   const span = document.createElement('span');
   span.className = 'info';
   span.textContent = '--- ' + msg + ' ---\n';
@@ -383,10 +462,83 @@ function appendInfo(msg) {
   }
 }
 
+// What is on screen, as text. textContent cannot be used: the line
+// breaks between runs are <br> elements and it drops them, so every
+// line would come out joined to the next.
+function bufferText() {
+  return Array.from($('output').childNodes)
+    .map(node => node.nodeName === 'BR' ? '\n' : node.textContent)
+    .join('');
+}
+
+// navigator.clipboard exists only in a secure context, and this page
+// is usually reached over plain HTTP on a LAN - so the execCommand
+// path is not politeness to old browsers, it is the one that runs.
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text)
+      .then(() => true, () => execCopy(text));
+  }
+  return Promise.resolve(execCopy(text));
+}
+
+function execCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+  ta.setAttribute('aria-hidden', 'true');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch (e) {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+// Says what happened on the button itself, briefly. An alert for a
+// copy that worked is worse than no news at all.
+function flashLabel(id, text) {
+  const btn = $(id);
+  const was = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = was; }, 1200);
+}
+
+$('btn-copy').onclick = () => {
+  copyText(bufferText()).then(ok => flashLabel(
+    'btn-copy', ok ? 'Copied' : 'Failed'));
+};
+
+$('btn-save').onclick = () => {
+  const at = now();
+  const name = 'ser2tcp-' + (portName || 'monitor') + '-'
+    + at.date.replace(/-/g, '')
+    + at.time.slice(0, 8).replace(/:/g, '') + '.log';
+  const url = URL.createObjectURL(
+    new Blob([bufferText()], { type: 'text/plain' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+};
+
 $('btn-clear').onclick = () => {
   $('output').innerHTML = '';
   lastSource = null;
   atLineStart = true;
+  lastDate = null;        // the date line went with the rest
+};
+$('btn-time').onclick = () => {
+  // Turning it back on announces the date again: the last one said is
+  // scrolled away somewhere above, if it was ever said at all.
+  if (setToggle('btn-time', !toggleOn('btn-time'))) lastDate = null;
 };
 $('btn-source').onclick = () => setToggle('btn-source', !toggleOn('btn-source'));
 $('btn-scroll').onclick = () => setToggle('btn-scroll', !toggleOn('btn-scroll'));
