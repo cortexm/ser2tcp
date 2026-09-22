@@ -931,6 +931,27 @@ tbody tr:hover { background: var(--table-hover); }
 .token-value.copied { color: var(--success); }
 .token-value.copied::after { content: ' (copied)'; font-family: inherit; }
 
+/* --- Icon-only copy button (next to a path or URL shown as text) --- */
+.copy-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: -2px;
+  margin-left: 6px;
+  padding: 2px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.copy-icon-btn:hover { color: var(--accent); background: var(--bg-alt); }
+.copy-icon-btn.copied { color: var(--success); }
+.copy-icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* --- Server entries inside a port card --- */
 .server-list {
   margin: 0;

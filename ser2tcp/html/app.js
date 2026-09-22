@@ -31,6 +31,74 @@ function btn(text, cls, onclick) {
   return el('button', { type: 'button', class: 'btn ' + (cls || ''), onclick }, text);
 }
 
+// Copy to the clipboard, wherever the page happens to be served from.
+// navigator.clipboard exists only in a secure context and this UI is
+// routinely reached over plain HTTP on a LAN, so the execCommand path is
+// not a legacy nicety here — it is the one that runs. Resolves to whether
+// the text actually made it.
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text)
+      .then(() => true, () => _execCopy(text));
+  }
+  return Promise.resolve(_execCopy(text));
+}
+
+// execCommand copies the selection, so it needs one: an off-screen
+// textarea holding the text, selected and thrown away again.
+function _execCopy(text) {
+  const ta = el('textarea', {
+    style: 'position:fixed;top:-1000px;opacity:0', 'aria-hidden': 'true',
+  });
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch (e) {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+const _COPY_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
+  + 'fill="none" stroke="currentColor" stroke-width="1.4" '
+  + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<rect x="6" y="6" width="8.5" height="9" rx="1.5"/>'
+  + '<path d="M11 3.8V3A1.5 1.5 0 0 0 9.5 1.5H3A1.5 1.5 0 0 0 1.5 3v6.5'
+  + 'A1.5 1.5 0 0 0 3 11h.8"/></svg>';
+const _COPIED_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
+  + 'fill="none" stroke="currentColor" stroke-width="1.8" '
+  + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<path d="M2.5 8.5 6 12l7.5-8"/></svg>';
+
+// Small icon-only copy button — for a value that is displayed as text
+// (a filesystem path, a URL) and would otherwise have to be selected by
+// hand. `value` may be a string or a function returning one, for values
+// that are not known yet when the button is built.
+function copyIconBtn(value, title) {
+  const b = el('button', {
+    type: 'button', class: 'copy-icon-btn',
+    title: title || 'Copy to clipboard',
+    'aria-label': title || 'Copy to clipboard',
+  });
+  b.innerHTML = _COPY_ICON;
+  b.onclick = () => {
+    copyText(typeof value === 'function' ? value() : value).then(ok => {
+      if (!ok) return;
+      b.innerHTML = _COPIED_ICON;
+      b.classList.add('copied');
+      setTimeout(() => {
+        b.innerHTML = _COPY_ICON;
+        b.classList.remove('copied');
+      }, 1200);
+    });
+  };
+  return b;
+}
+
 function formGroup(label, input, opts = {}) {
   const wrap = el('div', { class: 'form-group' });
   if (label) wrap.appendChild(el('label', {}, label));
@@ -443,6 +511,8 @@ const routes = [
   [/^\/certificates\/([^/]+)$/,    m => showCertEditor(decodeURIComponent(m[1]))],
   [/^\/certificates\/([^/]+)\/paste\/(cert\.pem|key\.pem|ca\.pem)$/,
     m => _showPasteCertModal(decodeURIComponent(m[1]), m[2])],
+  [/^\/certificates\/([^/]+)\/view\/(cert\.pem|ca\.pem)$/,
+    m => _showViewCertModal(decodeURIComponent(m[1]), m[2])],
   [/^\/certificates\/([^/]+)\/replace$/,
     m => _showReplacePairModal(decodeURIComponent(m[1]))],
   [/^\/login$/,                    () => showLogin()],
@@ -960,9 +1030,10 @@ function renderServerRow(srv, portId, srvIdx, portState) {
       title: 'Click to copy',
       onclick: e => {
         e.stopPropagation();
-        navigator.clipboard.writeText(wsUrl);
-        urlEl.textContent = 'Copied!';
-        setTimeout(() => { urlEl.textContent = wsUrl; }, 1000);
+        copyText(wsUrl).then(ok => {
+          urlEl.textContent = ok ? 'Copied!' : 'Copy failed';
+          setTimeout(() => { urlEl.textContent = wsUrl; }, 1000);
+        });
       },
     }, wsUrl);
     li.appendChild(urlEl);
@@ -1497,7 +1568,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     onclick: () => { wsTokenInput.value = crypto.randomUUID(); } }, 'Generate');
   const wsCopyBtn = el('button', { type: 'button', class: 'btn btn-small',
     onclick: () => {
-      if (wsTokenInput.value) navigator.clipboard.writeText(wsTokenInput.value);
+      if (wsTokenInput.value) copyText(wsTokenInput.value);
     } }, 'Copy');
   const wsTokenRow = formRow('Token', [wsTokenInput, wsGenBtn, wsCopyBtn]);
   const wsRows = el('div',
@@ -1945,7 +2016,8 @@ function renderTokenCard(tok) {
     class: 'token-value',
     title: 'Click to copy',
     onclick: () => {
-      navigator.clipboard.writeText(tok.token).then(() => {
+      copyText(tok.token).then(ok => {
+        if (!ok) return;
         tv.classList.add('copied');
         setTimeout(() => tv.classList.remove('copied'), 1000);
       });
@@ -2056,8 +2128,8 @@ function showTokenEditor(tokenId) {
   const genBtn = btn('Generate', 'btn-accent btn-small',
     () => { tokenInput.value = crypto.randomUUID(); });
   const copyBtn = btn('Copy', 'btn-small', () => {
-    navigator.clipboard.writeText(tokenInput.value).then(() => {
-      copyBtn.textContent = 'Copied';
+    copyText(tokenInput.value).then(ok => {
+      copyBtn.textContent = ok ? 'Copied' : 'Copy failed';
       setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1000);
     });
   });
@@ -2447,8 +2519,14 @@ function renderCertsActions() {
 }
 
 function renderCertsList() {
-  $('certificates-path').textContent =
-    'Certificates stored in: ' + (currentCerts.certs_dir || '');
+  const certsDir = currentCerts.certs_dir || '';
+  const pathEl = $('certificates-path');
+  pathEl.innerHTML = '';
+  pathEl.appendChild(el('span', { style: 'word-break:break-all;min-width:0' },
+    'Certificates stored in: ' + certsDir));
+  if (certsDir) {
+    pathEl.appendChild(copyIconBtn(certsDir, 'Copy path'));
+  }
   const root = $('certificates-content');
   root.innerHTML = '';
   const bundles = currentCerts.bundles || [];
@@ -2591,9 +2669,14 @@ function _showNewBundleModal() {
 
 function _showBundleEditor(info) {
   const body = el('div', {});
+  // Flex row, not a plain line: the path wraps (it is long and breaks
+  // anywhere) and the icon must stay beside it, not drop below.
   body.appendChild(el('div', {
-    class: 'card-subtitle', style: 'margin-bottom:12px;word-break:break-all',
-  }, 'Path: ' + info.path));
+    class: 'card-subtitle',
+    style: 'margin-bottom:12px;display:flex;align-items:flex-start',
+  }, el('span', { style: 'word-break:break-all;min-width:0' },
+       'Path: ' + info.path),
+     copyIconBtn(info.path, 'Copy path')));
 
   const usedBy = info.used_by || [];
   if (usedBy.length) {
@@ -2862,8 +2945,9 @@ function _renderCertFileRow(bundleName, fname, fileInfo, usedBy) {
       + '/paste/' + fname)));
   if (fileInfo.present) {
     if (fname !== 'key.pem') {
-      actions.appendChild(btn('View / download', 'btn-small',
-        () => _downloadCertFile(bundleName, fname)));
+      actions.appendChild(btn('View', 'btn-small',
+        () => navigate('/certificates/' + encodeURIComponent(bundleName)
+          + '/view/' + fname)));
     }
     actions.appendChild(btn('Delete', 'btn-small btn-danger',
       () => _confirmDeleteCertFile(bundleName, fname, usedBy)));
@@ -2909,19 +2993,67 @@ function _showPasteCertModal(bundleName, fname) {
   ta.focus();
 }
 
-function _downloadCertFile(bundleName, fname) {
+// Save a PEM string as a file. The content is already in the browser,
+// so there is nothing to fetch — no server round trip, no second request
+// that could fail after the user already sees the text.
+function _downloadPem(filename, content) {
+  const blob = new Blob([content], { type: 'application/x-pem-file' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Show the PEM in a read-only box; download and copy act on what is
+// displayed. A plain download gave no way to check what is in the file
+// without opening it from the download folder, and pasting a cert into
+// another host's config is the common case anyway.
+function _showViewCertModal(bundleName, fname) {
   api('GET', '/api/certs/' + encodeURIComponent(bundleName)
         + '/files/' + encodeURIComponent(fname))
-    .then(data => {
-      const blob = new Blob([data.content], { type: 'application/x-pem-file' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = bundleName + '-' + fname;
-      a.click();
-      URL.revokeObjectURL(url);
-    })
-    .catch(e => alert(String(e)));
+    .then(data => _renderViewCertModal(bundleName, fname, data.content || ''))
+    .catch(e => {
+      if (e !== 'unauthorized') alert(String(e));
+      navigate('/certificates/' + encodeURIComponent(bundleName));
+    });
+}
+
+function _renderViewCertModal(bundleName, fname, content) {
+  const ta = el('textarea', {
+    rows: '16', readonly: true, spellcheck: 'false',
+    style: 'width:100%;font-family:monospace;font-size:12px',
+  });
+  ta.value = content;
+  const downloadName = bundleName + '-' + fname;
+  // The visible textarea is selected as well, so that a browser which
+  // refuses both copy paths still leaves the user one keystroke away.
+  const copyBtn = btn('Copy', 'btn-small', () => {
+    ta.focus();
+    ta.select();
+    copyText(content).then(ok => {
+      copyBtn.textContent = ok ? 'Copied' : 'Press Ctrl+C';
+      setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+    });
+  });
+  const body = el('div', {},
+    el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px' },
+      btn('Download', 'btn-small btn-accent',
+        () => _downloadPem(downloadName, content)),
+      copyBtn),
+    ta,
+    el('div', { class: 'card-subtitle', style: 'margin-top:4px;font-size:12px' },
+      'Saved as ' + downloadName + '. Public file — it contains no '
+      + 'private key.'));
+  openModal({
+    title: fname + ' (' + bundleName + ')',
+    body,
+    wide: true,
+    footer: [btn('Close', 'btn-primary', () => backToList())],
+  });
+  ta.focus();
+  ta.setSelectionRange(0, 0);
 }
 
 // ----- Certificate generator -----
@@ -3127,36 +3259,52 @@ function _submitCertGeneration(fields) {
     .catch(e => modalError(String(e)));
 }
 
+// Join PEM blocks into one file. Order is cert, key, CA — what OpenSSL
+// (and therefore curl --cert, Python's load_cert_chain, HAProxy, stunnel)
+// expects when it is handed a single file. No comment lines between the
+// blocks: OpenSSL would skip them, but a stricter parser need not, and
+// the order already says which block is which.
+function _joinPem(...parts) {
+  return parts
+    .filter(p => p && p.trim())
+    .map(p => p.trim() + '\n')
+    .join('');
+}
+
 function _showClientCertDownload(data) {
-  // Present cert+key+ca as separate downloads. Combined ZIP would
-  // require a JS library; three buttons is good enough and lets the
-  // user pick what to install on the client.
-  const downloadBtn = (label, filename, content) => btn(
-    label, 'btn-accent btn-small',
-    () => {
-      const blob = new Blob([content], { type: 'application/x-pem-file' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
-    });
+  // cert+key+ca separately, and the three of them as one file — most
+  // clients take a single combined PEM and that is one thing to copy
+  // over instead of three. A ZIP would need a JS library, and a .p12
+  // would need the key to make a second trip through the server.
   const namePrefix = (data.cn || 'client').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const combined = _joinPem(data.cert_pem, data.key_pem, data.ca_pem);
+  const fileRow = (label, filename, content, note) => el('div', {
+    style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap',
+  },
+    btn('Download ' + label, 'btn-accent btn-small',
+      () => _downloadPem(filename, content)),
+    copyIconBtn(content, 'Copy ' + label + ' to clipboard'),
+    el('span', { class: 'card-subtitle', style: 'font-size:12px' }, note));
   const body = el('div', {},
     el('p', {},
       'Client certificate generated. Download the files and install '
       + 'them on the mTLS client. ',
       el('strong', {}, 'The private key is not stored on the server '),
       '— if you lose it, regenerate.'),
-    el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin:12px 0' },
-      downloadBtn('cert.pem', namePrefix + '-cert.pem', data.cert_pem),
-      downloadBtn('key.pem', namePrefix + '-key.pem', data.key_pem),
-      downloadBtn('ca.pem', namePrefix + '-ca.pem', data.ca_pem)),
+    el('div', { style: 'display:flex;flex-direction:column;gap:8px;margin:12px 0' },
+      fileRow('all-in-one', namePrefix + '-combined.pem', combined,
+        'certificate + key + CA in one file'),
+      fileRow('cert.pem', namePrefix + '-cert.pem', data.cert_pem,
+        'the client certificate'),
+      fileRow('key.pem', namePrefix + '-key.pem', data.key_pem,
+        'the private key — keep it secret'),
+      fileRow('ca.pem', namePrefix + '-ca.pem', data.ca_pem,
+        'the CA to trust the server with')),
     el('p', { class: 'card-subtitle', style: 'font-size:12px' },
-      'On the client, configure your TLS stack to present '
-      + namePrefix + '-cert.pem + ' + namePrefix + '-key.pem '
-      + 'and trust ' + namePrefix + '-ca.pem.'));
+      'Either hand the client ' + namePrefix + '-combined.pem, or the '
+      + 'separate files: present cert.pem + key.pem, trust ca.pem. '
+      + 'The combined file and key.pem both hold the private key — '
+      + 'store them mode 0600.'));
   openModal({
     title: 'Client certificate ready',
     body,
