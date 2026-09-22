@@ -445,8 +445,13 @@ class SerialProxy():
         return False
 
     def total_connections(self):
-        """Return total number of connections across all servers"""
-        return sum(len(server.connections) for server in self._servers)
+        """How many clients are using the device, across all servers.
+
+        Counts the *attached* ones: the port-level limit is about how
+        many share the device, and a WebSocket that has detached is not
+        one of them even though its socket is still open.
+        """
+        return sum(len(server.attached) for server in self._servers)
 
     def can_add_connection(self):
         """Check if new connection can be added (port-level limit)"""

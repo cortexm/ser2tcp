@@ -414,6 +414,16 @@ class Server():
                 if _os.path.exists(sock_path):
                     _os.unlink(sock_path)
 
+    @property
+    def attached(self):
+        """The clients holding the port open.
+
+        A socket protocol has no way to say "stay connected but let go
+        of the device", so every connection is attached. The property
+        exists so SerialProxy can ask both server kinds the same thing.
+        """
+        return self._connections
+
     def has_connections(self):
         """True if server has some connections"""
         return bool(self._connections)

@@ -150,38 +150,45 @@ class TestWhatReachesTheDevice(unittest.TestCase):
         self.serial = Mock()
         return ServerWebSocket(config, self.serial, log=Mock())
 
-    def _client(self, text=False):
+    def _client(self, text=False, server=None):
+        """A client joined the ordinary way, so it is attached.
+
+        Only attached clients carry data now, so reaching into the
+        server's lists would test something the real path never does.
+        """
         client = Mock()
         client.ws_is_text = text
+        client.is_websocket = True
         client.read_buffer.return_value = b'hello'
+        if server is not None:
+            server.add_connection(client)
         return client
 
     def test_rw_passes_input_on(self):
         server = self._ws()
-        server.process_message(self._client())
+        server.process_message(self._client(server=server))
         self.serial.send.assert_called_once_with(b'hello')
 
     def test_ro_does_not(self):
         server = self._ws(access='ro')
-        server.process_message(self._client())
+        server.process_message(self._client(server=server))
         self.serial.send.assert_not_called()
 
     def test_wo_does(self):
         server = self._ws(access='wo', control={'rts': True})
-        server.process_message(self._client())
+        server.process_message(self._client(server=server))
         self.serial.send.assert_called_once_with(b'hello')
 
     def test_rw_sends_to_clients(self):
         server = self._ws()
-        client = Mock()
-        server._connections.append(client)
+        client = self._client(server=server)
         server.send(b'from device')
         client.ws_send.assert_called_once_with(b'from device')
 
     def test_wo_sends_nothing_to_clients(self):
         server = self._ws(access='wo', control={'rts': True})
-        client = Mock()
-        server._connections.append(client)
+        client = self._client(server=server)
+        client.ws_send.reset_mock()
         server.send(b'from device')
         client.ws_send.assert_not_called()
 

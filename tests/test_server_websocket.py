@@ -150,8 +150,12 @@ class TestMaxConnections(unittest.TestCase):
     def test_port_level_limit(self):
         """Port-level max_connections limits total across servers"""
         serial = Mock()
-        serial.connect = Mock(return_value=True)
-        serial.can_add_connection = Mock(side_effect=[True, True, False])
+        # A port that counts its users, like the real one. A fixed list
+        # of answers would run out: the limit is asked once to take a
+        # slot and again to explain a refusal.
+        users = []
+        serial.can_add_connection = Mock(side_effect=lambda: len(users) < 2)
+        serial.connect = Mock(side_effect=lambda: users.append(1) or True)
         serial.get_signals = Mock(return_value=0)
         config = {'protocol': 'websocket', 'endpoint': 'test', 'max_connections': 0}
         srv = ServerWebSocket(config, serial)

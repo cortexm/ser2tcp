@@ -44,6 +44,11 @@ class ServerWebSocket():
             self._ctl_signals = set(s.lower() for s in signals)
         self._ip_filter = _ip_filter.create_filter(config, log=log)
         self._connections = []
+        # Who is actually using the device. A connection is a control
+        # channel; being attached is what carries data and what holds
+        # the port open. Kept as a separate list rather than a flag on
+        # the client because uhttp owns those objects.
+        self._attached = []
         # Set while the serial port is behind and clients must wait.
         self._read_paused = False
         self._log.info(
@@ -66,8 +71,18 @@ class ServerWebSocket():
 
     @property
     def connections(self):
-        """Return list of connections (uhttp HttpConnection objects)"""
+        """Every client on this endpoint, attached or not.
+
+        This is what the status payload lists and what the disconnect
+        endpoint looks through: a detached client is still a client and
+        must not vanish from either.
+        """
         return self._connections
+
+    @property
+    def attached(self):
+        """The clients carrying data, and so holding the port open"""
+        return self._attached
 
     @property
     def endpoint(self):
@@ -105,8 +120,54 @@ class ServerWebSocket():
         return self._max_connections
 
     def has_connections(self):
-        """True if server has active connections"""
-        return bool(self._connections)
+        """True while somebody is holding the port open.
+
+        Asked by SerialProxy.disconnect() to decide whether the device
+        may be closed, so it has to mean *attached* - a control channel
+        with nobody listening to the device is not a reason to keep it
+        open.
+        """
+        return bool(self._attached)
+
+    def attach(self, client):
+        """Start carrying data for this client, opening the port.
+
+        Returns False when the port cannot take another user: the
+        client stays connected, because its control channel is still
+        good and it has to be able to be told why.
+        """
+        if client not in self._connections:
+            return False
+        if client in self._attached:
+            return True
+        if not self._serial.can_add_connection():
+            self._log.info(
+                "Attach refused (port limit): %s /ws/%s",
+                self._client_addr(client), self._endpoint)
+            return False
+        if not self._serial.connect():
+            self._log.info(
+                "Attach refused (port unavailable): %s /ws/%s",
+                self._client_addr(client), self._endpoint)
+            return False
+        self._attached.append(client)
+        if self._read_paused:
+            # Joined while the port is behind: wait like the others.
+            self._apply_read_paused(client)
+        return True
+
+    def detach(self, client):
+        """Stop carrying data for this client and let go of the port.
+
+        The connection stays open. Releasing is only safe once the
+        client is out of the list - SerialProxy.disconnect() closes the
+        device when nobody holds it, and asking while this one still
+        counted would keep it open forever.
+        """
+        if client not in self._attached:
+            return
+        self._attached.remove(client)
+        self._serial.disconnect()
 
     def add_connection(self, client):
         """Add accepted WebSocket connection"""
@@ -116,25 +177,26 @@ class ServerWebSocket():
                 "Client rejected (server limit): %s WEBSOCKET", addr)
             client.ws_close(1013, 'Server limit reached')
             return
-        if not self._serial.can_add_connection():
-            addr = self._client_addr(client)
-            self._log.info(
-                "Client rejected (port limit): %s WEBSOCKET", addr)
-            client.ws_close(1013, 'Port limit reached')
+        # Attached on arrival, so a client that only wants data still
+        # has to do nothing - the change is what it may do afterwards.
+        # attach() is what asks the port limit and opens the device, so
+        # the two reasons it can fail are told apart by asking it which.
+        self._connections.append(client)
+        if not self.attach(client):
+            self._connections.remove(client)
+            if not self._serial.can_add_connection():
+                self._log.info(
+                    "Client rejected (port limit): %s WEBSOCKET",
+                    self._client_addr(client))
+                client.ws_close(1013, 'Port limit reached')
+            else:
+                client.ws_close(1011, 'Serial port unavailable')
             return
-        if self._serial.connect():
-            self._connections.append(client)
-            addr = self._client_addr(client)
-            self._log.info(
-                "Client connected: %s WEBSOCKET /ws/%s",
-                addr, self._endpoint)
-            if self._read_paused:
-                # Joined while the port is behind: wait like the others.
-                self._apply_read_paused(client)
-            if self._control:
-                self._send_signals_to(client)
-        else:
-            client.ws_close(1011, 'Serial port unavailable')
+        addr = self._client_addr(client)
+        self._log.info(
+            "Client connected: %s WEBSOCKET /ws/%s", addr, self._endpoint)
+        if self._control:
+            self._send_signals_to(client)
 
     def set_read_paused(self, paused):
         """Stop or resume reading every client on this endpoint.
@@ -152,7 +214,9 @@ class ServerWebSocket():
         if self._read_paused == bool(paused):
             return
         self._read_paused = bool(paused)
-        for client in list(self._connections):
+        # Only the attached: backpressure is about clients feeding the
+        # device, and a detached one is not.
+        for client in list(self._attached):
             self._apply_read_paused(client)
 
     def _apply_read_paused(self, client):
@@ -191,10 +255,13 @@ class ServerWebSocket():
         """Remove WebSocket connection"""
         if client in self._connections:
             addr = self._client_addr(client)
+            # detach() releases the port, and only if this client was
+            # holding it - a detached client leaving must not release a
+            # claim it had already given up.
+            self.detach(client)
             self._connections.remove(client)
             self._log.info(
                 "Client disconnected: %s WEBSOCKET", addr)
-            self._serial.disconnect()
 
     def process_message(self, client):
         """Process incoming WebSocket message"""
@@ -204,7 +271,7 @@ class ServerWebSocket():
         if client.ws_is_text:
             if self._control:
                 self._process_control_message(client, data.decode('utf-8'))
-        elif self._can_write:
+        elif self._can_write and client in self._attached:
             self._serial.send(data)
 
     def _process_control_message(self, client, msg):
@@ -232,10 +299,10 @@ class ServerWebSocket():
                 self.remove_connection(client)
 
     def send(self, data):
-        """Send serial data to all connections as binary frames"""
+        """Send serial data to the attached clients as binary frames"""
         if not self._can_read:
             return
-        for client in list(self._connections):
+        for client in list(self._attached):
             try:
                 client.ws_send(data)
             except OSError:
@@ -261,6 +328,9 @@ class ServerWebSocket():
                 client.ws_close(1001, 'Server shutting down')
             except OSError:
                 pass
+        # Nobody is holding the port any more; leaving the list behind
+        # would have has_connections() vouch for clients that are gone.
+        self._attached.clear()
         self._serial.disconnect()
 
     def close(self):
