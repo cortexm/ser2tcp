@@ -7,8 +7,19 @@
   --text: #333;
   --text-muted: #555;
   --text-faint: #888;
+  /* What the browser already uses here; the light theme reads fine. */
+  --placeholder: #757575;
   --border: #ddd;
   --border-light: #eee;
+  /* A field you can type in sits clearly below the page, so grey is
+     left to mean one thing only: this one is disabled. Borrowing --bg
+     made an ordinary input look like an inert one. */
+  --field-bg: #fff;
+  --field-bg-disabled: #e6e6e6;
+  /* A hint that the pointer is over it, no more: between the field's
+     own ground and the dialog's. It used to borrow --table-hover,
+     which is a row highlight and far too big a step here. */
+  --field-bg-hover: #f6f6f6;
   --accent: #4a90d9;
   --accent-hover: #357abd;
   --header-bg: #fff;
@@ -23,6 +34,11 @@
   --shadow: rgba(0, 0, 0, 0.1);
   --tag-bg: #e8f0fe;
   --tag-text: #1a56db;
+  /* What a short answer gets - a bit count, a port number, a client
+     limit: about a third of the field beside it, narrow enough to read
+     as the short one and wide enough not to look cramped. Not a theme
+     value, but it belongs with the other lengths the forms share. */
+  --short-field: 136px;
 }
 
 [data-theme="dark"] {
@@ -32,8 +48,24 @@
   --text: #e0e0e0;
   --text-muted: #b0b0b0;
   --text-faint: #777;
+  /* Dimmer than the browser's own #757575. The measured contrast is
+     about the same in both themes, but light text on a dark ground
+     reads as heavier than dark on light at the same ratio - so the
+     hint looked like a value that was already typed in. */
+  --placeholder: #5e5e5e;
   --border: #383838;
   --border-light: #2e2e2e;
+  /* Not #000. It is the ground under text you read and type, and pure
+     black against #e0e0e0 is more contrast than that wants - the field
+     only has to sit clearly below the page. */
+  --field-bg: #111;
+  /* About the modal's own ground, one step off it so the field is
+     still a shape where the border is faint. It was lighter than the
+     dialog it sits in, which made an inert field the brightest thing
+     in the row. */
+  --field-bg-disabled: #262626;
+  /* Midway between #111 and the modal's #242424. */
+  --field-bg-hover: #1b1b1b;
   --accent: #6aabf0;
   --accent-hover: #8ec4ff;
   --header-bg: #161616;
@@ -272,7 +304,10 @@ body {
 }
 .btn-success:hover { background: var(--success); color: #fff; }
 .btn-small { padding: 4px 10px; font-size: 12px; }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* Dimmed, and the pointer dropped so it does not look clickable - but
+   no barred cursor anywhere in here. It reads as a refusal where there
+   is only nothing to do, and it has not been the convention for years. */
+.btn:disabled { opacity: 0.5; cursor: default; }
 
 .btn:focus-visible,
 .theme-btn:focus-visible {
@@ -370,7 +405,7 @@ body {
   border-radius: 4px;
   font-size: 14px;
   outline: none;
-  background: var(--bg);
+  background: var(--field-bg);
   color: var(--text);
   font-family: inherit;
 }
@@ -676,7 +711,7 @@ a.kebab-item { display: block; text-decoration: none; }
  * native control alone is too subtle a hint that the row is inert. */
 .modal-body label.checkbox-label:has(input:disabled) {
   color: var(--text-faint);
-  cursor: not-allowed;
+  cursor: default;
 }
 /* Which way the line runs. RTS and DTR are driven from here; the rest
    are the device talking back, and the difference decides what can be
@@ -730,7 +765,7 @@ a.kebab-item { display: block; text-decoration: none; }
   border-radius: 4px;
   font-size: 14px;
   outline: none;
-  background: var(--bg);
+  background: var(--field-bg);
   color: var(--text);
   font-family: inherit;
 }
@@ -767,7 +802,11 @@ select {
   padding: 5px 28px 5px 10px;
   border: 1px solid var(--border);
   border-radius: 4px;
-  background-color: var(--bg-surface);
+  /* The same ground as a text input. It used to sit on --bg-surface,
+     which is the modal's own colour - so a select blended into the
+     dialog while the input beside it looked recessed, and the two read
+     as different kinds of thing in a row where they are not. */
+  background-color: var(--field-bg);
   color: var(--text);
   -webkit-appearance: none;
   -moz-appearance: none;
@@ -781,30 +820,25 @@ select {
   background-size: 10px 6px;
 }
 select:focus { border-color: var(--accent); }
-select:hover { background-color: var(--table-hover); }
+select:hover { background-color: var(--field-bg-hover); }
 select:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-  background-color: var(--bg-alt);
+  cursor: default;
+  background-color: var(--field-bg-disabled);
   color: var(--text-faint);
 }
 
-/* --- Form inputs: disabled state --- */
+/* --- Form inputs: disabled state ---
+   Grey is the whole signal, in both themes: the field moves off the
+   white/black a live one sits on, towards the page. Dimming it as well
+   said the same thing twice and cost the text its contrast. */
 .modal-body input:disabled,
 .modal-body textarea:disabled,
 .modal-body select:disabled {
-  background: var(--bg-alt);
+  background: var(--field-bg-disabled);
   color: var(--text-faint);
   border-color: var(--border-light);
-  cursor: not-allowed;
+  cursor: default;
   opacity: 1;  /* override any inherited opacity */
-}
-[data-theme="dark"] .modal-body input:disabled,
-[data-theme="dark"] .modal-body textarea:disabled,
-[data-theme="dark"] .modal-body select:disabled {
-  /* Slightly darker than surface so the field reads as inert */
-  background: rgba(0, 0, 0, 0.25);
-  color: var(--text-faint);
 }
 
 /* --- Checkboxes — scale up to match input height (~36 px row) and tint
@@ -819,8 +853,98 @@ input[type="checkbox"] {
   margin: 0;
   vertical-align: middle;
 }
+/* A hint, not a value. Left to the browser it was the same grey in
+   both themes and read as something already typed in the dark one. */
+::placeholder { color: var(--placeholder); opacity: 1; }
+
+/* Two fields on one line, for the pairs that are read together -
+   address and port, baudrate and data bits, parity and stop bits.
+   The first takes what is left; the second is as wide as it needs.
+   They drop onto their own lines when the modal is too narrow. */
+.field-pair {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 18em;
+  flex-wrap: wrap;
+}
+/* The first field takes whatever is left, so the second column ends on
+   the row's right edge - the same edge every other field in the form
+   ends on. It used to be capped instead, which anchored the split from
+   the left: fine while every row was equally wide, but a row inside a
+   server box is not, and it left the short field short of the edge as
+   well. */
+.field-pair > input,
+.field-pair > select {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+/* Three short answers on one line: the first two pack to the left, the
+   last keeps the right edge so it lines up with the second field of the
+   pair above it.
+
+   Too narrow, the last one drops to a line of its own and stays in its
+   column. That is the only piece that can move: the first two are
+   packed left and nothing is spread. `space-between` was tried and it
+   scattered them - a field on one line, another to its right, the third
+   underneath - which is how this row broke. Letting them shrink instead
+   was worse still: a client limit two digits wide became 22px. */
+.field-trio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 18em;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.field-trio > .pair-second:last-child { margin-left: auto; }
+.field-trio > input,
+.field-trio > select {
+  flex: 0 0 var(--short-field);
+  width: var(--short-field);
+  min-width: 0;
+}
+/* Fixed, so the split lands in the same place on every paired row and
+   the second column lines up down the form. The right-hand field is
+   the short answer of the two - a port, a bit count - and sized for
+   that rather than allowed to grow to match the left. */
+.pair-second {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+/* Px, not em and not rem. Em came out 104px on one control and 112px on
+   the next, because it resolves against the element's own font-size.
+   Rem fixed that but tied these widths to the browser's root size,
+   while --label-col beside them is a length and every label and field
+   in the form is set in px - so on a browser whose default text is
+   larger the fields outgrew the room and a trio wrapped into a jumble.
+   Nothing here scales with the root, so nothing here asks it to. */
+.pair-second > input,
+.pair-second > select {
+  flex: 0 0 var(--short-field);
+  width: var(--short-field);
+  min-width: 0;
+}
+/* Not the row's own label column, but a column all the same: fixed, so
+   the second field starts in the same place whether the label beside it
+   is "Port" or "Data bits". Px for the same reason as --short-field. */
+.modal-body .form-row label.inline-label {
+  min-width: 88px;
+  margin-bottom: 0;
+  flex-shrink: 0;
+}
+
+/* A checkbox sitting on a field's own row, not in the label column -
+   so it takes the width of its text and nothing more. */
+.modal-body .form-row > label.inline-check {
+  min-width: 0;
+  margin-left: 4px;
+}
+
 input[type="checkbox"]:disabled {
-  cursor: not-allowed;
+  cursor: default;
   opacity: 0.5;
 }
 .modal-body label.checkbox-label input[type="checkbox"] {
@@ -887,6 +1011,30 @@ tbody tr:hover { background: var(--table-hover); }
 .section-title:first-child { margin-top: 0; }
 
 /* --- Server box (inside port editor) --- */
+/* What a server box insets its contents by: 12px of padding and 1px of
+   border. The box is widened by exactly that much on both sides, so
+   what is inside it starts and ends where everything above it does -
+   one column down the whole form, both edges the same distance from
+   the modal. Indenting the form to meet the box instead was the other
+   way round, and it left the right-hand side further in than the left. */
+:root { --box-inset: 13px; }
+.port-form .server-box {
+  margin-left: calc(-1 * var(--box-inset));
+  margin-right: calc(-1 * var(--box-inset));
+}
+/* One label column for the whole form, as a length both kinds of row
+   can work from. 102px is 8.5em at the 12px these labels use - wide
+   enough for "Poll interval", the longest of them. The column is a
+   minimum, so a longer label pushes its own field out of line with the
+   rest, which is the one thing this is here to prevent. */
+.port-form { --label-col: 102px; }
+.port-form .form-row > label { min-width: var(--label-col); }
+/* A USB match row reaches that same line from further along: a 16px
+   checkbox and an 8px gap come before its label, and it is followed by
+   8px rather than the form row's 10px. 16 + 8 + 8 - 10 = 22. */
+.port-form .match-cell > label {
+  min-width: calc(var(--label-col) - 22px);
+}
 .server-box {
   background: var(--bg-alt);
   border: 1px solid var(--border-light);
@@ -895,15 +1043,15 @@ tbody tr:hover { background: var(--table-hover); }
   margin-bottom: 8px;
   position: relative;
 }
+/* Beside the protocol select, not floating over its top-right corner
+   where it covered the select's own arrow. */
 .server-box .server-remove {
-  position: absolute;
-  top: 6px;
-  right: 6px;
+  flex: 0 0 auto;
   background: none;
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  padding: 4px;
+  padding: 6px;
   border-radius: 4px;
   display: flex;
   align-items: center;
@@ -911,17 +1059,25 @@ tbody tr:hover { background: var(--table-hover); }
 .server-box .server-remove:hover { color: var(--error); }
 .server-box .server-remove:disabled { opacity: 0.3; cursor: default; }
 .server-box .server-remove svg { width: 16px; height: 16px; }
-.server-box .form-row > label { min-width: 7em; }
 
+/* Two attributes to a row; each one drops to its own line when the
+   modal is too narrow to hold the pair. */
 .match-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
   margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.match-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 16em;
+  min-width: 0;
 }
 .match-row input[type="checkbox"] { margin: 0; }
 .match-row label {
-  min-width: 6em;
   margin-bottom: 0 !important;
   text-transform: none !important;
   letter-spacing: 0 !important;
@@ -979,8 +1135,10 @@ tbody tr:hover { background: var(--table-hover); }
 .token-value.copied { color: var(--success); }
 .token-value.copied::after { content: ' (copied)'; font-family: inherit; }
 
-/* --- Icon-only copy button (next to a path or URL shown as text) --- */
-.copy-icon-btn {
+/* --- Icon-only buttons (beside a field, or a path or URL shown as
+   text) - where a labelled button would be more furniture than the
+   action is worth. --- */
+.icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -993,9 +1151,17 @@ tbody tr:hover { background: var(--table-hover); }
   color: var(--text-muted);
   cursor: pointer;
 }
-.copy-icon-btn:hover { color: var(--accent); background: var(--bg-alt); }
-.copy-icon-btn.copied { color: var(--success); }
-.copy-icon-btn:focus-visible {
+.icon-btn:hover { color: var(--accent); background: var(--bg-alt); }
+/* The whole feedback a copy gets: the icon becomes a green tick for a
+   moment, and only when the text actually made it. */
+.icon-btn.copied { color: var(--success); }
+.icon-btn:disabled {
+  color: var(--text-faint);
+  opacity: 0.5;
+  cursor: default;
+}
+.icon-btn:disabled:hover { color: var(--text-faint); background: none; }
+.icon-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }

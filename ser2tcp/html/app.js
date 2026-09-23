@@ -73,18 +73,32 @@ const _COPIED_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
   + 'fill="none" stroke="currentColor" stroke-width="1.8" '
   + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
   + '<path d="M2.5 8.5 6 12l7.5-8"/></svg>';
+// Rotate: draw this one again. An arrow that comes back to where it
+// started says "replace what is there", which is what generating over
+// an existing token does.
+const _REGENERATE_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
+  + 'fill="none" stroke="currentColor" stroke-width="1.4" '
+  + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>'
+  + '<path d="M13.6 1.9v2.9h-2.9"/></svg>';
 
-// Small icon-only copy button — for a value that is displayed as text
-// (a filesystem path, a URL) and would otherwise have to be selected by
-// hand. `value` may be a string or a function returning one, for values
-// that are not known yet when the button is built.
-function copyIconBtn(value, title) {
+// Small icon-only button for a field or a value shown as text, where a
+// labelled button would be more furniture than the action is worth.
+function iconBtn(svg, title, onclick) {
   const b = el('button', {
-    type: 'button', class: 'copy-icon-btn',
-    title: title || 'Copy to clipboard',
-    'aria-label': title || 'Copy to clipboard',
+    type: 'button', class: 'icon-btn', title, 'aria-label': title,
   });
-  b.innerHTML = _COPY_ICON;
+  b.innerHTML = svg;
+  b.onclick = onclick;
+  return b;
+}
+
+// Copy — for a value that is displayed as text (a filesystem path, a
+// URL) and would otherwise have to be selected by hand. `value` may be
+// a string or a function returning one, for values that are not known
+// yet when the button is built.
+function copyIconBtn(value, title) {
+  const b = iconBtn(_COPY_ICON, title || 'Copy to clipboard', null);
   b.onclick = () => {
     copyText(typeof value === 'function' ? value() : value).then(ok => {
       if (!ok) return;
@@ -108,6 +122,35 @@ function formGroup(label, input, opts = {}) {
     style: 'margin-top:4px;font-size:12px',
   }, opts.hint));
   return wrap;
+}
+
+// Two fields on one line, for the pairs that are one answer - where to
+// listen, how to frame a byte. Stacked, the short one sat alone on a
+// row with the width of an address it never needs. The first label
+// takes the row's own label column, the second an inline one, and both
+// drop onto their own lines when the modal is too narrow. The second
+// half comes back separately because it is not always wanted: a Unix
+// socket has a path and no port.
+function pairRow(label, first, secondLabel, second) {
+  const secondPart = el('span', { class: 'pair-second' },
+    el('label', { class: 'inline-label' }, secondLabel), second);
+  const row = el('div', { class: 'form-row' },
+    typeof label === 'string' ? el('label', {}, label) : label,
+    el('div', { class: 'field-pair' }, first, secondPart));
+  return { row, secondPart };
+}
+
+// Three short answers on one line, each with its own label - the first
+// in the row's label column, the other two inline. The last one keeps
+// the right edge, so it lines up with the second field of a pairRow
+// above it; the first two pack to the left.
+function trioRow(label, first, secondLabel, second, thirdLabel, third) {
+  const part = (text, field) => el('span', { class: 'pair-second' },
+    el('label', { class: 'inline-label' }, text), field);
+  return el('div', { class: 'form-row' },
+    el('label', {}, label),
+    el('div', { class: 'field-trio' },
+      first, part(secondLabel, second), part(thirdLabel, third)));
 }
 
 function formRow(label, input) {
@@ -606,6 +649,11 @@ function doLogout() {
 // Constants
 // ===========================================================================
 const MATCH_ATTRS = ['vid', 'pid', 'serial_number', 'manufacturer', 'product', 'location'];
+// Shown instead of the attribute name where it is too long for the
+// label column - the two that would otherwise widen it for everybody.
+// The full name stays as the field's title, since that is what goes in
+// the config file.
+const MATCH_LABELS = { serial_number: 'serial', manufacturer: 'manufact' };
 const PROTOCOLS = ['TCP', 'TELNET', 'SSL', 'SOCKET', 'WEBSOCKET'];
 const CONTROL_SIGNALS = ['rts', 'dtr', 'cts', 'dsr', 'ri', 'cd'];
 // Which way each line runs. RTS and DTR are driven from this end, so
@@ -1313,7 +1361,11 @@ function _showPortEditorWithBundles(id, query, bundles, stored) {
 }
 
 function _buildPortForm(cfg, editId, bundles) {
-  const root = el('div');
+  // The class is what lines the fields up: this form has rows at two
+  // levels - its own, and those inside a server box - and the box's
+  // padding used to leave the inner ones ending short of the outer
+  // ones. See .port-form in style.css.
+  const root = el('div', { class: 'port-form' });
 
   // Identifier. What the API and every link address this port by, so
   // it is worth being able to choose something readable - and worth
@@ -1348,8 +1400,7 @@ function _buildPortForm(cfg, editId, bundles) {
   const matchDiv = el('div');
   const matchInputs = {};
   const matchCheckboxes = {};
-  MATCH_ATTRS.forEach(attr => {
-    const row = el('div', { class: 'match-row' });
+  const matchCell = attr => {
     const cb = el('input', {
       type: 'checkbox',
       checked: !!(cfg.serial.match && cfg.serial.match[attr]),
@@ -1380,11 +1431,16 @@ function _buildPortForm(cfg, editId, bundles) {
     inp.oninput = updateMatchedDevicePreview;
     matchCheckboxes[attr] = cb;
     matchInputs[attr] = inp;
-    row.appendChild(cb);
-    row.appendChild(el('label', {}, attr));
-    row.appendChild(inpWrap);
-    matchDiv.appendChild(row);
-  });
+    return el('div', { class: 'match-cell' },
+      cb, el('label', { title: attr }, MATCH_LABELS[attr] || attr), inpWrap);
+  };
+  // Two to a row, in the order they are listed: vid with pid, serial
+  // with manufacturer, product with location. Six rows of one short
+  // field each was a lot of modal for very little.
+  for (let i = 0; i < MATCH_ATTRS.length; i += 2) {
+    matchDiv.appendChild(el('div', { class: 'match-row' },
+      matchCell(MATCH_ATTRS[i]), matchCell(MATCH_ATTRS[i + 1])));
+  }
 
   // While match mode is on, portInput is disabled and shows the device(s)
   // currently matching the filter (informational only — not collected into
@@ -1470,7 +1526,9 @@ function _buildPortForm(cfg, editId, bundles) {
 
   const portMaxInput = el('input', {
     type: 'number', min: '0', step: '1', inputMode: 'numeric',
-    placeholder: '0 (unlimited)',
+    // Short, because the field is: "0 (unlimited)" was cut off mid-word
+    // and said less than the bare zero does. The title carries the rest.
+    placeholder: '0',
     value: cfg.max_connections !== undefined ? String(cfg.max_connections) : '',
     title: 'Total clients across all servers on this port (0 = unlimited)',
   });
@@ -1489,11 +1547,13 @@ function _buildPortForm(cfg, editId, bundles) {
   root.appendChild(matchDiv);
 
   root.appendChild(el('div', { class: 'section-title' }, 'Parameters'));
-  root.appendChild(formRow('Baudrate', baudSel));
-  root.appendChild(formRow('Data bits', byteSel));
-  root.appendChild(formRow('Parity', paritySel));
-  root.appendChild(formRow('Stop bits', stopSel));
-  root.appendChild(formRow('Max clients', portMaxInput));
+  // Baudrate is the one that needs room; the rest are short answers, so
+  // they go three to a line. Max clients rides along rather than taking
+  // a row to itself for a field the width of a two-digit number.
+  root.appendChild(pairRow('Baudrate', baudSel, 'Data bits', byteSel).row);
+  root.appendChild(trioRow(
+    'Max clients', portMaxInput, 'Parity', paritySel,
+    'Stop bits', stopSel));
 
   root.appendChild(el('div', { class: 'section-title' }, 'Servers'));
   const serversDiv = el('div');
@@ -1568,7 +1628,8 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   });
   removeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'
     + '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14"/></svg>';
-  box.appendChild(removeBtn);
+  // Goes in the protocol row further down rather than floating in the
+  // corner, where it sat on top of the select's own arrow.
 
   const protoSel = el('select');
   PROTOCOLS.forEach(p => {
@@ -1584,12 +1645,17 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const wsTokenInput = el('input', {
     type: 'text', placeholder: '(use global auth)', value: srv.token || '',
   });
-  const wsGenBtn = el('button', { type: 'button', class: 'btn btn-small btn-accent',
-    onclick: () => { wsTokenInput.value = crypto.randomUUID(); } }, 'Generate');
-  const wsCopyBtn = el('button', { type: 'button', class: 'btn btn-small',
-    onclick: () => {
-      if (wsTokenInput.value) copyText(wsTokenInput.value);
-    } }, 'Copy');
+  const wsCopyBtn = copyIconBtn(() => wsTokenInput.value, 'Copy token');
+  // Nothing to copy while the field is empty - that is not a token, it
+  // is the endpoint falling back to the global auth, and a button that
+  // would hand over an empty string says otherwise.
+  const syncTokenCopy = () => { wsCopyBtn.disabled = !wsTokenInput.value; };
+  const wsGenBtn = iconBtn(_REGENERATE_ICON, 'Generate a new token', () => {
+    wsTokenInput.value = crypto.randomUUID();
+    syncTokenCopy();
+  });
+  wsTokenInput.oninput = syncTokenCopy;
+  syncTokenCopy();
   const wsTokenRow = formRow('Token', [wsTokenInput, wsGenBtn, wsCopyBtn]);
   const wsRows = el('div',
     {},
@@ -1601,11 +1667,11 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const addrInput = el('input', {
     type: 'text', value: srv.address || '0.0.0.0',
   });
-  const addrRow = el('div', { class: 'form-row' }, addrLabel, addrInput);
   const portInput = el('input', {
     type: 'number', value: srv.port !== undefined ? String(srv.port) : '',
   });
-  const portRow = formRow('Port', portInput);
+  const { row: addrRow, secondPart: portRow } = pairRow(
+    addrLabel, addrInput, 'Port', portInput);
 
   // SSL fields: bundle dropdown + mTLS toggle. Built via shared helper
   // so port-SSL and HTTPS editors stay consistent. We always want the
@@ -1632,7 +1698,15 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const [readCb, readLabel] = enableCb('Read', access === 'rw' || access === 'ro');
   const [writeCb, writeLabel] = enableCb('Write', access === 'rw' || access === 'wo');
   const [ctlCb, ctlLabel] = enableCb('Control', !!srv.control);
-  const dataRow = formRow('Enable', [readLabel, writeLabel, ctlLabel]);
+  // ACL covers the client limit as well as the address rules: capping
+  // how many may connect is access control too, and it is the same
+  // question - who gets in. A limit of 0 is the absence of one, so a
+  // configured 0 reads the same as no key at all.
+  const [aclCb, aclLabel] = enableCb('ACL', !!(
+    (srv.allow || []).length || (srv.deny || []).length
+    || srv.max_connections));
+  const dataRow = formRow('Enable',
+    [readLabel, writeLabel, ctlLabel, aclLabel]);
 
   // Direction is shown by colour rather than by a word in front of
   // each group: six boxes and two labels do not fit on one line, and
@@ -1716,10 +1790,6 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const ctlDetails = el('div', { class: 'subgroup' },
     ctlDescEl, ctlMoreDetails, reportRow, writeRow, pollRow);
   const ctlDiv = el('div', {}, ctlDetails);
-  ctlCb.onchange = () => {
-    ctlDetails.classList.toggle('hidden', !ctlCb.checked);
-  };
-  if (!ctlCb.checked) ctlDetails.classList.add('hidden');
 
   // IP filter
   const allowInput = el('input', {
@@ -1730,7 +1800,10 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     type: 'text', placeholder: '192.168.1.100',
     value: (srv.deny || []).join(', '),
   });
-  const ipDiv = el('div', { class: 'subgroup' },
+  // The address rules go away on a Unix socket, which has no address
+  // to filter - but a cap on how many may connect still applies, so
+  // only these two rows hide, not the section.
+  const ipRows = el('div', {},
     formRow('Allow IPs', allowInput),
     formRow('Deny IPs', denyInput));
 
@@ -1742,11 +1815,11 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     title: '0 = unlimited',
   });
   const maxConnRow = formRow('Max clients', maxConnInput);
+  const ipDiv = el('div', { class: 'subgroup' }, ipRows, maxConnRow);
 
-  box.appendChild(formRow('Protocol', protoSel));
+  box.appendChild(formRow('Protocol', [protoSel, removeBtn]));
   box.appendChild(wsRows);
-  box.appendChild(addrRow);
-  box.appendChild(portRow);
+  box.appendChild(addrRow);      // carries the port half with it
   box.appendChild(sslDiv);
   // Which way data flows is not a control-protocol setting: a plain TCP
   // server can be read-only. It used to live inside the control section
@@ -1754,7 +1827,19 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   box.appendChild(dataRow);
   box.appendChild(ctlDiv);
   box.appendChild(ipDiv);
-  box.appendChild(maxConnRow);
+
+  // One place decides whether a section is on screen. It used to be
+  // two - the checkbox toggled the inner div and the protocol switch
+  // toggled its wrapper - so ticking Control on a server that did not
+  // have it revealed nothing: the wrapper was still hidden from the
+  // last time the protocol was looked at. It only appeared after a
+  // save, when the box was rebuilt with control already on.
+  function updateSections() {
+    ctlDiv.classList.toggle('hidden', ctlCb.disabled || !ctlCb.checked);
+    ipDiv.classList.toggle('hidden', !aclCb.checked);
+  }
+  [ctlCb, aclCb].forEach(
+    cb => cb.addEventListener('change', updateSections));
 
   function updateProtoFields() {
     const proto = protoSel.value;
@@ -1773,8 +1858,10 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     ctlLabel.title = isTelnet
       ? 'Not available on TELNET — the escape byte 0xFF is IAC there'
       : '';
-    ctlDiv.classList.toggle('hidden', isTelnet || !ctlCb.checked);
-    ipDiv.classList.toggle('hidden', isSocket);
+    // A Unix socket has no address to filter on, but it can still be
+    // capped - so the rules go, not the section.
+    ipRows.classList.toggle('hidden', isSocket);
+    updateSections();
     ctlDescEl.innerHTML = '';
     if (isWs) {
       ctlDescEl.appendChild(document.createTextNode(
@@ -1840,7 +1927,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
       get proto() { return protoSel.value; },
       protoSel, addrInput, portInput, epInput: wsEndpointInput,
       tokenInput: wsTokenInput, ssl,
-      readCb, writeCb, ctlCb, writeRowCbs, reportCbs, pollSel,
+      readCb, writeCb, ctlCb, aclCb, writeRowCbs, reportCbs, pollSel,
       allowInput, denyInput, maxConnInput,
       // What was configured before this box was opened. The form does
       // not have a field for everything a server can carry, and
@@ -1920,6 +2007,14 @@ function _collectPortConfig(form) {
         : 'A server has to read, write or do control, '
           + 'or it would do nothing');
     }
+    const reported = CONTROL_SIGNALS.filter(sig => d.reportCbs[sig].checked);
+    if (control && !reported.length) {
+      // Control over nothing. Allow set already requires the line to
+      // be reported, so with no report there is nothing to set either
+      // - all that is left is escaping 0xFF for no one's benefit.
+      throw new Error(
+        'Control needs at least one signal to report, or it does nothing');
+    }
     // The default carries no key, so an ordinary server stays as plain
     // in the file as it was before this existed.
     const access = read && write ? 'rw' : read ? 'ro' : write ? 'wo' : 'none';
@@ -1929,23 +2024,35 @@ function _collectPortConfig(form) {
       OUTPUT_SIGNALS.forEach(sig => {
         if (d.writeRowCbs[sig].checked) ctl[sig] = true;
       });
-      const signals = [];
-      CONTROL_SIGNALS.forEach(sig => {
-        if (d.reportCbs[sig].checked) signals.push(sig);
-      });
-      if (signals.length) ctl.signals = signals;
+      if (reported.length) ctl.signals = reported;
       const pollMs = parseInt(d.pollSel.value);
       if (pollMs) ctl.poll_interval = pollMs / 1000;
       srv.control = ctl;
     }
-    if (proto !== 'socket') {
-      const allow = d.allowInput.value.trim();
-      if (allow) srv.allow = allow.split(',').map(s => s.trim()).filter(Boolean);
-      const deny = d.denyInput.value.trim();
-      if (deny) srv.deny = deny.split(',').map(s => s.trim()).filter(Boolean);
+    // Unticking ACL drops what it held rather than keeping it out of
+    // sight: a rule nobody can see is one nobody will remember when
+    // wondering why a client is being refused.
+    if (d.aclCb.checked) {
+      // A Unix socket has no address to filter, so only the cap counts.
+      const rules = proto === 'socket' ? '' : d.allowInput.value.trim();
+      const blocked = proto === 'socket' ? '' : d.denyInput.value.trim();
+      // A limit of none is not a limit; it goes in as no key, which
+      // is what the server already reads an absent one as.
+      const mc = parseInt(d.maxConnInput.value.trim());
+      if (!rules && !blocked && !(mc > 0)) {
+        throw new Error(proto === 'socket'
+          ? 'ACL needs a client limit, or it does nothing'
+          : 'ACL needs an address rule or a client limit, '
+            + 'or it does nothing');
+      }
+      if (rules) {
+        srv.allow = rules.split(',').map(s => s.trim()).filter(Boolean);
+      }
+      if (blocked) {
+        srv.deny = blocked.split(',').map(s => s.trim()).filter(Boolean);
+      }
+      if (mc > 0) srv.max_connections = mc;
     }
-    const mc = d.maxConnInput.value.trim();
-    if (mc !== '') srv.max_connections = parseInt(mc);
     cfg.servers.push(srv);
   });
   return cfg;
@@ -2451,15 +2558,15 @@ function _buildSslFields(currentSsl, bundles) {
   };
   bundleSelect.onchange = updateMtlsState;
   updateMtlsState();
-  const manageLink = el('a', {
-    href: '#/certificates', onclick: () => closeModal(),
-    style: 'font-size:12px;margin-left:8px',
-  }, 'Manage certificates…');
+  // Beside the bundle it depends on, rather than on a row of its own:
+  // whether mTLS can be switched on at all is a property of the bundle
+  // selected right there, and the checkbox greys out with it.
+  const mtlsLabel = el('label', {
+    class: 'checkbox-label inline-check',
+    title: 'Require client certificate',
+  }, mtlsCb, el('span', {}, ' mTLS'));
   const sslDiv = el('div', { class: 'subgroup' },
-    formRow('Bundle', [bundleSelect, manageLink]),
-    el('div', { style: 'margin:6px 0 0 120px' },
-      el('label', { class: 'checkbox-label' },
-        mtlsCb, el('span', {}, ' Require client certificate (mTLS)'))));
+    formRow('Bundle', [bundleSelect, mtlsLabel]));
   if (!sslCb.checked) sslDiv.classList.add('hidden');
   sslCb.onchange = () => sslDiv.classList.toggle('hidden', !sslCb.checked);
 
@@ -2521,8 +2628,7 @@ function _showHttpEditorWithBundles(id, bundles) {
       isNew ? 'Used in the API and in links.'
         : 'Changing this breaks existing links to this server.'),
     formRow('Name', nameInput),
-    formRow('Address', addrInput),
-    formRow('Port', portInput),
+    pairRow('Address', addrInput, 'Port', portInput).row,
     el('div', { style: 'margin:8px 0' },
       el('label', { class: 'checkbox-label' },
         ssl.sslCb, el('span', {}, ' SSL'))),
