@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, MagicMock, patch
 
+from tests import requires_pty
 from ser2tcp.cert_manager import CertManager, generate_certificate
 from ser2tcp.http_auth import hash_password
 from ser2tcp.http_server import (
@@ -1521,6 +1522,7 @@ class TestComputePortState(unittest.TestCase):
         self.assertEqual(
             self.wrapper._compute_port_state(proxy, []), 'offline')
 
+    @requires_pty
     def test_a_device_that_exists_but_is_not_enumerated_is_offline(self):
         """Enumeration is not the only evidence a device is there.
 

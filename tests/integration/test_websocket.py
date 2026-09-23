@@ -558,6 +558,7 @@ class TestTheDeviceGoesAway(WebSocketTestCase):
         self.assertEqual(sock.recv(64), b'')
 
 
+@base.requires_pty
 class TestTheDeviceArrivesLate(base.IntegrationTestCase):
     """A port configured for a device that is not plugged in yet.
 

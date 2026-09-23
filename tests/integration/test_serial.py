@@ -78,6 +78,7 @@ def read_client_until(sock, marker, timeout=3.0):
     return out
 
 
+@base.requires_pty
 class SerialPtyTestCase(base.IntegrationTestCase):
     """Runs ser2tcp against a pty.
 
@@ -567,6 +568,7 @@ class TestSlowDeviceBackpressure(SerialPtyTestCase):
         self.assertIn(b'resumed', read_device(self.master_fd, 7, timeout=10))
 
 
+@base.requires_pty
 class FailedPortTestCase(base.IntegrationTestCase):
     """A config whose first port cannot bind, followed by one that can.
 
@@ -692,6 +694,7 @@ class TestEditingAroundAFailedPort(FailedPortTestCase):
         self.addCleanup(sock.close)
 
 
+@base.requires_pty
 class TestEditingKeepsEverySetting(base.IntegrationTestCase):
     """What the editor reads back has to be what was configured.
 

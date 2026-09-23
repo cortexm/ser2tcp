@@ -1086,8 +1086,19 @@ class TestReaderThreadShutdown(unittest.TestCase):
         """Better a warning than a loop frozen without explanation"""
         proxy = self._proxy()
         release = threading.Event()
-        proxy._serial.read.side_effect = lambda **kw: (
-            release.wait(5) or b'')
+
+        def blocking_read(**_kwargs):
+            """Block until the test lets go, then read nothing.
+
+            It was `release.wait(5) or b''`, which returns True once the
+            event is set - so the thread went on to sendall(True) and
+            raised in the background, long after this test had passed,
+            on top of whichever test was running by then.
+            """
+            release.wait(5)
+            return b''
+
+        proxy._serial.read.side_effect = blocking_read
         proxy._serial.cancel_read.side_effect = NotImplementedError()
         proxy._start_reader_thread()
         time.sleep(0.05)
