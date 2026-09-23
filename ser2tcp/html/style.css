@@ -39,6 +39,11 @@
      as the short one and wide enough not to look cramped. Not a theme
      value, but it belongs with the other lengths the forms share. */
   --short-field: 136px;
+  /* The column an inline label sits in, so the field after it starts in
+     the same place whether the label is "Port" or "Data bits". Wide
+     enough for the port editor's labels, which are the long ones; a
+     form with only short ones sets its own (see .http-form). */
+  --inline-col: 88px;
 }
 
 [data-theme="dark"] {
@@ -871,17 +876,43 @@ input[type="checkbox"] {
   gap: 8px;
   flex: 1 1 18em;
   flex-wrap: wrap;
+  /* Without it a flex item will not shrink below the widest thing in
+     it, so a pair that did not fit pushed out through the side of the
+     modal instead of giving way. */
+  min-width: 0;
 }
 /* The first field takes whatever is left, so the second column ends on
    the row's right edge - the same edge every other field in the form
    ends on. It used to be capped instead, which anchored the split from
    the left: fine while every row was equally wide, but a row inside a
    server box is not, and it left the short field short of the edge as
-   well. */
-.field-pair > input,
-.field-pair > select {
-  flex: 1 1 8rem;
-  min-width: 0;
+   well.
+
+   A basis of zero, and a floor in px. The basis was 8rem, and a flex
+   line wraps on what the items ask for before any of them is allowed
+   to shrink - so on a browser whose default text is 22px or more that
+   8rem asked for 176px, the pair no longer fit, and the short field
+   dropped to a line of its own while the long one stretched across
+   the whole row. Asking for nothing and growing into what is left
+   gives the same result at every root size; min-width is what decides
+   when the row genuinely has to break, and it is a length like every
+   other one in this form.
+
+   `0%`, not `0`. A unitless zero in the flex shorthand is read as a
+   number rather than a length by some engines - Safari most famously -
+   and the basis falls back to auto, which for these fields is
+   `width: 100%` and puts the pair straight through the side of the
+   modal. The percentage is the spelling every engine agrees on.
+
+   The selector carries .modal-body so these widths outrank the general
+   `.modal-body input[type=...] { width: 100% }` above rather than
+   losing to it on specificity and relying on flex-basis to paper over
+   the difference. */
+.modal-body .field-pair > input,
+.modal-body .field-pair > select {
+  flex: 1 1 0%;
+  min-width: 96px;
+  width: auto;
 }
 /* Three short answers on one line: the first two pack to the left, the
    last keeps the right edge so it lines up with the second field of the
@@ -902,8 +933,8 @@ input[type="checkbox"] {
   min-width: 0;
 }
 .field-trio > .pair-second:last-child { margin-left: auto; }
-.field-trio > input,
-.field-trio > select {
+.modal-body .field-trio > input,
+.modal-body .field-trio > select {
   flex: 0 0 var(--short-field);
   width: var(--short-field);
   min-width: 0;
@@ -916,7 +947,12 @@ input[type="checkbox"] {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  flex: 0 0 auto;
+  /* It may give way, and it is the last thing that will: the field
+     inside has a floor, and below that the pair wraps. Fixed, it could
+     not give way at all, so a row with too little room had nowhere to
+     put the overflow except outside the dialog. */
+  flex: 0 1 auto;
+  min-width: 0;
 }
 /* Px, not em and not rem. Em came out 104px on one control and 112px on
    the next, because it resolves against the element's own font-size.
@@ -924,18 +960,24 @@ input[type="checkbox"] {
    while --label-col beside them is a length and every label and field
    in the form is set in px - so on a browser whose default text is
    larger the fields outgrew the room and a trio wrapped into a jumble.
-   Nothing here scales with the root, so nothing here asks it to. */
-.pair-second > input,
-.pair-second > select {
-  flex: 0 0 var(--short-field);
+   Nothing here scales with the root, so nothing here asks it to.
+
+   .modal-body so it outranks the general input rule's `width: 100%`,
+   and a shrink of 1 with a floor: a port number would rather be a
+   little narrow than hanging outside the modal, and at the floor the
+   row wraps instead. */
+.modal-body .pair-second > input,
+.modal-body .pair-second > select {
+  flex: 0 1 var(--short-field);
   width: var(--short-field);
+  min-width: 64px;
   min-width: 0;
 }
 /* Not the row's own label column, but a column all the same: fixed, so
    the second field starts in the same place whether the label beside it
    is "Port" or "Data bits". Px for the same reason as --short-field. */
 .modal-body .form-row label.inline-label {
-  min-width: 88px;
+  min-width: var(--inline-col);
   margin-bottom: 0;
   flex-shrink: 0;
 }
@@ -1039,6 +1081,18 @@ tbody tr:hover { background: var(--table-hover); }
 .port-form .match-cell > label {
   min-width: calc(var(--label-col) - 22px);
 }
+
+/* --- HTTP server editor --- */
+/* Its own columns, because its labels are the short ones - Name,
+   Address, ID, Port - and it has half the room to say them in: the
+   port editor opens wide, this one at 560px. Borrowing columns cut
+   for "Poll interval" left 74px of nothing between "ID" and its
+   field, and the pair had so little left that it pushed the port
+   out through the side of the dialog. Widest here is "Address" at
+   61px and "Port" at 35px, so both columns are those plus room to
+   breathe rather than a number carried over from another form. */
+.http-form { --inline-col: 48px; }
+.http-form .form-row > label { min-width: 72px; }
 .server-box {
   background: var(--bg-alt);
   border: 1px solid var(--border-light);

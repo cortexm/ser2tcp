@@ -2702,8 +2702,11 @@ function _showHttpEditorWithBundles(id, bundles) {
     value: String(srv.port || 8080), min: '1', max: '65535' });
   const ssl = _buildSslFields(srv.ssl, bundles);
 
+  // Its own class, and its own label columns with it: short labels in
+  // a narrow dialog, where the port editor's are long ones in a wide
+  // one. See .http-form in style.css.
   const body = el('div',
-    {},
+    { class: 'http-form' },
     pairRow('Name', nameInput, 'ID', idInput).row,
     el('div', { class: 'field-hint' },
       isNew ? 'Used in the API and in links. Follows the name until '
