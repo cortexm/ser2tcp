@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock
 
 from ser2tcp.cert_manager import CertManager, generate_certificate
-from ser2tcp.connection_ssl import SslHandshakeError
+from ser2tcp.connection_tls import TlsHandshakeError
 from ser2tcp.server import Server
 
 
@@ -19,8 +19,8 @@ def free_port():
         return sock.getsockname()[1]
 
 
-class TestServerReloadSslContext(unittest.TestCase):
-    """reload_ssl_context() re-reads the bundle into the live context."""
+class TestServerReloadTlsContext(unittest.TestCase):
+    """reload_tls_context() re-reads the bundle into the live context."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -41,34 +41,34 @@ class TestServerReloadSslContext(unittest.TestCase):
         self.servers.append(srv)
         return srv
 
-    def test_ssl_server_reloads(self):
+    def test_tls_server_reloads(self):
         srv = self._server({
-            'address': '127.0.0.1', 'port': free_port(), 'protocol': 'ssl',
-            'ssl': {'bundle': 'web'},
+            'address': '127.0.0.1', 'port': free_port(), 'protocol': 'tls',
+            'tls': {'bundle': 'web'},
         })
-        context = srv._ssl_context
+        context = srv._tls_context
         cert, key = generate_certificate('after', key_type='ec_p256', days=30)
         self.mgr.save_files('web', [('cert.pem', cert), ('key.pem', key)])
-        self.assertTrue(srv.reload_ssl_context())
+        self.assertTrue(srv.reload_tls_context())
         # Reloaded in place: the same context object serves the new cert,
         # so connections already negotiated are undisturbed.
-        self.assertIs(srv._ssl_context, context)
+        self.assertIs(srv._tls_context, context)
 
     def test_plain_server_has_nothing_to_reload(self):
         srv = self._server({
             'address': '127.0.0.1', 'port': free_port(), 'protocol': 'tcp',
         })
-        self.assertFalse(srv.reload_ssl_context())
+        self.assertFalse(srv.reload_tls_context())
 
     def test_reload_raises_when_bundle_gone(self):
         from ser2tcp.cert_manager import CertManagerError
         srv = self._server({
-            'address': '127.0.0.1', 'port': free_port(), 'protocol': 'ssl',
-            'ssl': {'bundle': 'web'},
+            'address': '127.0.0.1', 'port': free_port(), 'protocol': 'tls',
+            'tls': {'bundle': 'web'},
         })
         self.mgr.delete_bundle('web')
         with self.assertRaises(CertManagerError):
-            srv.reload_ssl_context()
+            srv.reload_tls_context()
 
 
 if __name__ == '__main__':
@@ -315,7 +315,7 @@ class TestHandshakeDispatch(unittest.TestCase):
 
     def test_a_failed_handshake_drops_the_connection(self):
         srv, con, sock = self._server_with_handshaking_connection()
-        con.handshake.side_effect = SslHandshakeError('no shared cipher')
+        con.handshake.side_effect = TlsHandshakeError('no shared cipher')
         srv.handle_event(sock, 1)
         self.assertEqual(srv.connections, [])
         self.serial.connect.assert_not_called()

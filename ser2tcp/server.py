@@ -12,7 +12,7 @@ import time as _time
 import ser2tcp.cert_manager as _cert_manager
 import ser2tcp.connection_control as _connection_control
 import ser2tcp.connection_socket as _connection_socket
-import ser2tcp.connection_ssl as _connection_ssl
+import ser2tcp.connection_tls as _connection_tls
 import ser2tcp.connection_tcp as _connection_tcp
 import ser2tcp.connection_telnet as _connection_telnet
 import ser2tcp.ip_filter as _ip_filter
@@ -76,7 +76,7 @@ class Server():
     CONNECTIONS = {
         'TCP': _connection_tcp.ConnectionTcp,
         'TELNET': _connection_telnet.ConnectionTelnet,
-        'SSL': _connection_ssl.ConnectionSsl,
+        'TLS': _connection_tls.ConnectionTls,
         'SOCKET': _connection_socket.ConnectionSocket,
     }
 
@@ -87,7 +87,7 @@ class Server():
         # asking about a socket that was never assigned turns a clear
         # ConfigError into an AttributeError nobody can act on.
         self._socket = None
-        self._ssl_context = None
+        self._tls_context = None
         self._connections = []
         self._log = log if log else _logging.Logger(self.__class__.__name__)
         self._config = config
@@ -108,8 +108,8 @@ class Server():
         self._data_enabled = self._can_read or self._can_write
         self._max_connections = self._config.get('max_connections', 0)
         self._ip_filter = _ip_filter.create_filter(self._config, log=self._log)
-        self._ssl_context = None
-        # Only SSL sets this; None means every client the CA signed.
+        self._tls_context = None
+        # Only TLS sets this; None means every client the CA signed.
         self._allowed_cns = None
         self._socket = None
         # Set while the listening socket is deliberately not watched
@@ -148,8 +148,8 @@ class Server():
                 self._config['address'],
                 self._config['port'],
                 self._protocol)
-            if self._protocol == 'SSL':
-                self._ssl_context = self._create_ssl_context()
+            if self._protocol == 'TLS':
+                self._tls_context = self._create_tls_context()
                 self._allowed_cns = self._parse_allowed_cns()
             self._socket = _socket.socket(
                 _socket.AF_INET, _socket.SOCK_STREAM, _socket.IPPROTO_TCP)
@@ -171,14 +171,14 @@ class Server():
     def __del__(self):
         self.close()
 
-    def _create_ssl_context(self):
-        """Create SSL context from config (bundle-based)."""
+    def _create_tls_context(self):
+        """Create TLS context from config (bundle-based)."""
         if not self._certs_dir:
             raise ConfigError(
-                'SSL protocol requires certs_dir (internal wiring error)')
-        ssl_config = self._config.get('ssl', {})
+                'TLS protocol requires certs_dir (internal wiring error)')
+        tls_config = self._config.get('tls', {})
         try:
-            return _cert_manager.build_ssl_context(ssl_config, self._certs_dir)
+            return _cert_manager.build_tls_context(tls_config, self._certs_dir)
         except _cert_manager.CertManagerError as err:
             raise ConfigError(str(err)) from err
 
@@ -191,21 +191,21 @@ class Server():
         """
         try:
             return _cert_manager.parse_allowed_client_cns(
-                self._config.get('ssl', {}))
+                self._config.get('tls', {}))
         except _cert_manager.CertManagerError as err:
             raise ConfigError(str(err)) from err
 
-    def reload_ssl_context(self):
+    def reload_tls_context(self):
         """Re-read the bundle into this server's existing SSLContext.
 
         Clients connecting from now on are served the new certificate;
         the ones already connected keep the session they negotiated.
-        Returns False for a non-SSL server, which has nothing to reload.
+        Returns False for a non-TLS server, which has nothing to reload.
         """
-        if self._ssl_context is None:
+        if self._tls_context is None:
             return False
-        _cert_manager.reload_ssl_context(
-            self._ssl_context, self._config.get('ssl', {}), self._certs_dir)
+        _cert_manager.reload_tls_context(
+            self._tls_context, self._config.get('tls', {}), self._certs_dir)
         return True
 
     @property
@@ -288,8 +288,8 @@ class Server():
             'buffer_limit': self._buffer_limit,
             'log': self._log,
         }
-        if self._ssl_context:
-            kwargs['ssl_context'] = self._ssl_context
+        if self._tls_context:
+            kwargs['tls_context'] = self._tls_context
             kwargs['allowed_cns'] = self._allowed_cns
         connection_class = self.CONNECTIONS[self._protocol]
         kwargs['can_write'] = self._can_write
@@ -299,7 +299,7 @@ class Server():
                 can_read=self._can_read, can_write=self._can_write)
         try:
             connection = connection_class(**kwargs)
-        except _connection_ssl.SslHandshakeError as err:
+        except _connection_tls.TlsHandshakeError as err:
             self._log.info(
                 "Client rejected: %s:%d (%s)", addr[0], addr[1], err)
             if not self._connections:
@@ -345,7 +345,7 @@ class Server():
         """
         try:
             done = con.handshake()
-        except _connection_ssl.SslHandshakeError as err:
+        except _connection_tls.TlsHandshakeError as err:
             self._log.info(
                 "Client rejected: %s (%s)", con.address_str(), err)
             self._remove_connection(con)
@@ -418,7 +418,7 @@ class Server():
     def on_serial_lost(self, reason):
         """The device is gone, so these clients are too.
 
-        TCP, TELNET, SSL and Unix sockets carry serial data and nothing
+        TCP, TELNET, TLS and Unix sockets carry serial data and nothing
         else: there is no way to tell a client the device went away, so
         holding it open would only feed it silence. Closing says it in
         the only language those protocols have.
@@ -523,7 +523,7 @@ class Server():
         """Read from a client and forward it, or drop the connection.
 
         Reads again while the connection says it is still holding
-        decrypted bytes. Under TLS those sit in the SSL object rather
+        decrypted bytes. Under TLS those sit in the TLS object rather
         than the kernel buffer, so select() will never mention them
         again - one large record used to arrive 4 KB at a time, the
         rest stuck until the client happened to send something else.
@@ -533,7 +533,7 @@ class Server():
                 data = con.recv(4096)
             except OSError as err:
                 # OSError covers the lot: a reset or aborted peer, an
-                # SSL error, a timeout, and a descriptor another handler
+                # TLS error, a timeout, and a descriptor another handler
                 # closed earlier in this same batch of events. Every one
                 # of them means this connection is finished, and naming
                 # only two of them left the rest to reach the event loop.

@@ -1,10 +1,10 @@
-"""Tests for ConnectionSsl class"""
+"""Tests for ConnectionTls class"""
 
 import unittest
 import unittest.mock
 from unittest.mock import Mock
 
-from ser2tcp.connection_ssl import ConnectionSsl
+from ser2tcp.connection_tls import ConnectionTls
 
 
 class MockSocket:
@@ -25,21 +25,21 @@ class MockSocket:
         return self._fileno
 
 
-class TestConnectionSsl(unittest.TestCase):
+class TestConnectionTls(unittest.TestCase):
     def _make_connection(self):
-        """Helper to create ConnectionSsl with mock socket"""
+        """Helper to create ConnectionTls with mock socket"""
         mock_socket = MockSocket()
-        mock_ssl_socket = MockSocket()
+        mock_tls_socket = MockSocket()
         addr = ('127.0.0.1', 12345)
         mock_serial = Mock()
         log = Mock()
         mock_context = Mock()
-        mock_context.wrap_socket.return_value = mock_ssl_socket
-        conn = ConnectionSsl(
+        mock_context.wrap_socket.return_value = mock_tls_socket
+        conn = ConnectionTls(
             (mock_socket, addr),
             mock_serial,
             log=log,
-            ssl_context=mock_context)
+            tls_context=mock_context)
         return conn, mock_serial, mock_context, mock_socket
 
     def test_wraps_socket_without_handshaking(self):
@@ -66,7 +66,7 @@ class TestConnectionSsl(unittest.TestCase):
         self.assertEqual(
             conn._log.info.call_args_list[0],
             unittest.mock.call(
-                "Client connected: %s SSL", '127.0.0.1:12345'))
+                "Client connected: %s TLS", '127.0.0.1:12345'))
 
     def test_a_handshake_that_wants_more_input_is_not_done(self):
         import selectors
@@ -87,11 +87,11 @@ class TestConnectionSsl(unittest.TestCase):
 
     def test_a_failed_handshake_raises(self):
         import ssl
-        from ser2tcp.connection_ssl import SslHandshakeError
+        from ser2tcp.connection_tls import TlsHandshakeError
         conn, _, _, _ = self._make_connection()
         conn.socket().do_handshake = Mock(
             side_effect=ssl.SSLError('no shared cipher'))
-        with self.assertRaises(SslHandshakeError):
+        with self.assertRaises(TlsHandshakeError):
             conn.handshake()
 
     def test_a_silent_client_goes_stale(self):
@@ -110,7 +110,7 @@ class TestConnectionSsl(unittest.TestCase):
         conn._handshake_started = time.time() - 3600
         self.assertFalse(conn.is_stale())
 
-    def test_pending_reports_what_the_ssl_object_still_holds(self):
+    def test_pending_reports_what_the_tls_object_still_holds(self):
         conn, _, _, _ = self._make_connection()
         conn.socket().pending = Mock(return_value=4096)
         self.assertEqual(conn.pending(), 4096)

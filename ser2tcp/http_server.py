@@ -227,17 +227,17 @@ class HttpServerWrapper():
     def _create_http_server(self, config):
         """Create one HTTP server from config.
 
-        Returns (server, ip_filter, config, ssl_context). The config and
+        Returns (server, ip_filter, config, tls_context). The config and
         the context are kept alongside the server so a cert bundle can
         later be reloaded into it without rebuilding the socket.
         """
         address = config.get('address', '0.0.0.0')
         port = config.get('port', 8080)
-        ssl_context = None
-        if 'ssl' in config:
+        tls_context = None
+        if 'tls' in config:
             try:
-                ssl_context = _cert_manager.build_ssl_context(
-                    config['ssl'], self._cert_manager.certs_dir)
+                tls_context = _cert_manager.build_tls_context(
+                    config['tls'], self._cert_manager.certs_dir)
             except _cert_manager.CertManagerError as err:
                 raise ValueError(f"HTTPS {address}:{port}: {err}") from err
             self._log.info("HTTPS server: %s:%d", address, port)
@@ -252,14 +252,14 @@ class HttpServerWrapper():
             raise ValueError(f"HTTP {address}:{port}: {error}")
         try:
             server = _uhttp_server.HttpServer(
-                address=address, port=port, ssl_context=ssl_context,
+                address=address, port=port, ssl_context=tls_context,
                 event_mode=True, selector=self._selector,
                 trusted_proxies=config.get('trusted_proxies'))
         except OSError as err:
             raise ValueError(
                 f"HTTP {address}:{port}: failed to bind: "
                 f"{err.strerror or err}") from err
-        return (server, ip_flt, config, ssl_context)
+        return (server, ip_flt, config, tls_context)
 
     def _http_server_or_placeholder(self, config):
         """Build one HTTP server, or a placeholder holding its place"""
@@ -849,8 +849,8 @@ class HttpServerWrapper():
                     }
                     if server.protocol != 'SOCKET':
                         srv_info['port'] = server.config['port']
-                    if 'ssl' in server.config:
-                        srv_info['ssl'] = server.config['ssl']
+                    if 'tls' in server.config:
+                        srv_info['tls'] = server.config['tls']
                 if not (server.can_read and server.can_write):
                     srv_info['access'] = _server.access_name(
                         server.can_read, server.can_write)
@@ -1321,7 +1321,7 @@ class HttpServerWrapper():
             if not isinstance(srv['protocol'], str):
                 return 'Server protocol must be a string'
             proto = srv['protocol'].upper()
-            if proto not in ('TCP', 'TELNET', 'SSL', 'SOCKET', 'WEBSOCKET'):
+            if proto not in ('TCP', 'TELNET', 'TLS', 'SOCKET', 'WEBSOCKET'):
                 return f'Unknown protocol: {srv["protocol"]}'
             # Parse it the way the server will, so the API never accepts
             # a value that would then stop the port from starting.
@@ -1354,11 +1354,11 @@ class HttpServerWrapper():
                 if 'address' in srv \
                         and not isinstance(srv['address'], str):
                     return 'Server address must be a string'
-            if proto == 'SSL':
-                if 'ssl' not in srv:
-                    return 'SSL protocol requires ssl config'
-                err = self._validate_ssl_config(
-                    srv['ssl'], allow_client_cn=True)
+            if proto == 'TLS':
+                if 'tls' not in srv:
+                    return 'TLS protocol requires tls config'
+                err = self._validate_tls_config(
+                    srv['tls'], allow_client_cn=True)
                 if err:
                     return err
             if 'control' in srv:
@@ -1960,31 +1960,31 @@ class HttpServerWrapper():
         if 'id' in data and not _config_ids.is_valid_id(data['id']):
             return ('id may only contain letters, digits, dot, dash and '
                     'underscore')
-        if 'ssl' in data:
-            err = self._validate_ssl_config(data['ssl'])
+        if 'tls' in data:
+            err = self._validate_tls_config(data['tls'])
             if err:
                 return err
         return (self._validate_trusted_proxies(data)
                 or self._validate_ip_rules(data))
 
-    def _validate_ssl_config(self, ssl, allow_client_cn=False):
+    def _validate_tls_config(self, tls, allow_client_cn=False):
         """Validate {"bundle": "...", "require_client_cert": bool} block.
         Checks that the referenced bundle exists and has required files.
 
         `allow_client_cn` says whether this caller supports the key of
-        that name - serial SSL servers do, HTTP servers do not. Saying
+        that name - serial TLS servers do, HTTP servers do not. Saying
         so is the point: accepted and then ignored is a config that
         means less than it reads, which is the failure this whole
         family of validators exists to prevent.
         """
-        if not isinstance(ssl, dict):
-            return 'ssl must be an object'
-        bundle = ssl.get('bundle')
+        if not isinstance(tls, dict):
+            return 'tls must be an object'
+        bundle = tls.get('bundle')
         if not bundle:
-            return 'ssl requires bundle name'
-        mtls = bool(ssl.get('require_client_cert'))
-        if 'allow_client_cn' in ssl and not allow_client_cn:
-            return ('allow_client_cn is only supported on serial SSL '
+            return 'tls requires bundle name'
+        mtls = bool(tls.get('require_client_cert'))
+        if 'allow_client_cn' in tls and not allow_client_cn:
+            return ('allow_client_cn is only supported on serial TLS '
                     'servers, not on HTTP servers')
         try:
             if allow_client_cn:
@@ -1992,7 +1992,7 @@ class HttpServerWrapper():
                 # a refused API call can never disagree. Before the
                 # bundle lookup: the shape of what was sent is this
                 # caller's mistake, a missing file is the server's.
-                _cert_manager.parse_allowed_client_cns(ssl)
+                _cert_manager.parse_allowed_client_cns(tls)
             _cert_manager.resolve_bundle_paths(
                 self._cert_manager.certs_dir, bundle,
                 require_client_cert=mtls)
@@ -2088,7 +2088,7 @@ class HttpServerWrapper():
         needs_restart = (
             old.get('address', '0.0.0.0') != srv.get('address', '0.0.0.0') or
             old.get('port') != srv.get('port') or
-            old.get('ssl') != srv.get('ssl') or
+            old.get('tls') != srv.get('tls') or
             old.get('allow') != srv.get('allow') or
             old.get('deny') != srv.get('deny'))
         if needs_restart:
@@ -2140,11 +2140,11 @@ class HttpServerWrapper():
         currently in use. `mtls` says whether that server verifies
         client certificates, i.e. whether ca.pem matters to it."""
         usage = []
-        # Port SSL servers
+        # Port TLS servers
         for p_idx, port in enumerate(self._get_ports_config()):
             for s_idx, srv in enumerate(port.get('servers', [])):
-                ssl_cfg = srv.get('ssl')
-                if not ssl_cfg or ssl_cfg.get('bundle') != bundle_name:
+                tls_cfg = srv.get('tls')
+                if not tls_cfg or tls_cfg.get('bundle') != bundle_name:
                     continue
                 usage.append({
                     'type': 'port',
@@ -2153,15 +2153,15 @@ class HttpServerWrapper():
                     'server_index': s_idx,
                     'address': srv.get('address'),
                     'server_port': srv.get('port'),
-                    'mtls': bool(ssl_cfg.get('require_client_cert')),
+                    'mtls': bool(tls_cfg.get('require_client_cert')),
                 })
         # HTTP servers
         http_list = self._configuration.get('http', [])
         if isinstance(http_list, dict):
             http_list = [http_list]
         for h_idx, srv in enumerate(http_list):
-            ssl_cfg = srv.get('ssl')
-            if not ssl_cfg or ssl_cfg.get('bundle') != bundle_name:
+            tls_cfg = srv.get('tls')
+            if not tls_cfg or tls_cfg.get('bundle') != bundle_name:
                 continue
             usage.append({
                 'type': 'http',
@@ -2169,7 +2169,7 @@ class HttpServerWrapper():
                 'name': srv.get('name'),
                 'address': srv.get('address'),
                 'server_port': srv.get('port'),
-                'mtls': bool(ssl_cfg.get('require_client_cert')),
+                'mtls': bool(tls_cfg.get('require_client_cert')),
             })
         return usage
 
@@ -2270,7 +2270,7 @@ class HttpServerWrapper():
             self._error(
                 client,
                 f"Bundle '{bundle}' is in use by {len(usage)} server(s); "
-                "remove SSL references first",
+                "remove TLS references first",
                 400)
             return
         try:
@@ -2490,34 +2490,34 @@ class HttpServerWrapper():
         A server whose reload fails keeps serving its previous cert.
         That is not something load_cert_chain() gives you - it installs
         the cert before it checks the key against it - so
-        reload_ssl_context() rehearses the load on a throwaway context
+        reload_tls_context() rehearses the load on a throwaway context
         and only repeats it on the live one once that worked.
         """
         reloaded = []
         errors = []
         for proxy in self._serial_proxies:
             for srv in proxy.servers:
-                ssl_cfg = srv.config.get('ssl') or {}
-                if srv.protocol != 'SSL' \
-                        or ssl_cfg.get('bundle') != bundle_name:
+                tls_cfg = srv.config.get('tls') or {}
+                if srv.protocol != 'TLS' \
+                        or tls_cfg.get('bundle') != bundle_name:
                     continue
                 label = "port %s:%s" % (
                     srv.config.get('address'), srv.config.get('port'))
                 try:
-                    srv.reload_ssl_context()
+                    srv.reload_tls_context()
                 except _cert_manager.CertManagerError as err:
                     errors.append(f"{label}: {err}")
                 else:
                     reloaded.append(label)
         for _server, _flt, cfg, ctx in self._servers:
-            ssl_cfg = cfg.get('ssl') or {}
-            if ctx is None or ssl_cfg.get('bundle') != bundle_name:
+            tls_cfg = cfg.get('tls') or {}
+            if ctx is None or tls_cfg.get('bundle') != bundle_name:
                 continue
             label = "http %s:%s" % (
                 cfg.get('address', '0.0.0.0'), cfg.get('port'))
             try:
-                _cert_manager.reload_ssl_context(
-                    ctx, ssl_cfg, self._cert_manager.certs_dir)
+                _cert_manager.reload_tls_context(
+                    ctx, tls_cfg, self._cert_manager.certs_dir)
             except _cert_manager.CertManagerError as err:
                 errors.append(f"{label}: {err}")
             else:
@@ -2531,7 +2531,7 @@ class HttpServerWrapper():
         hook, re-upload, generate) take effect without a restart: new
         handshakes get the new cert, established connections are left
         alone. A CA removed from ca.pem still needs a restart — see
-        cert_manager.reload_ssl_context().
+        cert_manager.reload_tls_context().
         """
         if not self._require_admin(client, user):
             return

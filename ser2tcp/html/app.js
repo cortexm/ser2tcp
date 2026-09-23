@@ -82,6 +82,27 @@ const _REGENERATE_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
   + '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>'
   + '<path d="M13.6 1.9v2.9h-2.9"/></svg>';
 
+// A prompt in a box: the VT100 terminal page.
+const _TERMINAL_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
+  + 'fill="none" stroke="currentColor" stroke-width="1.4" '
+  + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/>'
+  + '<path d="M4.5 6.5 6.8 8.5 4.5 10.5"/><path d="M8.5 10.5H11.5"/></svg>';
+// Lines of output in the same box: the raw view, which does not
+// interpret what it is given, it just shows it.
+const _RAW_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
+  + 'fill="none" stroke="currentColor" stroke-width="1.4" '
+  + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/>'
+  + '<path d="M4 6.2h8"/><path d="M4 8.5h8"/><path d="M4 10.8h5"/></svg>';
+// One node handing what it has to two others.
+const _SHARE_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" '
+  + 'fill="none" stroke="currentColor" stroke-width="1.4" '
+  + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<circle cx="4" cy="8" r="2"/><circle cx="12" cy="3.6" r="2"/>'
+  + '<circle cx="12" cy="12.4" r="2"/>'
+  + '<path d="M5.8 7 10.2 4.6"/><path d="M5.8 9 10.2 11.4"/></svg>';
+
 // Small icon-only button for a field or a value shown as text, where a
 // labelled button would be more furniture than the action is worth.
 function iconBtn(svg, title, onclick) {
@@ -111,6 +132,37 @@ function copyIconBtn(value, title) {
     });
   };
   return b;
+}
+
+// The same button as iconBtn, as a link: for an action that is really a
+// place - a terminal page, a share modal - so it can be middle-clicked,
+// opened in a new tab and copied like any other link.
+function iconLink(svg, title, href, newTab) {
+  const a = el('a', { class: 'icon-btn', href, title, 'aria-label': title });
+  if (newTab) {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  }
+  a.innerHTML = svg;
+  return a;
+}
+
+// Text that copies itself on a click and says so for a moment. For a
+// value that is taken elsewhere - a device path, an address - where a
+// button beside it would be more furniture than the action is worth.
+function copyableSpan(text, cls) {
+  const span = el('span', {
+    class: (cls ? cls + ' ' : '') + 'copyable',
+    title: 'Click to copy',
+  }, text);
+  span.onclick = e => {
+    e.stopPropagation();
+    copyText(text).then(ok => {
+      span.textContent = ok ? 'Copied!' : 'Copy failed';
+      setTimeout(() => { span.textContent = text; }, 1000);
+    });
+  };
+  return span;
 }
 
 function formGroup(label, input, opts = {}) {
@@ -555,6 +607,8 @@ const routes = [
   [/^\/ports\/new$/,               m => showPortEditor(null, m._q)],
   [/^\/ports\/([^/]+)\/edit$/,      m => showPortEditor(
       decodeURIComponent(m[1]), m._q)],
+  [/^\/ports\/([^/]+)\/share\/(.+)$/, m => showShareLink(
+      decodeURIComponent(m[1]), decodeURIComponent(m[2]))],
   [/^\/detected$/,                 () => showDetected()],
   [/^\/users$/,                    () => showUsers()],
   [/^\/users\/new$/,               () => showUserEditor(null)],
@@ -654,7 +708,7 @@ const MATCH_ATTRS = ['vid', 'pid', 'serial_number', 'manufacturer', 'product', '
 // The full name stays as the field's title, since that is what goes in
 // the config file.
 const MATCH_LABELS = { serial_number: 'serial', manufacturer: 'manufact' };
-const PROTOCOLS = ['TCP', 'TELNET', 'SSL', 'SOCKET', 'WEBSOCKET'];
+const PROTOCOLS = ['TCP', 'TELNET', 'TLS', 'SOCKET', 'WEBSOCKET'];
 const CONTROL_SIGNALS = ['rts', 'dtr', 'cts', 'dsr', 'ri', 'cd'];
 // Which way each line runs. RTS and DTR are driven from this end, so
 // they are the only ones a client could ever be allowed to set; the
@@ -716,7 +770,7 @@ const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 // Every server setting the editor has a field for. These are rebuilt
 // from the form on save; anything else is carried over untouched.
 const FORM_OWNED_SERVER_KEYS = [
-  'address', 'port', 'endpoint', 'token', 'ssl', 'access', 'data',
+  'address', 'port', 'endpoint', 'token', 'tls', 'access', 'data',
   'control', 'allow', 'deny', 'max_connections',
 ];
 
@@ -738,7 +792,7 @@ const ACCESS_LABELS = {
 
 // The same idea for an HTTP server: these come from the form, the rest
 // of the entry - an IP filter, anything added later - is carried over.
-const FORM_OWNED_HTTP_KEYS = ['address', 'port', 'name', 'ssl'];
+const FORM_OWNED_HTTP_KEYS = ['address', 'port', 'name', 'tls'];
 
 // An id is derived from the name: lowercase, digits and hyphens, with
 // everything else becoming a hyphen, runs of them collapsing to one and
@@ -983,9 +1037,51 @@ function renderPortsList() {
     root.appendChild(el('p', { class: 'empty' }, 'No ports configured'));
     return;
   }
+  _resolveEndpointTokens(portsStatus.ports);
   const grid = el('div', { class: 'card-grid' });
   portsStatus.ports.forEach((p, i) => grid.appendChild(renderPortCard(p, i)));
   root.appendChild(grid);
+}
+
+// The token a terminal link needs where this browser has no session to
+// fall back on, so that an endpoint with a token opens from here like
+// any other.
+//
+// That case is an installation with no users configured, and there
+// every request is already admin: /api/ports/<id> hands the token to
+// anybody who can reach the server at all, so carrying it in a link on
+// this page costs nothing that was not free already. Where users *are*
+// configured you had to sign in to be reading this, the plain link
+// works on that session, and nothing here is fetched.
+//
+// /api/status reports `token_required` and never the token, on purpose
+// - it is also fed to the status stream for hours - so the stored
+// configuration is where this has to come from.
+const _endpointTokens = new Map();
+const _tokensAsked = new Set();
+
+function _resolveEndpointTokens(ports) {
+  if (token) return;
+  const wanted = ports.filter(p => p.id && !_tokensAsked.has(p.id)
+    && (p.servers || []).some(s => s.token_required));
+  if (!wanted.length) return;
+  // Marked before the answer comes, and left marked if it never does:
+  // this runs on every status push, and a port that cannot be read
+  // would otherwise be asked about for ever. The share dialog fetches
+  // for itself and says what went wrong.
+  wanted.forEach(p => _tokensAsked.add(p.id));
+  Promise.all(wanted.map(p => api(
+    'GET', '/api/ports/' + encodeURIComponent(p.id),
+  ).then(cfg => (cfg.servers || []).forEach(s => {
+    if (s.endpoint && s.token) _endpointTokens.set(s.endpoint, s.token);
+  }), () => {}))).then(() => renderPortsList());
+}
+
+// A saved port may carry a new token, and a deleted one takes its
+// endpoints with it. Cheaper to ask again than to work out what moved.
+function forgetEndpointTokens() {
+  _endpointTokens.clear();
+  _tokensAsked.clear();
 }
 
 // Server now ships `state` in each port payload — fall back to a local
@@ -1026,7 +1122,12 @@ function renderPortCard(port, index) {
 
   // Header row: title + kebab
   const titleText = port.name || ser.port || ('Port ' + (index + 1));
-  const titleSpan = el('span', { class: 'card-title' }, titleText);
+  // Where the title *is* the device path - an unnamed port - it is the
+  // one place the path is written, so it copies from here. A named
+  // port carries it in the subtitle instead, and it copies from there.
+  const titleSpan = (!port.name && ser.port)
+    ? copyableSpan(titleText, 'card-title')
+    : el('span', { class: 'card-title' }, titleText);
   const headerRow = el('div', { class: 'card-header-row' }, titleSpan);
   // Monitor is there whatever the port is doing: it watches the line,
   // and waiting for a device to turn up is a thing you open it to do.
@@ -1046,24 +1147,33 @@ function renderPortCard(port, index) {
   headerRow.appendChild(kebabMenu(actions));
   card.appendChild(headerRow);
 
-  // Subtitle: device path or match
-  let subtitle = '';
+  // Subtitle: device path or match. The path is the thing that gets
+  // typed into somebody else's command line, so it copies on a click -
+  // a match description does not, there being no file to open.
+  let device = '';
+  let described = '';
   if (ser.port) {
-    if (port.name || ser.match) subtitle = ser.port;
+    if (port.name || ser.match) device = ser.port;
   } else if (ser.match) {
     const matching = detectedPorts.filter(p => _matchesPort(p, ser.match));
-    if (matching.length) subtitle = matching.map(p => p.device).join(', ');
-    else subtitle = 'match: ' + Object.entries(ser.match).map(([k,v]) => k+'='+v).join(', ');
+    if (matching.length) device = matching.map(p => p.device).join(', ');
+    else described = 'match: ' + Object.entries(ser.match).map(([k,v]) => k+'='+v).join(', ');
   }
   const subParts = [];
-  if (subtitle) subParts.push(subtitle);
+  if (device) subParts.push(copyableSpan(device));
+  if (described) subParts.push(described);
   if (ser.baudrate) subParts.push(ser.baudrate + ' bps');
   // No "connected"/"disconnected" here: the card's colour is the answer
   // (green connected, blue idle but ready, red device missing) and the
   // word only repeated it.
   if (subParts.length) {
-    card.appendChild(
-      el('div', { class: 'card-subtitle' }, subParts.join(' — ')));
+    const sub = el('div', { class: 'card-subtitle' });
+    subParts.forEach((part, i) => {
+      if (i) sub.appendChild(document.createTextNode(' — '));
+      sub.appendChild(typeof part === 'string'
+        ? document.createTextNode(part) : part);
+    });
+    card.appendChild(sub);
   }
 
   // A port that never started. Its servers do not exist and there is
@@ -1089,30 +1199,38 @@ function renderPortCard(port, index) {
   // they're more actionable in context. Those pages report and toggle
   // them over their own WebSocket, not through the API.
 
-  // Server list — Terminal / Raw links inside need to know the port
-  // state to gate themselves (hidden when the device isn't on the
-  // system, since opening them would just immediately fail).
+  // Server list. The links inside do not care what state the port is
+  // in: a device that is not plugged in yet is something to wait for,
+  // and waiting for it from an open terminal is the point.
   const serverUl = el('ul', { class: 'server-list' });
   (port.servers || []).forEach((s, si) => {
-    serverUl.appendChild(renderServerRow(s, id, si, state));
+    serverUl.appendChild(renderServerRow(s, id, si));
   });
   card.appendChild(serverUl);
 
   return card;
 }
 
-function renderServerRow(srv, portId, srvIdx, portState) {
+function renderServerRow(srv, portId, srvIdx) {
   const proto = (srv.protocol || 'tcp').toUpperCase();
   const li = el('li', { class: 'server-row' });
 
-  // Head: protocol tag + address
+  // Head: protocol tag + address + what can be done with it
   const head = el('div', { class: 'server-row-head' });
   head.appendChild(el('span', { class: 'server-row-tag' }, proto));
   let addrText;
   if (proto === 'WEBSOCKET') addrText = '/ws/' + srv.endpoint;
   else if (proto === 'SOCKET') addrText = srv.address;
   else addrText = srv.address + ':' + srv.port;
-  head.appendChild(document.createTextNode(addrText));
+  // The address is what you take elsewhere - into a terminal program,
+  // into socat, into a colleague's message - so it copies on a click.
+  // A WebSocket endpoint does not: the string worth having there is
+  // the full URL with its token, and that is what the share link is.
+  if (proto === 'WEBSOCKET') {
+    head.appendChild(el('span', { class: 'server-row-addr' }, addrText));
+  } else {
+    head.appendChild(copyableSpan(addrText, 'server-row-addr'));
+  }
   li.appendChild(head);
 
   // Which way data may flow, on every protocol — a read-only TCP server
@@ -1124,50 +1242,50 @@ function renderServerRow(srv, portId, srvIdx, portState) {
       ACCESS_LABELS[access] || access));
   }
 
-  // WebSocket: clickable URL + terminal links
+  // WebSocket: what can be done with the endpoint, as icons beside it.
+  // The ws:// URL used to be printed underneath and copied on a click.
+  // It is gone: the string worth handing anybody is the one with the
+  // token in it, and that is what the share link is for.
   if (proto === 'WEBSOCKET') {
-    const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = scheme + '//' + location.host + '/ws/' + srv.endpoint;
-    const urlEl = el('div', {
-      class: 'server-row-detail copyable',
-      title: 'Click to copy',
-      onclick: e => {
-        e.stopPropagation();
-        copyText(wsUrl).then(ok => {
-          urlEl.textContent = ok ? 'Copied!' : 'Copy failed';
-          setTimeout(() => { urlEl.textContent = wsUrl; }, 1000);
-        });
-      },
-    }, wsUrl);
-    li.appendChild(urlEl);
+    const actions = el('span', { class: 'row-actions' });
+    // Where the endpoint has a token and this browser has no session,
+    // the link carries the token itself - in the fragment, the same way
+    // a shared one does.
+    const epToken = srv.token_required
+      ? _endpointTokens.get(srv.endpoint) : null;
+    const frag = epToken ? '#token=' + encodeURIComponent(epToken) : '';
     // A terminal needs to hear the device; write-only and control-only
     // endpoints would open and then sit silent forever.
-    if (access === 'rw' || access === 'ro') {
-      // Skip Terminal / Raw when the configured device isn't present —
-      // clicking them would just fail to open a serial connection.
-      if (portState !== 'error') {
-        // The terminal pages authenticate as the signed-in user: they
-        // read the session token from localStorage and never look at
-        // the per-server token. So an endpoint that has one, on an
-        // installation with no users to sign in as, cannot be reached
-        // from the browser at all — offering the link would only lead
-        // to a 401. The per-server token is for devices.
-        if (srv.token_required && !token) {
-          li.appendChild(el('div', { class: 'server-row-detail' },
-            'no terminal — endpoint has a token and nobody to sign in as'));
-        } else {
-          li.appendChild(el('div', { class: 'ws-links' },
-            el('a', {
-              href: '/xterm/' + srv.endpoint,
-              target: '_blank', rel: 'noopener',
-            }, 'Terminal'),
-            el('a', {
-              href: '/raw/' + srv.endpoint,
-              target: '_blank', rel: 'noopener',
-            }, 'Raw')));
-        }
-      }
+    //
+    // A device that is not plugged in is *not* a reason to withhold
+    // them, which it used to be. The page is not refused by a port
+    // that will not open — it is told, and the port is retried for as
+    // long as it stays — so opening the terminal first and plugging
+    // the board in second is a way of watching it from its first byte.
+    const hasTerminal = access === 'rw' || access === 'ro';
+    // A bare link authenticates as whoever is signed in here — the
+    // pages read the session token and never look at the per-server
+    // one — so an endpoint with a token needs one of the two: a session
+    // to be, or its own token in the link. Until the token has been
+    // fetched there is no link to offer, which is a moment, not a
+    // state worth drawing.
+    if (hasTerminal && (!srv.token_required || token || epToken)) {
+      actions.appendChild(iconLink(_TERMINAL_ICON, 'Terminal (VT100)',
+        '/xterm/' + srv.endpoint + frag, true));
+      actions.appendChild(iconLink(_RAW_ICON, 'Raw view',
+        '/raw/' + srv.endpoint + frag, true));
     }
+    // Only an endpoint with a token can be handed to somebody who has
+    // no account here — that token is the whole credential, and it
+    // grants this endpoint and nothing else. Offered whatever the
+    // access is: a write-only endpoint has no terminal to share, but
+    // its WebSocket URL is still worth handing out.
+    if (srv.token_required) {
+      actions.appendChild(iconLink(_SHARE_ICON, 'Share link…',
+        '#/ports/' + encodeURIComponent(portId) + '/share/'
+          + encodeURIComponent(srv.endpoint)));
+    }
+    if (actions.childNodes.length) head.appendChild(actions);
   }
 
   // Control protocol summary
@@ -1205,6 +1323,101 @@ function renderServerRow(srv, portId, srvIdx, portState) {
   }
 
   return li;
+}
+
+// ===========================================================================
+// Share link
+// ===========================================================================
+
+// A link for somebody who has no account here: "this is our device, try
+// it". It carries the endpoint's own token, which is the one credential
+// narrow enough to hand out — it opens that endpoint, as much of it as
+// its access allows, and nothing else. A session token would be an
+// account.
+//
+// The token is not in /api/status, deliberately (that payload is also
+// broadcast to every status listener for hours), so the stored
+// configuration is fetched when the link is actually asked for.
+function showShareLink(portId, endpoint) {
+  // Same wait as the port editor: on a reload the status stream has
+  // not arrived yet, and opening the modal over an empty page would
+  // leave nothing to go back to. The first snapshot calls route()
+  // again, so this runs a second time on its own.
+  if (!portsStatus) return;
+  api('GET', '/api/ports/' + encodeURIComponent(portId))
+    .then(cfg => _renderShareLink(endpoint, cfg))
+    .catch(e => {
+      if (e !== 'unauthorized') alert(String(e));
+      navigate('/ports');
+    });
+}
+
+function _renderShareLink(endpoint, cfg) {
+  const srv = (cfg.servers || []).find(
+    s => (s.protocol || '').toUpperCase() === 'WEBSOCKET'
+      && s.endpoint === endpoint);
+  if (!srv || !srv.token) {
+    alert('This endpoint has no token — add one in the port editor first, '
+      + 'or a link would let in anyone who can reach the server.');
+    navigate('/ports');
+    return;
+  }
+  // The fragment never leaves the browser: it is not sent with the
+  // request, so the token stays out of the server log, out of anything
+  // a proxy in front of us writes down, and out of the Referer header.
+  // The page reads it, keeps it for the tab and wipes it from the
+  // address bar.
+  const frag = '#token=' + encodeURIComponent(srv.token);
+  const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const access = serverAccess(srv);
+  const body = el('div', {});
+  if (access === 'rw' || access === 'ro') {
+    body.appendChild(_shareRow('Terminal',
+      location.origin + '/xterm/' + endpoint + frag,
+      'VT100 terminal — for a device that echoes.'));
+    body.appendChild(_shareRow('Raw',
+      location.origin + '/raw/' + endpoint + frag,
+      'Coloured raw view, TX and RX apart, hex escapes.'));
+  }
+  // A query, not a fragment: a device or a wscat has no fragment to
+  // read. This is the URL for a machine, and a query is something
+  // servers log — which is exactly why the two links differ.
+  body.appendChild(_shareRow('WebSocket URL',
+    wsScheme + '//' + location.host + '/ws/' + endpoint
+      + '?token=' + encodeURIComponent(srv.token),
+    'For a program rather than a browser — the token rides in the '
+      + 'query, where a plain WebSocket client can put it.'));
+  // The short spelling: ACCESS_LABELS explains each one in a sentence,
+  // which does not fit inside a sentence of its own.
+  const what = { rw: 'read and write', ro: 'read only',
+    wo: 'write only', none: 'control only' }[access] || access;
+  body.appendChild(el('p', { class: 'card-subtitle',
+    style: 'font-size:12px;margin-top:14px' },
+    'Anyone holding the link can use this endpoint (' + what + ')'
+    + (srv.max_connections ? ', up to ' + srv.max_connections + ' at a time' : '')
+    + '. To take it back, generate a new token in the port editor — '
+    + 'that revokes every link handed out so far.'));
+  openModal({
+    title: 'Share ' + endpoint,
+    body,
+    footer: btn('Close', 'btn-primary', () => backToList()),
+  });
+}
+
+function _shareRow(label, url, note) {
+  // A readonly input rather than text: it selects on click, and it
+  // scrolls instead of wrapping a long URL across four lines.
+  const urlEl = el('input', {
+    type: 'text', readonly: true, value: url,
+    style: 'flex:1;font-family:monospace;font-size:12px',
+    onclick: e => e.target.select(),
+  });
+  return el('div', { style: 'margin-bottom:14px' },
+    el('label', { style: 'display:block;margin-bottom:4px' }, label),
+    el('div', { style: 'display:flex;gap:8px;align-items:center' },
+      urlEl, copyIconBtn(url, 'Copy ' + label)),
+    el('div', { class: 'card-subtitle', style: 'font-size:12px;margin-top:4px' },
+      note));
 }
 
 // Is this device already spoken for by a configured port? Either it is
@@ -1302,7 +1515,7 @@ function renderDetectedCard(p, configured) {
 function confirmDeletePort(id, name) {
   if (!confirm('Delete port "' + name + '"?')) return;
   api('DELETE', '/api/ports/' + encodeURIComponent(id))
-    .then(() => navigate('/ports'))
+    .then(() => { forgetEndpointTokens(); navigate('/ports'); })
     .catch(e => { if (e !== 'unauthorized') alert(e); });
 }
 
@@ -1735,15 +1948,15 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const { row: addrRow, secondPart: portRow } = pairRow(
     addrLabel, addrInput, 'Port', portInput);
 
-  // SSL fields: bundle dropdown + mTLS toggle. Built via shared helper
-  // so port-SSL and HTTPS editors stay consistent. We always want the
-  // ssl block when protocol=SSL, so we hide the SSL-enable checkbox the
+  // TLS fields: bundle dropdown + mTLS toggle. Built via shared helper
+  // so port-TLS and HTTPS editors stay consistent. We always want the
+  // tls block when protocol=TLS, so we hide the TLS-enable checkbox the
   // helper exposes and treat the bundle as required.
-  const ssl = _buildSslFields(srv.ssl, bundles || [], { clientCn: true });
-  ssl.sslCb.checked = true;
-  ssl.sslCb.style.display = 'none';
-  ssl.wrap.classList.remove('hidden');
-  const sslDiv = ssl.wrap;
+  const tls = _buildTlsFields(srv.tls, bundles || [], { clientCn: true });
+  tls.tlsCb.checked = true;
+  tls.tlsCb.style.display = 'none';
+  tls.wrap.classList.remove('hidden');
+  const tlsDiv = tls.wrap;
 
   // What this server offers a client, as three independent things
   // rather than a list of the combinations. Read and write were a
@@ -1767,9 +1980,9 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const [aclCb, aclLabel] = enableCb('ACL', !!(
     (srv.allow || []).length || (srv.deny || []).length
     || srv.max_connections
-    // Named clients live in the ssl block but are shown here, and a
+    // Named clients live in the tls block but are shown here, and a
     // section that opened closed would drop them on the next save.
-    || ((srv.ssl || {}).allow_client_cn || []).length));
+    || ((srv.tls || {}).allow_client_cn || []).length));
   const dataRow = formRow('Enable',
     [readLabel, writeLabel, ctlLabel, aclLabel]);
 
@@ -1882,16 +2095,16 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const maxConnRow = formRow('Max clients', maxConnInput);
   // Who may connect, by name rather than by address - the same
   // question the rows above ask, so it is asked in the same place.
-  // Built with the SSL fields because the value is written into the
-  // ssl block, and hidden by them when the server is not SSL or mTLS
+  // Built with the TLS fields because the value is written into the
+  // tls block, and hidden by them when the server is not TLS or mTLS
   // is off.
   const ipDiv = el('div', { class: 'subgroup' },
-    ipRows, maxConnRow, ssl.cnRow);
+    ipRows, maxConnRow, tls.cnRow);
 
   box.appendChild(formRow('Protocol', [protoSel, removeBtn]));
   box.appendChild(wsRows);
   box.appendChild(addrRow);      // carries the port half with it
-  box.appendChild(sslDiv);
+  box.appendChild(tlsDiv);
   // Which way data flows is not a control-protocol setting: a plain TCP
   // server can be read-only. It used to live inside the control section
   // because `data: false` was only legal with control configured.
@@ -1908,10 +2121,10 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   function updateSections() {
     ctlDiv.classList.toggle('hidden', ctlCb.disabled || !ctlCb.checked);
     ipDiv.classList.toggle('hidden', !aclCb.checked);
-    // The CN row lives in the ACL section but is owned by the SSL
+    // The CN row lives in the ACL section but is owned by the TLS
     // fields, so it is re-checked whenever either side could have
     // moved: the protocol switch runs through here too.
-    ssl.syncCn();
+    tls.syncCn();
   }
   [ctlCb, aclCb].forEach(
     cb => cb.addEventListener('change', updateSections));
@@ -1919,14 +2132,14 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   function updateProtoFields() {
     const proto = protoSel.value;
     const isSocket = proto === 'SOCKET';
-    const isSsl = proto === 'SSL';
+    const isTls = proto === 'TLS';
     const isTelnet = proto === 'TELNET';
     const isWs = proto === 'WEBSOCKET';
     wsRows.classList.toggle('hidden', !isWs);
     addrRow.classList.toggle('hidden', isWs);
     portRow.classList.toggle('hidden', isWs || isSocket);
     addrLabel.textContent = isSocket ? 'Path' : 'Address';
-    sslDiv.classList.toggle('hidden', !isSsl);
+    tlsDiv.classList.toggle('hidden', !isTls);
     // TELNET has no room for it: the escape protocol's 0xFF is IAC.
     ctlCb.disabled = isTelnet;
     if (isTelnet) ctlCb.checked = false;
@@ -2001,7 +2214,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     boxData: {
       get proto() { return protoSel.value; },
       protoSel, addrInput, portInput, epInput: wsEndpointInput,
-      tokenInput: wsTokenInput, ssl,
+      tokenInput: wsTokenInput, tls,
       readCb, writeCb, ctlCb, aclCb, writeRowCbs, reportCbs, pollSel,
       allowInput, denyInput, maxConnInput,
       // What was configured before this box was opened. The form does
@@ -2068,12 +2281,12 @@ function _collectPortConfig(form) {
         if (p) srv.port = parseInt(p);
       }
     }
-    if (proto === 'ssl') {
+    if (proto === 'tls') {
       // The allowed-CN list is part of the ACL section, so it is saved
       // only while that section is on.
-      const sslVal = d.ssl.getValue(d.aclCb.checked);
-      if (!sslVal) throw new Error('SSL server requires a bundle');
-      srv.ssl = sslVal;
+      const tlsVal = d.tls.getValue(d.aclCb.checked);
+      if (!tlsVal) throw new Error('TLS server requires a bundle');
+      srv.tls = tlsVal;
     }
     const read = d.readCb.checked;
     const write = d.writeCb.checked;
@@ -2121,7 +2334,7 @@ function _collectPortConfig(form) {
       const mc = parseInt(d.maxConnInput.value.trim());
       // Naming the clients that may connect is a rule like the others,
       // so a section holding only that is not an empty one.
-      const named = d.ssl.clientCns().length;
+      const named = d.tls.clientCns().length;
       if (!rules && !blocked && !(mc > 0) && !named) {
         throw new Error(proto === 'socket'
           ? 'ACL needs a client limit, or it does nothing'
@@ -2149,7 +2362,7 @@ function _savePortFromForm(form, id) {
   const path = id !== null ? '/api/ports/' + encodeURIComponent(id)
     : '/api/ports';
   api(method, path, cfg)
-    .then(() => navigate('/ports'))
+    .then(() => { forgetEndpointTokens(); navigate('/ports'); })
     .catch(e => {
       if (e === 'unauthorized') return;
       // Includes the answer to a save aimed at a version of the port
@@ -2540,8 +2753,9 @@ function renderHttpCard(srv, index) {
   // process that was not serving look exactly like one that was.
   const card = el('div',
     { class: 'card ' + (srv.error ? 'card-error' : 'card-online') });
-  const ssl = srv.ssl ? ' (SSL)' : '';
-  const titleText = srv.name || `${srv.address || '0.0.0.0'}:${srv.port}${ssl}`;
+  const tlsTag = srv.tls ? ' (TLS)' : '';
+  const titleText = srv.name
+    || `${srv.address || '0.0.0.0'}:${srv.port}${tlsTag}`;
   const title = el('span', { class: 'card-title' }, titleText);
   const headerRow = el('div', { class: 'card-header-row' }, title);
   if (isAdmin) {
@@ -2561,12 +2775,12 @@ function renderHttpCard(srv, index) {
   const meta = el('div', { class: 'card-meta' });
   meta.appendChild(el('div', { class: 'card-meta-row' },
     el('span', { class: 'card-meta-label' }, 'Listen'),
-    el('span', {}, `${srv.address || '0.0.0.0'}:${srv.port}${ssl}`)));
-  if (srv.ssl) {
+    el('span', {}, `${srv.address || '0.0.0.0'}:${srv.port}${tlsTag}`)));
+  if (srv.tls) {
     meta.appendChild(el('div', { class: 'card-meta-row' },
       el('span', { class: 'card-meta-label' }, 'Bundle'),
-      el('span', {}, srv.ssl.bundle || '-')));
-    if (srv.ssl.require_client_cert) {
+      el('span', {}, srv.tls.bundle || '-')));
+    if (srv.tls.require_client_cert) {
       meta.appendChild(el('div', { class: 'card-meta-row' },
         el('span', { class: 'card-meta-label' }, 'mTLS'),
         el('span', {}, 'required')));
@@ -2607,18 +2821,18 @@ function showSessionEditor() {
   });
 }
 
-// Build the bundle dropdown + mTLS toggle used by both HTTP and port SSL
-// editors. Returns {wrap, sslCb, getValue} — `wrap` is the div to insert,
-// `sslCb` is the enable checkbox (caller decides where to put it),
-// `getValue()` returns the ssl block or null.
-// `clientCn` builds the allowed-CN field, which serial SSL servers take
+// Build the bundle dropdown + mTLS toggle used by both HTTP and port TLS
+// editors. Returns {wrap, tlsCb, getValue} — `wrap` is the div to insert,
+// `tlsCb` is the enable checkbox (caller decides where to put it),
+// `getValue()` returns the tls block or null.
+// `clientCn` builds the allowed-CN field, which serial TLS servers take
 // and HTTP servers do not - the API refuses the key there, so offering
 // the field would be offering a value that cannot be saved. The row is
 // returned rather than placed: naming who may connect is access
 // control, so the port editor puts it in the ACL section, while the
-// value still belongs to the ssl block and is written from here.
-function _buildSslFields(currentSsl, bundles, opts = {}) {
-  const sslCb = el('input', { type: 'checkbox', checked: !!currentSsl });
+// value still belongs to the tls block and is written from here.
+function _buildTlsFields(currentTls, bundles, opts = {}) {
+  const tlsCb = el('input', { type: 'checkbox', checked: !!currentTls });
   const bundleSelect = el('select');
   const placeholderOpt = el('option', { value: '' }, '-- select bundle --');
   bundleSelect.appendChild(placeholderOpt);
@@ -2633,15 +2847,15 @@ function _buildSslFields(currentSsl, bundles, opts = {}) {
       + (_certFilePresent(b, 'ca.pem') ? ' [mTLS-capable]' : ''));
     bundleSelect.appendChild(opt);
   });
-  if (currentSsl && currentSsl.bundle) {
-    bundleSelect.value = currentSsl.bundle;
+  if (currentTls && currentTls.bundle) {
+    bundleSelect.value = currentTls.bundle;
   }
   const mtlsCb = el('input', { type: 'checkbox',
-    checked: !!(currentSsl && currentSsl.require_client_cert) });
+    checked: !!(currentTls && currentTls.require_client_cert) });
   const cnInput = el('input', {
     type: 'text', autocomplete: 'off',
     placeholder: 'operator, gateway-2 — empty: any client the CA signed',
-    value: ((currentSsl && currentSsl.allow_client_cn) || []).join(', '),
+    value: ((currentTls && currentTls.allow_client_cn) || []).join(', '),
   });
   const cnRow = opts.clientCn
     ? formRow('Allowed CNs', cnInput)
@@ -2656,12 +2870,12 @@ function _buildSslFields(currentSsl, bundles, opts = {}) {
   };
   // The list only means anything while a client certificate is
   // demanded; without mTLS there is no name to check. It also has
-  // nothing to say on a server that is not SSL at all - and that is
-  // read off the SSL section's own visibility, since the row now sits
+  // nothing to say on a server that is not TLS at all - and that is
+  // read off the TLS section's own visibility, since the row now sits
   // somewhere else and cannot go with it.
   const updateCnState = () => {
     if (!cnRow) return;
-    const on = mtlsCb.checked && !sslDiv.classList.contains('hidden');
+    const on = mtlsCb.checked && !tlsDiv.classList.contains('hidden');
     cnInput.disabled = !on;
     cnRow.classList.toggle('hidden', !on);
   };
@@ -2674,18 +2888,18 @@ function _buildSslFields(currentSsl, bundles, opts = {}) {
     class: 'checkbox-label inline-check',
     title: 'Require client certificate',
   }, mtlsCb, el('span', {}, ' mTLS'));
-  const sslDiv = el('div', { class: 'subgroup' },
+  const tlsDiv = el('div', { class: 'subgroup' },
     formRow('Bundle', [bundleSelect, mtlsLabel]));
-  if (!sslCb.checked) sslDiv.classList.add('hidden');
-  sslCb.onchange = () => {
-    sslDiv.classList.toggle('hidden', !sslCb.checked);
+  if (!tlsCb.checked) tlsDiv.classList.add('hidden');
+  tlsCb.onchange = () => {
+    tlsDiv.classList.toggle('hidden', !tlsCb.checked);
     updateCnState();
   };
-  // After sslDiv exists: updateCnState reads its visibility.
+  // After tlsDiv exists: updateCnState reads its visibility.
   updateMtlsState();
 
   function clientCns() {
-    if (!cnRow || !mtlsCb.checked || !sslCb.checked) return [];
+    if (!cnRow || !mtlsCb.checked || !tlsCb.checked) return [];
     return cnInput.value.split(',').map(s => s.trim()).filter(Boolean);
   }
 
@@ -2694,7 +2908,7 @@ function _buildSslFields(currentSsl, bundles, opts = {}) {
   // drops the address rules, rather than saving a limit that is no
   // longer on screen.
   function getValue(withClientCn = true) {
-    if (!sslCb.checked) return null;
+    if (!tlsCb.checked) return null;
     const bundle = bundleSelect.value;
     if (!bundle) throw new Error('Select a certificate bundle');
     const out = { bundle };
@@ -2706,7 +2920,7 @@ function _buildSslFields(currentSsl, bundles, opts = {}) {
     if (names.length) out.allow_client_cn = names;
     return out;
   }
-  return { wrap: sslDiv, sslCb, cnRow, clientCns, syncCn: updateCnState,
+  return { wrap: tlsDiv, tlsCb, cnRow, clientCns, syncCn: updateCnState,
     getValue };
 }
 
@@ -2764,7 +2978,7 @@ function _showHttpEditorWithBundles(id, bundles) {
     value: srv.address || '0.0.0.0', placeholder: '0.0.0.0' });
   const portInput = el('input', { type: 'number',
     value: String(srv.port || 8080), min: '1', max: '65535' });
-  const ssl = _buildSslFields(srv.ssl, bundles);
+  const tls = _buildTlsFields(srv.tls, bundles);
 
   // Its own class, and its own label columns with it: short labels in
   // a narrow dialog, where the port editor's are long ones in a wide
@@ -2780,8 +2994,8 @@ function _showHttpEditorWithBundles(id, bundles) {
     pairRow('Address', addrInput, 'Port', portInput).row,
     el('div', { style: 'margin:8px 0' },
       el('label', { class: 'checkbox-label' },
-        ssl.sslCb, el('span', {}, ' SSL'))),
-    ssl.wrap);
+        tls.tlsCb, el('span', {}, ' TLS'))),
+    tls.wrap);
 
   openModal({
     title: isNew ? 'New HTTP server' : 'Edit HTTP server',
@@ -2793,7 +3007,7 @@ function _showHttpEditorWithBundles(id, bundles) {
       btn('Cancel', '', () => backToList()),
       btn('Save', 'btn-primary',
         () => _saveHttpServer(isNew ? null : id,
-          { idInput, nameInput, addrInput, portInput, ssl },
+          { idInput, nameInput, addrInput, portInput, tls },
           isNew ? {} : srv)),
     ].filter(Boolean),
   });
@@ -2819,10 +3033,10 @@ function _saveHttpServer(id, fields, original) {
   }
   const name = fields.nameInput.value.trim();
   if (name) data.name = name;
-  let sslVal;
-  try { sslVal = fields.ssl.getValue(); }
+  let tlsVal;
+  try { tlsVal = fields.tls.getValue(); }
   catch (e) { return modalError(e.message); }
-  if (sslVal) data.ssl = sslVal;
+  if (tlsVal) data.tls = tlsVal;
   const method = id === null ? 'POST' : 'PUT';
   const path = id === null
     ? '/api/settings/http'

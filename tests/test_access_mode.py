@@ -204,7 +204,7 @@ class TestAConnectionThatMayNotWrite(unittest.TestCase):
     """The gate has to sit on the connection for the socket protocols.
 
     A WebSocket server reads its clients itself, so one check covers it.
-    TCP, TELNET, SSL and Unix sockets hand each connection the serial
+    TCP, TELNET, TLS and Unix sockets hand each connection the serial
     port and let it write — so every one of them needs to know, and the
     check belongs in the one place they share.
     """

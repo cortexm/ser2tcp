@@ -270,12 +270,12 @@ class TestApiStatus(unittest.TestCase):
         return proxy
 
     def _make_server(self, protocol='TCP', address='0.0.0.0', port=21000,
-            connections=None, ssl=None):
+            connections=None, tls=None):
         server = Mock()
         server.protocol = protocol
         config = {'address': address, 'port': port}
-        if ssl:
-            config['ssl'] = ssl
+        if tls:
+            config['tls'] = tls
         server.config = config
         server.connections = connections or []
         return server
@@ -364,19 +364,19 @@ class TestApiStatus(unittest.TestCase):
         self.assertEqual(serial['parity'], 'EVEN')
         self.assertEqual(serial['stopbits'], 'TWO')
 
-    def test_ssl_config_in_status(self):
-        ssl_cfg = {'bundle': 'main', 'require_client_cert': False}
+    def test_tls_config_in_status(self):
+        tls_cfg = {'bundle': 'main', 'require_client_cert': False}
         server = self._make_server(
-            protocol='SSL', port=10443, ssl=ssl_cfg)
+            protocol='TLS', port=10443, tls=tls_cfg)
         proxy = self._make_proxy(
             port='/dev/ttyUSB0', servers=[server])
         wrapper = make_wrapper(serial_proxies=[proxy])
         client = MockClient(path='/api/status')
         wrapper._handle_request(client)
         srv = client.responded['ports'][0]['servers'][0]
-        self.assertEqual(srv['ssl'], ssl_cfg)
+        self.assertEqual(srv['tls'], tls_cfg)
 
-    def test_no_ssl_config_for_tcp(self):
+    def test_no_tls_config_for_tcp(self):
         server = self._make_server(protocol='TCP')
         proxy = self._make_proxy(
             port='/dev/ttyUSB0', servers=[server])
@@ -384,7 +384,7 @@ class TestApiStatus(unittest.TestCase):
         client = MockClient(path='/api/status')
         wrapper._handle_request(client)
         srv = client.responded['ports'][0]['servers'][0]
-        self.assertNotIn('ssl', srv)
+        self.assertNotIn('tls', srv)
 
 
 class TestApiDisconnect(unittest.TestCase):
@@ -2153,12 +2153,12 @@ class TestPortConfigTypeValidation(unittest.TestCase):
         self.assertEqual(client.respond_status, 400)
         return client.responded['error']
 
-    def _ssl_server(self, ssl):
-        return [{'protocol': 'ssl', 'address': '127.0.0.1', 'port': 10443,
-            'ssl': ssl}]
+    def _tls_server(self, tls):
+        return [{'protocol': 'tls', 'address': '127.0.0.1', 'port': 10443,
+            'tls': tls}]
 
     def test_allow_client_cn_must_be_a_list(self):
-        err = self._assert_rejected(self._ssl_server({
+        err = self._assert_rejected(self._tls_server({
             'bundle': 'main', 'require_client_cert': True,
             'allow_client_cn': 'operator'}))
         self.assertIn('list of names', err)
@@ -2166,7 +2166,7 @@ class TestPortConfigTypeValidation(unittest.TestCase):
     def test_allow_client_cn_needs_mtls(self):
         # Without require_client_cert the list would enforce nothing,
         # so it is refused here rather than on the next restart.
-        err = self._assert_rejected(self._ssl_server({
+        err = self._assert_rejected(self._tls_server({
             'bundle': 'main', 'allow_client_cn': ['operator']}))
         self.assertIn('require_client_cert', err)
 
@@ -2283,9 +2283,9 @@ class TestHttpConfigTypeValidation(unittest.TestCase):
         self.assertEqual(client.respond_status, 400)
 
     def test_allow_client_cn_is_not_an_http_server_key(self):
-        # Serial SSL servers take it; an HTTP server does not enforce
+        # Serial TLS servers take it; an HTTP server does not enforce
         # it, and accepting the key would store a limit that is not one.
-        client = self._post({'address': '0.0.0.0', 'port': 8443, 'ssl': {
+        client = self._post({'address': '0.0.0.0', 'port': 8443, 'tls': {
             'bundle': 'main', 'require_client_cert': True,
             'allow_client_cn': ['operator']}})
         self.assertEqual(client.respond_status, 400)

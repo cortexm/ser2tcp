@@ -811,13 +811,13 @@ class TestAllowedClientCn(SerialPtyTestCase):
     an accepted client moves bytes, a refused one is dropped.
     """
 
-    ssl_port = None
+    tls_port = None
 
     @classmethod
     def port_servers(cls):
         return [{
-            'protocol': 'ssl', 'address': '127.0.0.1', 'port': cls.ssl_port,
-            'ssl': {
+            'protocol': 'tls', 'address': '127.0.0.1', 'port': cls.tls_port,
+            'tls': {
                 'bundle': 'port',
                 'require_client_cert': True,
                 'allow_client_cn': ['operator'],
@@ -848,7 +848,7 @@ class TestAllowedClientCn(SerialPtyTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.ssl_port = base.free_port()
+        cls.tls_port = base.free_port()
         super().setUpClass()
 
     def connect_as(self, name):
@@ -856,17 +856,17 @@ class TestAllowedClientCn(SerialPtyTestCase):
         cert_file, key_file = self.client_files[name]
         context = ssl.create_default_context(cafile=self.ca_file)
         context.load_cert_chain(cert_file, key_file)
-        raw = socket.create_connection(('127.0.0.1', self.ssl_port), 10)
+        raw = socket.create_connection(('127.0.0.1', self.tls_port), 10)
         return context.wrap_socket(raw, server_hostname='localhost')
 
     def test_the_listed_client_reaches_the_device(self):
         with self.connect_as('operator') as tls:
-            self.wait_for_connections(1, port=self.ssl_port)
+            self.wait_for_connections(1, port=self.tls_port)
             tls.sendall(b'from-operator')
             self.assertEqual(
                 read_device(self.master_fd, len(b'from-operator')),
                 b'from-operator')
-        self.wait_for_connections(0, port=self.ssl_port)
+        self.wait_for_connections(0, port=self.tls_port)
 
     def test_an_unlisted_client_is_dropped_after_the_handshake(self):
         # Its certificate is valid and signed by the CA the server
@@ -880,6 +880,6 @@ class TestAllowedClientCn(SerialPtyTestCase):
                 self.assertEqual(tls.recv(1), b'')
             except (ssl.SSLError, OSError):
                 pass        # a reset instead of a clean close is fine
-        self.wait_for_connections(0, port=self.ssl_port)
+        self.wait_for_connections(0, port=self.tls_port)
         # Nothing it sent may have reached the device.
         self.assertEqual(read_device(self.master_fd, 1, timeout=0.5), b'')

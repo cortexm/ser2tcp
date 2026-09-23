@@ -94,11 +94,15 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
   <button id="btn-send">Send</button>
 </div>
 
+<script src="/endpoint-token.js"></script>
+<script src="/ws-retry.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const pathParts = location.pathname.split('/raw/');
 const endpoint = pathParts[1] || '';
-const token = localStorage.getItem('ser2tcp_token');
+// A shared link's token, this tab's copy of one, or the signed-in
+// user's session - in that order. See endpoint-token.js.
+const token = endpointToken(endpoint);
 
 $('endpoint-name').textContent = '/ws/' + endpoint;
 document.title = 'ser2tcp raw \u2014 ' + endpoint;
@@ -127,6 +131,11 @@ let signals = null;
 // where the server drops the request without a word.
 let settable = [];
 
+// Opening this page on a device that is not plugged in yet is a way of
+// watching it from its first byte, so the link has to look after itself
+// while nobody is looking at the page. See ws-retry.js.
+const retry = wsRetry(() => { if (wantConnected && !ws) connect(); });
+
 function connect() {
   if (ws) return;
   wantConnected = true;
@@ -139,6 +148,7 @@ function connect() {
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     wsEverOpened = true;
+    retry.succeeded();
     setStatus('online'); appendInfo('Connected');
   };
   ws.onclose = ev => {
@@ -157,6 +167,7 @@ function connect() {
       setStatus('error');
       appendInfo('Cannot open connection');
     }
+    retry.schedule(wantConnected);
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return applyMessage(ev.data);
@@ -205,6 +216,7 @@ function applyMessage(text) {
 
 function disconnect() {
   wantConnected = false;
+  retry.cancel();
   if (ws) { ws.close(); ws = null; setStatus('offline'); }
 }
 
@@ -213,6 +225,8 @@ function disconnect() {
 // into view, or getting the network back, is the moment to find out
 // and to pick it up again.
 function reconnectIfWanted() {
+  // Whatever the clock was waiting for has happened.
+  retry.cancel();
   if (wantConnected && !ws && endpoint) connect();
 }
 document.addEventListener('visibilitychange', () => {

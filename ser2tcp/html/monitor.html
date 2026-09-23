@@ -100,6 +100,7 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
 
 <div id="output"></div>
 
+<script src="/ws-retry.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const pathParts = location.pathname.split('/monitor/');
@@ -157,6 +158,11 @@ let peers = [];
 let paused = false;
 let missed = 0;
 
+// A monitor is left open on a port precisely to catch what happens
+// next, so the link looks after itself. Nothing to hang up here, so
+// nothing to ask before retrying. See ws-retry.js.
+const retry = wsRetry(() => { if (!ws) connect(); });
+
 function connect() {
   if (ws) return;
   wsEverOpened = false;
@@ -168,6 +174,7 @@ function connect() {
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     wsEverOpened = true;
+    retry.succeeded();
     setStatus('online'); appendInfo('Connected'); lastSource = null;
   };
   ws.onclose = ev => {
@@ -189,6 +196,7 @@ function connect() {
       // whether or not anything is on the other end of it.
       appendInfo('Cannot open connection (no such port?)');
     }
+    retry.schedule();
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return applyMessage(ev.data);
@@ -259,6 +267,8 @@ function describePeer(peer) {
 // - the laptop slept, the network went, the server restarted - and
 // coming back into view is the moment to find out and pick it up.
 function reconnectIfWanted() {
+  // Whatever the clock was waiting for has happened.
+  retry.cancel();
   if (!ws && portName) connect();
 }
 document.addEventListener('visibilitychange', () => {

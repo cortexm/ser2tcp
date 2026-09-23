@@ -54,7 +54,7 @@ class TestHttpsServer(base.IntegrationTestCase):
             'ports': [],
             'http': [{
                 'name': 'secure', 'address': '127.0.0.1', 'port': cls.port,
-                'ssl': {'bundle': 'web'},
+                'tls': {'bundle': 'web'},
             }],
         }
 
@@ -89,7 +89,7 @@ class TestCertChainValidates(base.IntegrationTestCase):
             'ports': [],
             'http': [{
                 'address': '127.0.0.1', 'port': cls.port,
-                'ssl': {'bundle': 'web'},
+                'tls': {'bundle': 'web'},
             }],
         }
 
@@ -130,7 +130,7 @@ class TestMutualTls(base.IntegrationTestCase):
             'ports': [],
             'http': [{
                 'address': '127.0.0.1', 'port': cls.port,
-                'ssl': {'bundle': 'web', 'require_client_cert': True},
+                'tls': {'bundle': 'web', 'require_client_cert': True},
             }],
         }
 
@@ -179,7 +179,7 @@ class TestBundleReload(base.IntegrationTestCase):
             'ports': [],
             'http': [{
                 'address': '127.0.0.1', 'port': cls.port,
-                'ssl': {'bundle': 'web'},
+                'tls': {'bundle': 'web'},
             }],
         }
 
@@ -240,7 +240,7 @@ class TestAFailedReloadKeepsTheServerServing(base.IntegrationTestCase):
             'http': [
                 {'address': '127.0.0.1', 'port': cls.port},
                 {'address': '127.0.0.1', 'port': cls.tls_port,
-                 'ssl': {'bundle': 'web'}},
+                 'tls': {'bundle': 'web'}},
             ],
         }
 
@@ -283,14 +283,14 @@ class TestAFailedReloadKeepsTheServerServing(base.IntegrationTestCase):
             'renewed.local')
 
 
-class TestPortSslBundleUsage(base.IntegrationTestCase):
-    """A port SSL server reports its bundle usage and accepts a reload.
+class TestPortTlsBundleUsage(base.IntegrationTestCase):
+    """A port TLS server reports its bundle usage and accepts a reload.
 
     The HTTP API here is plain — what is under test is the port server
     on the other side of it.
     """
 
-    ssl_port = None
+    tls_port = None
 
     @classmethod
     def build_config(cls):
@@ -300,9 +300,9 @@ class TestPortSslBundleUsage(base.IntegrationTestCase):
                 'serial': {'port': '/dev/tty.not-a-real-device',
                     'baudrate': 9600},
                 'servers': [{
-                    'protocol': 'ssl',
-                    'address': '127.0.0.1', 'port': cls.ssl_port,
-                    'ssl': {'bundle': 'web', 'require_client_cert': True},
+                    'protocol': 'tls',
+                    'address': '127.0.0.1', 'port': cls.tls_port,
+                    'tls': {'bundle': 'web', 'require_client_cert': True},
                 }],
             }],
             'http': [{'address': '127.0.0.1', 'port': cls.port}],
@@ -324,7 +324,7 @@ class TestPortSslBundleUsage(base.IntegrationTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.ssl_port = base.free_port()
+        cls.tls_port = base.free_port()
         super().setUpClass()
 
     def test_used_by_reports_the_port_server(self):
@@ -334,7 +334,7 @@ class TestPortSslBundleUsage(base.IntegrationTestCase):
         usage = body['used_by'][0]
         self.assertEqual(usage['type'], 'port')
         self.assertEqual(usage['port_name'], 'demo')
-        self.assertEqual(usage['server_port'], self.ssl_port)
+        self.assertEqual(usage['server_port'], self.tls_port)
         # ca.pem is in play for this server, so the UI can warn before
         # anyone deletes it
         self.assertTrue(usage['mtls'])
@@ -348,7 +348,7 @@ class TestPortSslBundleUsage(base.IntegrationTestCase):
         status, body = self.post('/api/certs/web/reload')
         self.assertEqual(status, 200)
         self.assertEqual(
-            body['reloaded'], [f'port 127.0.0.1:{self.ssl_port}'])
+            body['reloaded'], [f'port 127.0.0.1:{self.tls_port}'])
 
     def test_port_server_serves_the_bundle_cert(self):
         # The configured serial device does not exist, so ser2tcp drops
@@ -356,7 +356,7 @@ class TestPortSslBundleUsage(base.IntegrationTestCase):
         # see whose certificate it offered. mTLS rejection itself is
         # covered by TestMutualTls, against a server that stays up.
         pem = base.tls_peer_cert(
-            '127.0.0.1', self.ssl_port,
+            '127.0.0.1', self.tls_port,
             client_cert=self.client_cert_file,
             client_key=self.client_key_file,
             probe=False)

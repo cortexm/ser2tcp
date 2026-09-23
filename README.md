@@ -1,6 +1,6 @@
 # Ser2tcp
 
-Simple proxy for connecting over TCP, TELNET, SSL, WebSocket or Unix socket to serial port
+Simple proxy for connecting over TCP, TELNET, TLS, WebSocket or Unix socket to serial port
 
 https://github.com/cortexm/ser2tcp
 
@@ -8,10 +8,10 @@ https://github.com/cortexm/ser2tcp
 
 - can serve multiple serial ports using pyserial library
 - each serial port can have multiple servers
-- server can use TCP, TELNET, SSL, WebSocket or SOCKET protocol
+- server can use TCP, TELNET, TLS, WebSocket or SOCKET protocol
   - TCP protocol just bridge whole RAW serial stream to TCP
   - TELNET protocol will send every character immediately and not wait for ENTER, it is useful to use standard `telnet` as serial terminal
-  - SSL protocol provides encrypted TCP connection with optional mutual TLS (mTLS) client certificate verification
+  - TLS protocol provides an encrypted TCP connection with optional mutual TLS (mTLS) client certificate verification
   - WebSocket protocol connects through the HTTP server with binary frames for data and JSON text frames for signal control
   - SOCKET protocol uses Unix domain socket for local IPC
 - servers accepts multiple connections at one time
@@ -24,7 +24,7 @@ https://github.com/cortexm/ser2tcp
 - web interface for viewing configured ports and connections
 - web terminal clients (xterm.js VT100 terminal and raw colored view)
 - authentication with session management and API tokens
-- SSL certificate manager via web UI (upload, paste, drag-and-drop PEM files)
+- TLS certificate manager via web UI (upload, paste, drag-and-drop PEM files)
 - light/dark mode web UI (follows system preference)
 
 ## Installation
@@ -176,12 +176,12 @@ Match attributes: `vid`, `pid`, `serial_number`, `manufacturer`, `product`, `loc
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `address` | Bind address (IP for tcp/telnet/ssl, path for socket) | required* |
+| `address` | Bind address (IP for tcp/telnet/tls, path for socket) | required* |
 | `port` | TCP port (not used for socket/websocket) | required* |
-| `protocol` | `tcp`, `telnet`, `ssl`, `websocket` or `socket` | required |
+| `protocol` | `tcp`, `telnet`, `tls`, `websocket` or `socket` | required |
 | `endpoint` | WebSocket URL path (websocket only), must be unique | required* |
 | `token` | Per-server auth token (websocket only) | - |
-| `ssl` | SSL configuration (required for `ssl` protocol) | - |
+| `tls` | TLS configuration (required for `tls` protocol) | - |
 | `access` | Which way data may flow: `rw`, `ro`, `wo`, `none` | `rw` |
 | `data` | Older spelling of `access` — `false` means `none` | true |
 | `control` | Signal control configuration | - |
@@ -189,7 +189,7 @@ Match attributes: `vid`, `pid`, `serial_number`, `manufacturer`, `product`, `loc
 | `buffer_limit` | Maximum send buffer size per client (bytes), `null` for unlimited | null |
 | `max_connections` | Maximum clients per server (0 = unlimited) | 0 |
 
-\* `address`/`port` required for tcp/telnet/ssl; `address` for socket; `endpoint` for websocket
+\* `address`/`port` required for tcp/telnet/tls; `address` for socket; `endpoint` for websocket
 
 #### Access mode
 
@@ -222,7 +222,7 @@ client is never sent the device's output, while the others still are.
 requires `control` to be configured; without it the server would do
 nothing at all and is refused at startup.
 
-Works on TCP, TELNET, SSL, WebSocket and Unix socket servers.
+Works on TCP, TELNET, TLS, WebSocket and Unix socket servers.
 
 > `data` is the older spelling and still works: `"data": false` means
 > `"access": "none"`, `"data": true` means `"access": "rw"`. Giving both
@@ -278,9 +278,45 @@ WebSocket connections go through the HTTP server — no separate listening port 
   is something to wait for rather than a connection error
 - Auth: per-server `token`, global user session, or both accepted
 - Web terminals available at `/xterm/<endpoint>` (VT100) and `/raw/<endpoint>` (colored hex)
+- A terminal can be opened before the device is plugged in: the page is
+  not refused by a port that will not open, it is told, and the port is
+  retried for as long as somebody is waiting — so the first byte the
+  board sends is already on screen. The page picks the link itself back
+  up too, after a server restart or a sleeping laptop, unless you
+  pressed Disconnect
 
 The full message format, for both `/ws/<endpoint>` and
 `/ws/monitor/<port-name>`, is in [README_WS_API.md](README_WS_API.md).
+
+#### Share link
+
+An endpoint that has a `token` can be handed to somebody who has no
+account here — "this is our device, try it". In the web UI, the share
+icon beside a WebSocket endpoint gives three URLs:
+
+```
+http://host:8080/xterm/my-device#token=SECRET   VT100 terminal
+http://host:8080/raw/my-device#token=SECRET     raw view
+ws://host:8080/ws/my-device?token=SECRET        for a program
+```
+
+- The token is the whole credential and it opens **that endpoint only**,
+  as far as its `access` allows. It is not an account: it reaches no
+  other endpoint, no API and no web UI
+- The browser links carry it in the URL **fragment**, which is never
+  sent to the server: it stays out of the request log, out of a reverse
+  proxy's log and out of the `Referer` header. The page reads it once,
+  keeps it for that browser tab and clears it from the address bar
+- The WebSocket URL uses `?token=` instead, since a program has no
+  fragment to read — that one does appear in server logs
+- To revoke, generate a new token for the endpoint: every link handed
+  out so far stops working
+- Limit the audience further with `allow`/`deny` and `max_connections`
+  on the same server
+
+Sharing sends somebody to an HTTP server that also serves the web UI
+and the whole API. On a LAN or a VPN that is the point; do not take it
+as a reason to expose that server to the internet.
 
 #### Socket configuration
 
@@ -298,22 +334,27 @@ For `socket` protocol, `address` is the path to the Unix domain socket:
 - Connect with: `socat - UNIX-CONNECT:/tmp/ser2tcp.sock`
 - Not available on Windows
 
-#### SSL configuration
+#### TLS configuration
 
-For `ssl` protocol, reference a certificate bundle managed by the
-Certificate Manager (see [below](#managing-certificates-via-web-ui)):
+For `tls` protocol, reference a certificate bundle managed by the
+Certificate Manager (see [below](#managing-certificates-via-web-ui)).
 
 ```json
 {
     "address": "0.0.0.0",
     "port": 10003,
-    "protocol": "ssl",
-    "ssl": {
+    "protocol": "tls",
+    "tls": {
         "bundle": "main",
         "require_client_cert": false
     }
 }
 ```
+
+> **Renamed from `ssl`.** The protocol value and the config block were
+> both called `ssl`; they are `tls` now, with no fallback. A config
+> written for an older version starts with *unknown protocol: ssl* —
+> rename the two keys, or set the server up again in the web UI.
 
 | Parameter | Description | Required |
 |-----------|-------------|----------|
@@ -333,8 +374,8 @@ one client, name it:
 {
     "address": "0.0.0.0",
     "port": 10003,
-    "protocol": "ssl",
-    "ssl": {
+    "protocol": "tls",
+    "tls": {
         "bundle": "main",
         "require_client_cert": true,
         "allow_client_cn": ["operator"]
@@ -350,7 +391,7 @@ one client, name it:
 - Requires `require_client_cert: true`. Without it a client need not
   present a certificate at all, so the list would enforce nothing;
   ser2tcp refuses that configuration rather than appearing to honour it
-- Serial `ssl` servers only. HTTP servers do not take this key — their
+- Serial `tls` servers only. HTTP servers do not take this key — their
   access control is users, tokens and IP filters
 
 The alternative, when clients come and go, is a CA per group of clients:
@@ -382,7 +423,7 @@ Filter logic:
 - **Only `allow`**: only IPs in allow list are allowed
 - **Both**: deny takes precedence, then allow list is checked
 
-Works on TCP, TELNET, SSL, WebSocket and HTTP servers. Not applicable to Unix socket (no IP addresses). Rejected connections are logged.
+Works on TCP, TELNET, TLS, WebSocket and HTTP servers. Not applicable to Unix socket (no IP addresses). Rejected connections are logged.
 
 **A rule that cannot be read stops the server it belongs to.** `allow`
 and `deny` must be lists, and every entry must parse as an address or a
@@ -441,12 +482,12 @@ Reading from the left would take the forged one and let it through an
 allow list.
 
 Only HTTP and WebSocket servers have a proxy in front of them. TCP,
-TELNET and SSL servers carry no headers, so their filters always compare
+TELNET and TLS servers carry no headers, so their filters always compare
 the socket address.
 
 ##### Managing certificates via web UI
 
-The web UI has a **Certificates** tab (admin only) for managing SSL
+The web UI has a **Certificates** tab (admin only) for managing TLS
 certificate bundles without shell access. A bundle is a directory under
 `{config_dir}/certs/{bundle_name}/` containing a fixed set of PEM files:
 
@@ -475,8 +516,8 @@ certificate bundles without shell access. A bundle is a directory under
   `ca.pem` are therefore checked again when served: one found to contain
   a private key is refused (403) and flagged in the Certificates tab,
   rather than handed to any signed-in user from a `0644` file
-- Bundles are referenced from SSL config via `"bundle": "<name>"` (both
-  port SSL servers and HTTPS servers); a bundle cannot be deleted while
+- Bundles are referenced from the `tls` config via `"bundle": "<name>"`
+  (both port TLS servers and HTTPS servers); a bundle cannot be deleted while
   any server still references it
 
 **Web UI operations** (Certificates tab):
@@ -541,7 +582,7 @@ the files on disk is only half the job:
        -H 'Authorization: Bearer <token>'
    ```
 
-   Every server using that bundle — HTTPS servers and port SSL servers
+   Every server using that bundle — HTTPS servers and port TLS servers
    alike — re-reads the files into its existing `SSLContext`. Connections
    in flight keep the certificate they negotiated with; every handshake
    from that moment on uses the new one. The response lists the servers
@@ -625,7 +666,7 @@ openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key -CAcreateser
 rm client.csr
 ```
 
-Testing SSL connection with `openssl s_client`:
+Testing a TLS connection with `openssl s_client`:
 
 ```bash
 # Plain TLS — skip cert validation (quick smoke test)
@@ -745,13 +786,13 @@ characters is hashed like any other rather than stored verbatim.
 A failed login takes the same work whether the account exists or not, so
 the response time does not say which logins are real.
 
-HTTPS with SSL — uses the same bundle-based config as port SSL servers:
+HTTPS — uses the same bundle-based config as port TLS servers:
 
 ```json
 {
     "http": [
         {"address": "0.0.0.0", "port": 8080},
-        {"address": "0.0.0.0", "port": 8443, "ssl": {
+        {"address": "0.0.0.0", "port": 8443, "tls": {
             "bundle": "main", "require_client_cert": false
         }}
     ]
@@ -804,7 +845,7 @@ With IP filtering:
 | GET | `/api/certs/<bundle>` | yes | Bundle detail (files, mtime, symlink target) |
 | DELETE | `/api/certs/<bundle>` | admin | Delete bundle and all its files |
 | POST | `/api/certs/<bundle>/files` | admin | Upload one file, or a set via `{"files": [...]}` |
-| POST | `/api/certs/<bundle>/reload` | admin | Re-read bundle into running servers' SSL contexts |
+| POST | `/api/certs/<bundle>/reload` | admin | Re-read bundle into running servers' TLS contexts |
 | GET | `/api/certs/<bundle>/files/<filename>` | yes | Download public file (cert.pem / ca.pem) |
 | DELETE | `/api/certs/<bundle>/files/<filename>` | admin | Delete single file from bundle |
 | POST | `/api/certs/<bundle>/generate` | admin | Generate cert+key into bundle (modes: self_signed / ca / signed_by) |

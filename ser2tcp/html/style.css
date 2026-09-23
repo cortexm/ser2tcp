@@ -1208,6 +1208,8 @@ tbody tr:hover { background: var(--table-hover); }
   background: none;
   color: var(--text-muted);
   cursor: pointer;
+  /* Some of these are links (iconLink): an action that is a place. */
+  text-decoration: none;
 }
 .icon-btn:hover { color: var(--accent); background: var(--bg-alt); }
 /* The whole feedback a copy gets: the icon becomes a green tick for a
@@ -1243,7 +1245,23 @@ tbody tr:hover { background: var(--table-hover); }
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 12px;
   color: var(--text);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
 }
+/* What you can do with this server, beside its address rather than on
+   a line of its own: three small icons say it in the width the words
+   "Terminal Raw Share link…" took on their own row. */
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+}
+/* Smaller than a form's icon button and with less around it: these sit
+   in a list of one-line rows, and a 16px icon made the rows carrying
+   them visibly taller than the rest. */
+.row-actions .icon-btn { margin-left: 2px; }
+.row-actions .icon-btn svg { width: 14px; height: 14px; }
 .server-row-tag {
   display: inline-block;
   padding: 0 5px;
@@ -1260,22 +1278,20 @@ tbody tr:hover { background: var(--table-hover); }
   color: var(--text-muted);
   padding-left: 4px;
 }
-.server-row-detail.copyable {
+/* A value that is taken elsewhere - a device path, an address - and
+   copies on a click. The hover is the only thing that says so, so it
+   is worth having wherever one of these appears. */
+.copyable {
   cursor: pointer;
+  border-bottom: 1px dotted transparent;
+}
+.copyable:hover {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.server-row-detail.copyable {
   font-family: ui-monospace, Menlo, Consolas, monospace;
 }
-.server-row-detail.copyable:hover { color: var(--accent); }
-.ws-links {
-  display: flex;
-  gap: 10px;
-  font-size: 12px;
-  margin-top: 2px;
-}
-.ws-links a {
-  color: var(--accent);
-  text-decoration: none;
-}
-.ws-links a:hover { text-decoration: underline; }
 
 .client-list {
   margin: 4px 0 0 0;

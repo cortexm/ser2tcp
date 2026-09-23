@@ -1,4 +1,4 @@
-"""SSL certificate bundle manager.
+"""TLS certificate bundle manager.
 
 A "bundle" is a directory under {config_dir}/certs/{name}/ that holds a
 fixed set of PEM files:
@@ -218,7 +218,7 @@ def resolve_bundle_paths(certs_dir, bundle_name, require_client_cert=False):
     Returns (cert_path, key_path, ca_path_or_None).
     """
     if not bundle_name:
-        raise CertManagerError('SSL config missing bundle name')
+        raise CertManagerError('TLS config missing bundle name')
     CertManager._validate_name(bundle_name)
     bundle_dir = _os.path.join(certs_dir, bundle_name)
     if not _os.path.isdir(bundle_dir):
@@ -240,8 +240,8 @@ def resolve_bundle_paths(certs_dir, bundle_name, require_client_cert=False):
     return (cert_path, key_path, None)
 
 
-def parse_allowed_client_cns(ssl_config):
-    """Read `allow_client_cn` from an ssl config block.
+def parse_allowed_client_cns(tls_config):
+    """Read `allow_client_cn` from a tls config block.
 
     Returns a tuple of names, or None when the key is absent (every
     client the CA vouches for is allowed, which is what mTLS alone
@@ -259,11 +259,11 @@ def parse_allowed_client_cns(ssl_config):
     reasoning as the IP filter (D5): a config must not enforce less
     than it says.
     """
-    if not isinstance(ssl_config, dict):
-        raise CertManagerError('ssl config must be an object')
-    if 'allow_client_cn' not in ssl_config:
+    if not isinstance(tls_config, dict):
+        raise CertManagerError('tls config must be an object')
+    if 'allow_client_cn' not in tls_config:
         return None
-    names = ssl_config['allow_client_cn']
+    names = tls_config['allow_client_cn']
     if isinstance(names, str):
         # One name where a list belongs would otherwise be iterated
         # character by character and match nothing.
@@ -287,7 +287,7 @@ def parse_allowed_client_cns(ssl_config):
         raise CertManagerError(
             'allow_client_cn is empty - that would let nobody in. Remove '
             'the key to accept every client the CA signed')
-    if not ssl_config.get('require_client_cert'):
+    if not tls_config.get('require_client_cert'):
         raise CertManagerError(
             'allow_client_cn requires require_client_cert: true - without '
             'it a client need not present a certificate at all')
@@ -522,7 +522,7 @@ def generate_certificate(
     return _serialize_cert_pem(cert), _serialize_key_pem(key)
 
 
-def reload_ssl_context(context, ssl_config, certs_dir):
+def reload_tls_context(context, tls_config, certs_dir):
     """Re-read a bundle's files into an existing SSLContext.
 
     Handshakes made from now on use the new cert; connections already
@@ -533,7 +533,7 @@ def reload_ssl_context(context, ssl_config, certs_dir):
     OpenSSL exposes no way to clear it, so a CA *removed* from ca.pem
     stays trusted until restart; an added one takes effect at once.
     """
-    cert_path, key_path, ca_path, bundle = _bundle_for(ssl_config, certs_dir)
+    cert_path, key_path, ca_path, bundle = _bundle_for(tls_config, certs_dir)
     # Load into a throwaway context first. load_cert_chain() installs
     # the certificate, then the key, and only then checks that they
     # belong together, so a bundle caught mid-renewal - new cert.pem on
@@ -547,12 +547,12 @@ def reload_ssl_context(context, ssl_config, certs_dir):
     _load_bundle(context, bundle, cert_path, key_path, ca_path)
 
 
-def _bundle_for(ssl_config, certs_dir):
-    """Resolve an ssl config to (cert, key, ca_or_None, bundle_name)"""
-    if not isinstance(ssl_config, dict):
-        raise CertManagerError('ssl config must be an object')
-    bundle = ssl_config.get('bundle')
-    mtls = bool(ssl_config.get('require_client_cert'))
+def _bundle_for(tls_config, certs_dir):
+    """Resolve a tls config to (cert, key, ca_or_None, bundle_name)"""
+    if not isinstance(tls_config, dict):
+        raise CertManagerError('tls config must be an object')
+    bundle = tls_config.get('bundle')
+    mtls = bool(tls_config.get('require_client_cert'))
     cert_path, key_path, ca_path = resolve_bundle_paths(
         certs_dir, bundle, require_client_cert=mtls)
     return cert_path, key_path, ca_path, bundle
@@ -578,23 +578,23 @@ def _load_bundle(context, bundle, cert_path, key_path, ca_path):
         context.verify_mode = _ssl.CERT_REQUIRED
 
 
-def build_ssl_context(ssl_config, certs_dir):
-    """Build an SSLContext from a server SSL config dict + certs_dir.
+def build_tls_context(tls_config, certs_dir):
+    """Build an SSLContext from a server TLS config dict + certs_dir.
 
     Expected config: {"bundle": "<name>", "require_client_cert": bool?}
 
     Raises CertManagerError on missing/invalid config or missing files.
     There is nothing serving yet, so this loads once - the rehearsal in
-    reload_ssl_context() is there to protect a context already in use.
+    reload_tls_context() is there to protect a context already in use.
     """
-    cert_path, key_path, ca_path, bundle = _bundle_for(ssl_config, certs_dir)
+    cert_path, key_path, ca_path, bundle = _bundle_for(tls_config, certs_dir)
     context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
     _load_bundle(context, bundle, cert_path, key_path, ca_path)
     return context
 
 
 class CertManager():
-    """Manage SSL certificate bundles on disk under {config_dir}/certs/."""
+    """Manage TLS certificate bundles on disk under {config_dir}/certs/."""
 
     def __init__(self, config_dir, log=None):
         self._log = log if log else _logging.getLogger(__name__)

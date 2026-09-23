@@ -133,7 +133,7 @@ go, and both are reported the same way — so a client that detached but
 stayed, and anything watching the monitor, sees the device come and go
 with the people using it.
 
-Clients on TCP, TELNET, SSL and Unix sockets are disconnected instead,
+Clients on TCP, TELNET, TLS and Unix sockets are disconnected instead,
 because those protocols have no channel to be told on. The monitor sees
 that as a peer disconnecting.
 
@@ -199,12 +199,12 @@ list, so an event can be logged and the list rendered from one frame:
 
 ```json
 {
-  "peer_connected": {"slot": 3, "id": "7d41e8b2", "protocol": "ssl",
+  "peer_connected": {"slot": 3, "id": "7d41e8b2", "protocol": "tls",
                      "address": "10.0.0.7", "port": 40112},
   "peers": [
     {"slot": 1, "id": "a1b2c3d4", "protocol": "tcp",
      "address": "192.168.1.50", "port": 51234},
-    {"slot": 3, "id": "7d41e8b2", "protocol": "ssl",
+    {"slot": 3, "id": "7d41e8b2", "protocol": "tls",
      "address": "10.0.0.7", "port": 40112}
   ]
 }

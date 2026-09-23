@@ -7,7 +7,7 @@ open on a port that is gone only feeds it silence.
 A WebSocket client is no longer in that position - it has a channel
 for `serial`, and `access`/`attach` gave it a reason to stay. So it
 keeps its socket, is told the device went away, and is told again
-when it comes back. TCP, TELNET, SSL and Unix sockets have no such
+when it comes back. TCP, TELNET, TLS and Unix sockets have no such
 channel and keep being dropped.
 """
 

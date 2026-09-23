@@ -169,7 +169,7 @@ def main():
     if not ports and not http_config:
         raise SystemExit("No ports or HTTP server configured")
 
-    # Cert bundles live next to config.json. Pass to SerialProxy so SSL
+    # Cert bundles live next to config.json. Pass to SerialProxy so TLS
     # servers can resolve bundle references.
     certs_dir = _os.path.join(_os.path.dirname(config_path) or '.', 'certs')
 

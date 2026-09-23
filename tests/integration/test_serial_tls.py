@@ -1,4 +1,4 @@
-"""Integration tests for an SSL serial server, driven from the loop.
+"""Integration tests for a TLS serial server, driven from the loop.
 
 One selectors loop serves every port, every client and the HTTP API, so
 anything that blocks in here stops all of it. TLS is where that is
@@ -28,14 +28,14 @@ def _client_context():
 class SslPortTestCase(SerialPtyTestCase):
     """A pty exposed over TLS as well as plain TCP."""
 
-    ssl_port = None
+    tls_port = None
 
     @classmethod
     def port_servers(cls):
         return [
             {'protocol': 'tcp', 'address': '127.0.0.1', 'port': cls.tcp_port},
-            {'protocol': 'ssl', 'address': '127.0.0.1', 'port': cls.ssl_port,
-                'ssl': {'bundle': 'web'}},
+            {'protocol': 'tls', 'address': '127.0.0.1', 'port': cls.tls_port,
+                'tls': {'bundle': 'web'}},
         ]
 
     @classmethod
@@ -47,12 +47,12 @@ class SslPortTestCase(SerialPtyTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.ssl_port = base.free_port()
+        cls.tls_port = base.free_port()
         super().setUpClass()
 
     def tls_connect(self, timeout=10):
         """Open a finished TLS connection to the serial port"""
-        raw = socket.create_connection(('127.0.0.1', self.ssl_port), timeout)
+        raw = socket.create_connection(('127.0.0.1', self.tls_port), timeout)
         self.addCleanup(raw.close)
         tls = _client_context().wrap_socket(raw, server_hostname='localhost')
         self.addCleanup(tls.close)
@@ -85,7 +85,7 @@ class TestTlsDataPath(SslPortTestCase):
     def test_a_large_record_arrives_whole(self):
         """One TLS record can hold far more than one recv() returns.
 
-        Decrypted bytes past the first read sit in the SSL object, not
+        Decrypted bytes past the first read sit in the TLS object, not
         in the socket, so select() never mentions them again - the rest
         of the write used to hang until the client happened to send
         something else.
@@ -106,13 +106,13 @@ class TestTlsDoesNotBlockTheLoop(SslPortTestCase):
     """
 
     def test_a_silent_client_does_not_freeze_the_api(self):
-        sock = socket.create_connection(('127.0.0.1', self.ssl_port), 5)
+        sock = socket.create_connection(('127.0.0.1', self.tls_port), 5)
         self.addCleanup(sock.close)
         time.sleep(0.3)
         self.assertTrue(self.api_responds())
 
     def test_a_silent_client_does_not_freeze_the_other_ports(self):
-        sock = socket.create_connection(('127.0.0.1', self.ssl_port), 5)
+        sock = socket.create_connection(('127.0.0.1', self.tls_port), 5)
         self.addCleanup(sock.close)
         time.sleep(0.3)
         plain = self.connect()
@@ -121,21 +121,21 @@ class TestTlsDoesNotBlockTheLoop(SslPortTestCase):
 
     def test_several_silent_clients_do_not_freeze_the_api(self):
         for _ in range(5):
-            sock = socket.create_connection(('127.0.0.1', self.ssl_port), 5)
+            sock = socket.create_connection(('127.0.0.1', self.tls_port), 5)
             self.addCleanup(sock.close)
         time.sleep(0.3)
         self.assertTrue(self.api_responds())
 
     def test_half_sent_handshake_does_not_freeze_the_api(self):
         """A few bytes of a ClientHello and then nothing"""
-        sock = socket.create_connection(('127.0.0.1', self.ssl_port), 5)
+        sock = socket.create_connection(('127.0.0.1', self.tls_port), 5)
         self.addCleanup(sock.close)
         sock.sendall(b'\x16\x03\x01\x00\x2a\x01')
         time.sleep(0.3)
         self.assertTrue(self.api_responds())
 
     def test_a_real_client_still_gets_through_alongside_them(self):
-        stalled = socket.create_connection(('127.0.0.1', self.ssl_port), 5)
+        stalled = socket.create_connection(('127.0.0.1', self.tls_port), 5)
         self.addCleanup(stalled.close)
         time.sleep(0.2)
         tls = self.tls_connect()
@@ -144,7 +144,7 @@ class TestTlsDoesNotBlockTheLoop(SslPortTestCase):
 
     def test_a_stalled_handshake_is_eventually_dropped(self):
         """Otherwise a silent connection holds a slot for good"""
-        sock = socket.create_connection(('127.0.0.1', self.ssl_port), 5)
+        sock = socket.create_connection(('127.0.0.1', self.tls_port), 5)
         self.addCleanup(sock.close)
         sock.settimeout(20)
         # send_timeout defaults to 5s; the server should hang up on its

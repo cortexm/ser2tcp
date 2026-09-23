@@ -132,7 +132,7 @@ class Connection():
         self.update_interest()
 
     def needs_handshake(self):
-        """True while this connection is not usable yet (see SSL)"""
+        """True while this connection is not usable yet (see TLS)"""
         return False
 
     def pending(self):

@@ -9,7 +9,7 @@ import unittest
 from tests import requires_posix_modes
 from ser2tcp.cert_manager import (
     CertManager, CertManagerError,
-    resolve_bundle_paths, build_ssl_context, reload_ssl_context,
+    resolve_bundle_paths, build_tls_context, reload_tls_context,
     inspect_certificate, cert_key_match, load_cert_and_key,
     generate_certificate, generate_private_key, parse_signer,
     parse_allowed_client_cns, client_cert_cn)
@@ -341,7 +341,7 @@ class TestResolveBundlePaths(unittest.TestCase):
 def _generate_test_cert(
         out_dir=None, common_name='test', days=1,
         is_ca=False, san_dns=None, san_ip=None):
-    """Generate a real self-signed cert + key for SSL load tests.
+    """Generate a real self-signed cert + key for TLS load tests.
     Uses cryptography lib (available as test dep)."""
     from cryptography import x509
     from cryptography.x509.oid import NameOID
@@ -383,7 +383,7 @@ def _generate_test_cert(
     return cert_pem, key_pem
 
 
-class TestBuildSslContext(unittest.TestCase):
+class TestBuildTlsContext(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.mgr = CertManager(self.tmp)
@@ -403,13 +403,13 @@ class TestBuildSslContext(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_build_context_ok(self):
-        ctx = build_ssl_context({'bundle': 'valid'}, self.certs_dir)
+        ctx = build_tls_context({'bundle': 'valid'}, self.certs_dir)
         import ssl
         self.assertIsInstance(ctx, ssl.SSLContext)
         self.assertNotEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
 
     def test_build_context_mtls(self):
-        ctx = build_ssl_context(
+        ctx = build_tls_context(
             {'bundle': 'valid', 'require_client_cert': True},
             self.certs_dir)
         import ssl
@@ -417,17 +417,17 @@ class TestBuildSslContext(unittest.TestCase):
 
     def test_missing_bundle_field(self):
         with self.assertRaises(CertManagerError):
-            build_ssl_context({}, self.certs_dir)
+            build_tls_context({}, self.certs_dir)
 
     def test_bundle_not_found(self):
         with self.assertRaises(CertManagerError):
-            build_ssl_context({'bundle': 'nope'}, self.certs_dir)
+            build_tls_context({'bundle': 'nope'}, self.certs_dir)
 
     def test_load_failure_wrapped(self):
         # Fake PEM files pass our marker validation but OpenSSL rejects them.
         # The error must surface as CertManagerError, not ssl.SSLError.
         with self.assertRaises(CertManagerError) as cm:
-            build_ssl_context({'bundle': 'badcert'}, self.certs_dir)
+            build_tls_context({'bundle': 'badcert'}, self.certs_dir)
         self.assertIn("Bundle 'badcert'", str(cm.exception))
 
 
@@ -798,7 +798,7 @@ class TestSaveFilesPairValidation(unittest.TestCase):
             os.path.join(self.tmp, 'certs', 'b1', 'cert.pem')))
 
 
-class TestReloadSslContext(unittest.TestCase):
+class TestReloadTlsContext(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.mgr = CertManager(self.tmp)
@@ -813,30 +813,30 @@ class TestReloadSslContext(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_reload_picks_up_new_files(self):
-        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        ctx = build_tls_context({'bundle': 'web'}, self.certs_dir)
         cert, key = generate_certificate(
             'after', key_type='ec_p256', days=30)
         self.mgr.save_files(
             'web', [('cert.pem', cert), ('key.pem', key)])
-        reload_ssl_context(ctx, {'bundle': 'web'}, self.certs_dir)
+        reload_tls_context(ctx, {'bundle': 'web'}, self.certs_dir)
         loaded = ctx.get_ca_certs()  # empty, but the call must not raise
         self.assertEqual(loaded, [])
 
     def test_reload_missing_bundle_raises(self):
-        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        ctx = build_tls_context({'bundle': 'web'}, self.certs_dir)
         with self.assertRaises(CertManagerError):
-            reload_ssl_context(ctx, {'bundle': 'gone'}, self.certs_dir)
+            reload_tls_context(ctx, {'bundle': 'gone'}, self.certs_dir)
 
     def test_reload_after_cert_deleted_raises(self):
-        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        ctx = build_tls_context({'bundle': 'web'}, self.certs_dir)
         self.mgr.delete_file('web', 'cert.pem')
         with self.assertRaises(CertManagerError):
-            reload_ssl_context(ctx, {'bundle': 'web'}, self.certs_dir)
+            reload_tls_context(ctx, {'bundle': 'web'}, self.certs_dir)
 
     def test_reload_mtls_requires_ca(self):
-        ctx = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        ctx = build_tls_context({'bundle': 'web'}, self.certs_dir)
         with self.assertRaises(CertManagerError):
-            reload_ssl_context(
+            reload_tls_context(
                 ctx, {'bundle': 'web', 'require_client_cert': True},
                 self.certs_dir)
 
@@ -896,7 +896,7 @@ class TestAFailedReloadLeavesTheServerServing(unittest.TestCase):
             'serving.local', key_type='ec_p256', days=30)
         self.mgr.save_files(
             'web', [('cert.pem', cert), ('key.pem', key)])
-        self.context = build_ssl_context({'bundle': 'web'}, self.certs_dir)
+        self.context = build_tls_context({'bundle': 'web'}, self.certs_dir)
 
     def tearDown(self):
         import shutil
@@ -910,7 +910,7 @@ class TestAFailedReloadLeavesTheServerServing(unittest.TestCase):
     def _reload(self, **config):
         config.setdefault('bundle', 'web')
         with self.assertRaises(CertManagerError) as caught:
-            reload_ssl_context(self.context, config, self.certs_dir)
+            reload_tls_context(self.context, config, self.certs_dir)
         return str(caught.exception)
 
     def _still_serving(self):
@@ -958,7 +958,7 @@ class TestAFailedReloadLeavesTheServerServing(unittest.TestCase):
             'renewed.local', key_type='ec_p256', days=30)
         self.mgr.save_files('web', [
             ('cert.pem', other_cert), ('key.pem', other_key)])
-        reload_ssl_context(self.context, {'bundle': 'web'}, self.certs_dir)
+        reload_tls_context(self.context, {'bundle': 'web'}, self.certs_dir)
         self.assertEqual(self._still_serving(), 'renewed.local')
 
 

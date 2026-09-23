@@ -1,4 +1,4 @@
-"""Connection SSL"""
+"""Connection TLS"""
 
 import selectors as _selectors
 import ssl as _ssl
@@ -8,12 +8,12 @@ import ser2tcp.cert_manager as _cert_manager
 import ser2tcp.connection_tcp as _connection_tcp
 
 
-class SslHandshakeError(Exception):
-    """SSL handshake failed"""
+class TlsHandshakeError(Exception):
+    """TLS handshake failed"""
 
 
-class ConnectionSsl(_connection_tcp.ConnectionTcp):
-    """SSL/TLS connection.
+class ConnectionTls(_connection_tcp.ConnectionTcp):
+    """TLS connection.
 
     The handshake runs in the event loop rather than inline. Done
     inline on a blocking socket it stopped everything: one loop serves
@@ -25,20 +25,20 @@ class ConnectionSsl(_connection_tcp.ConnectionTcp):
 
     def __init__(
             self, connection, ser, send_timeout=None, buffer_limit=None,
-            log=None, ssl_context=None, can_write=True,
+            log=None, tls_context=None, can_write=True,
             allowed_cns=None):
         sock, addr = connection
         self._socket = None
         # None: any client the CA signed. A tuple: only these names.
         self._allowed_cns = allowed_cns
         try:
-            ssl_sock = ssl_context.wrap_socket(
+            tls_sock = tls_context.wrap_socket(
                 sock, server_side=True, do_handshake_on_connect=False)
         except (_ssl.SSLError, OSError) as err:
             sock.close()
-            raise SslHandshakeError(f"SSL handshake failed: {err}") from err
+            raise TlsHandshakeError(f"TLS handshake failed: {err}") from err
         super().__init__(
-            (ssl_sock, addr), ser, send_timeout, buffer_limit, log,
+            (tls_sock, addr), ser, send_timeout, buffer_limit, log,
             can_write)
         self._handshake_done = False
         # What the TLS layer last asked to wait for, or None once the
@@ -63,7 +63,7 @@ class ConnectionSsl(_connection_tcp.ConnectionTcp):
         if self._handshake_done:
             return True
         if not self._socket:
-            raise SslHandshakeError('connection closed during handshake')
+            raise TlsHandshakeError('connection closed during handshake')
         try:
             self._socket.do_handshake()
         except _ssl.SSLWantReadError:
@@ -75,12 +75,12 @@ class ConnectionSsl(_connection_tcp.ConnectionTcp):
             self.update_interest()
             return False
         except (OSError, ValueError) as err:
-            raise SslHandshakeError(f"SSL handshake failed: {err}") from err
+            raise TlsHandshakeError(f"TLS handshake failed: {err}") from err
         self._check_client_cn()
         self._handshake_done = True
         self._handshake_want = None
         self.update_interest()
-        self._log.info("Client connected: %s SSL", self.address_str())
+        self._log.info("Client connected: %s TLS", self.address_str())
         return True
 
     def _check_client_cn(self):
@@ -100,10 +100,10 @@ class ConnectionSsl(_connection_tcp.ConnectionTcp):
             # require_client_cert is enforced by the context, so an
             # empty cert here means a renegotiated or resumed session
             # OpenSSL did not hand us one for - refuse either way.
-            raise SslHandshakeError(
+            raise TlsHandshakeError(
                 'client certificate has no Common Name')
         if name not in self._allowed_cns:
-            raise SslHandshakeError(
+            raise TlsHandshakeError(
                 f"client CN '{name}' is not allowed on this server")
 
     def wanted_events(self):
@@ -139,7 +139,7 @@ class ConnectionSsl(_connection_tcp.ConnectionTcp):
             return None
 
     def pending(self):
-        """Decrypted bytes still held by the SSL object.
+        """Decrypted bytes still held by the TLS object.
 
         One TLS record can carry far more than a single recv() returns,
         and what is left sits here rather than in the kernel buffer -

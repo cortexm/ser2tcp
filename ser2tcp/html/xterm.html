@@ -72,11 +72,15 @@ body { background: #1e1e1e; color: #ccc; font-family: sans-serif;
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
+<script src="/endpoint-token.js"></script>
+<script src="/ws-retry.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const pathParts = location.pathname.split('/xterm/');
 const endpoint = pathParts[1] || '';
-const token = localStorage.getItem('ser2tcp_token');
+// A shared link's token, this tab's copy of one, or the signed-in
+// user's session - in that order. See endpoint-token.js.
+const token = endpointToken(endpoint);
 
 $('endpoint-name').textContent = '/ws/' + endpoint;
 document.title = 'ser2tcp \u2014 ' + endpoint;
@@ -129,6 +133,11 @@ term.onData(data => {
 
 window.addEventListener('resize', () => fitAddon.fit());
 
+// Opening a terminal on a device that is not plugged in yet is a way
+// of watching it from its first byte, so the link has to look after
+// itself while nobody is looking at the page. See ws-retry.js.
+const retry = wsRetry(() => { if (wantConnected && !ws) connect(); });
+
 function connect() {
   if (ws) return;
   wantConnected = true;
@@ -141,6 +150,7 @@ function connect() {
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     wsEverOpened = true;
+    retry.succeeded();
     setStatus('online');
   };
   ws.onclose = () => {
@@ -153,6 +163,7 @@ function connect() {
     settable = [];
     renderSignals();
     setStatus(wsEverOpened ? 'offline' : 'error');
+    retry.schedule(wantConnected);
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return applyMessage(ev.data);
@@ -206,6 +217,7 @@ function notice(msg) {
 
 function disconnect() {
   wantConnected = false;
+  retry.cancel();
   if (ws) { ws.close(); ws = null; setStatus('offline'); }
 }
 
@@ -214,6 +226,8 @@ function disconnect() {
 // into view, or getting the network back, is the moment to find out
 // and to pick it up again.
 function reconnectIfWanted() {
+  // Whatever the clock was waiting for has happened.
+  retry.cancel();
   if (wantConnected && !ws && endpoint) connect();
 }
 document.addEventListener('visibilitychange', () => {
