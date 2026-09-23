@@ -787,10 +787,10 @@ then on:
 ```json
 {
   "ports": [
-    {"id": "9f3c1a20", "name": "my-device", "serial": {"port": "/dev/ttyUSB0"}, "servers": []}
+    {"id": "my-device", "name": "my-device", "serial": {"port": "/dev/ttyUSB0"}, "servers": []}
   ],
   "http": [
-    {"id": "4b7e0d55", "address": "0.0.0.0", "port": 8080}
+    {"id": "main", "name": "main", "address": "0.0.0.0", "port": 8080}
   ]
 }
 ```
@@ -799,6 +799,19 @@ An id survives edits, so a bookmarked URL or an open editor keeps
 pointing at the same port. A position would not: adding or removing an
 entry renumbers everything after it, and a port that fails to start
 would shift the rest.
+
+One that is not given is derived from the entry's name: lowercase,
+digits and hyphens, with every other character becoming a hyphen, runs
+of them collapsing to one and neither end keeping one. `My Port ##2`
+gives `my-port-2`. With no name, a port falls back to its device
+(`/dev/ttyUSB0` → `ttyusb0`); with neither, to `port` or `http`. An id
+already in use takes the first free `-1`, `-2` and so on — ports and
+HTTP servers share one namespace.
+
+Choosing your own is still the point of the field being there: an id
+may be any of `A-Z a-z 0-9 . _ -`, up to 64 characters. **Ids already
+written into a config are never rewritten**, so one that was handed out
+before this — or by hand — stays exactly as it is.
 
 Both are reported by the API — `id` in each entry of `/api/status` and
 of `/api/settings` — so a client never has to guess one.

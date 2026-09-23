@@ -155,11 +155,12 @@ class HttpServerWrapper():
         for config in configs:
             self._servers.append(self._http_server_or_placeholder(config))
 
-    def _fresh_id(self):
+    def _fresh_id(self, entry=None, fallback=_config_ids.FALLBACK_SLUG):
         """An id no entry in this configuration is using"""
-        return _config_ids.fresh_id(self._configuration)
+        return _config_ids.fresh_id(self._configuration, entry, fallback)
 
-    def _claim_id(self, data, current=None):
+    def _claim_id(self, data, current=None,
+            fallback=_config_ids.FALLBACK_SLUG):
         """Settle the id for an entry being written.
 
         Returns (id, error). A given one is honoured - a readable id is
@@ -167,10 +168,14 @@ class HttpServerWrapper():
         long as nothing else answers to it. Ports and HTTP servers share
         one namespace: the URL says which kind is meant, but an id that
         means two things is confusing whatever the URL says.
+
+        One that is not given is derived from the entry's own name, so
+        a caller that sends no id gets the same readable thing the
+        editor would have proposed rather than a number nobody chose.
         """
         wanted = data.get('id')
         if wanted is None or wanted == current:
-            return (current or self._fresh_id()), None
+            return (current or self._fresh_id(data, fallback)), None
         if wanted in _config_ids.taken_ids(self._configuration):
             return None, f"id '{wanted}' is already in use"
         return wanted, None
@@ -2022,7 +2027,8 @@ class HttpServerWrapper():
             self._error(client, error, 400)
             return
         http_list = self._http_list(create=True)
-        new_id, id_error = self._claim_id(data)
+        new_id, id_error = self._claim_id(
+            data, fallback=_config_ids.HTTP_FALLBACK_SLUG)
         if id_error:
             self._error(client, id_error, 400)
             return
@@ -2055,7 +2061,9 @@ class HttpServerWrapper():
             self._error(client, error, 400)
             return
         old = http_list[index]
-        new_id, id_error = self._claim_id(data, old.get('id'))
+        new_id, id_error = self._claim_id(
+            data, old.get('id'),
+            fallback=_config_ids.HTTP_FALLBACK_SLUG)
         if id_error:
             self._error(client, id_error, 400)
             return

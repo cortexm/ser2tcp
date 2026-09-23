@@ -495,6 +495,10 @@ body.stream-down .card-detected.card-detected-configured {
 .card-header-row > .tag,
 .card-header-row > .kebab-menu { flex: none; }
 .card-subtitle { font-size: 13px; color: var(--text-muted); }
+/* An id the form worked out rather than one somebody typed. Only
+   until it is saved: the file does not record which of the two it was,
+   so on the way back in it reads as chosen, because by then it was. */
+.modal-body input.is-derived { color: var(--text-faint); }
 .field-hint {
   font-size: 12px;
   color: var(--text-faint);

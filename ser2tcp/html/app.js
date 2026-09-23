@@ -740,18 +740,53 @@ const ACCESS_LABELS = {
 // of the entry - an IP filter, anything added later - is carried over.
 const FORM_OWNED_HTTP_KEYS = ['address', 'port', 'name', 'ssl'];
 
-// The same shape the server generates, so a pre-filled field is a real
-// id rather than a placeholder that turns into something else on save.
-function suggestId() {
+// An id is derived from the name: lowercase, digits and hyphens, with
+// everything else becoming a hyphen, runs of them collapsing to one and
+// neither end keeping one. So `My Port ##2` and `my/port--2` both give
+// `my-port-2` - what a person types to mean the same thing should mean
+// the same thing.
+//
+// The same rule lives in config_ids.py, because the server has to fill
+// one in for a caller that sends none and this has to *show* one before
+// the save that would create it. tests/test_config_ids_slug.py holds
+// the cases both are pinned to.
+const SLUG_MAX = 48;
+// The last thing left to say about an entry with no name and no device
+// is its kind. Calling an HTTP server `port` would be worse than
+// saying nothing.
+const FALLBACK_SLUG = 'port';
+const HTTP_FALLBACK_SLUG = 'http';
+
+function slugId(text) {
+  if (typeof text !== 'string') return '';
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, SLUG_MAX)
+    .replace(/^-+|-+$/g, '');
+}
+
+// `base`, or the first `base-N` nobody is answering to. Two names can
+// land on one slug, so the count is against the ids in use.
+function uniqueId(base, taken) {
+  base = base || FALLBACK_SLUG;
+  if (!taken.has(base)) return base;
+  let n = 1;
+  while (taken.has(base + '-' + n)) n++;
+  return base + '-' + n;
+}
+
+// What an entry's id should be derived from: its name, or failing that
+// the device it is configured for.
+function entrySlug(name, device, fallback) {
+  return slugId(name)
+    || slugId(String(device || '').split('/').pop())
+    || fallback || FALLBACK_SLUG;
+}
+
+function suggestId(name, device, ignore, fallback) {
   const taken = knownIds();
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const bytes = new Uint8Array(4);
-    crypto.getRandomValues(bytes);
-    const candidate = [...bytes]
-      .map(b => b.toString(16).padStart(2, '0')).join('');
-    if (!taken.has(candidate)) return candidate;
-  }
-  return '';
+  if (ignore) taken.delete(ignore);
+  return uniqueId(entrySlug(name, device, fallback), taken);
 }
 
 // Recompute usedPorts/usedEndpoints — used by editor for conflict checks.
@@ -1367,22 +1402,37 @@ function _buildPortForm(cfg, editId, bundles) {
   // ones. See .port-form in style.css.
   const root = el('div', { class: 'port-form' });
 
-  // Identifier. What the API and every link address this port by, so
-  // it is worth being able to choose something readable - and worth
-  // seeing what it is before following a link.
+  // The name is what a person calls the port; the id is what the API
+  // and every link address it by, and it is derived from the name
+  // rather than being four random bytes that point at the port without
+  // saying anything about it. Editable all the same: the derived one
+  // is a good default, not a rule.
+  const nameInput = el('input', { type: 'text', value: cfg.name || '' });
   const idInput = el('input', {
     type: 'text',
-    value: cfg.id || suggestId(),
+    value: cfg.id || '',
     placeholder: 'letters, digits, . - _',
   });
+  // Grey while it is only a suggestion, ordinary once somebody has
+  // typed in it - and only until it is saved, because the file does
+  // not record which of the two it was.
+  let idTouched = false;
+  function followName() {
+    if (idTouched) return;
+    idInput.value = suggestId(
+      nameInput.value, portInput.value, editId !== null ? cfg.id : null);
+    idInput.classList.add('is-derived');
+  }
+  idInput.oninput = () => {
+    idTouched = true;
+    idInput.classList.remove('is-derived');
+  };
   const idHint = el('div', { class: 'field-hint' },
     editId !== null
-      ? 'Changing this breaks existing links to this port.'
-      : 'Used in the API and in links. Change it to something you '
-        + 'will recognise.');
-
-  // Name
-  const nameInput = el('input', { type: 'text', value: cfg.name || '' });
+      ? 'Follows the name until you change it. '
+        + 'Changing it breaks existing links to this port.'
+      : 'Used in the API and in links. Follows the name until you '
+        + 'change it.');
 
   // Port input with autocomplete from detected USB devices.
   const portInput = el('input', {
@@ -1393,6 +1443,18 @@ function _buildPortForm(cfg, editId, bundles) {
       value: p.device,
       hint: p.description || '',
     })));
+
+  nameInput.addEventListener('input', followName);
+  // A new port picking up a device takes its name from it - /dev/ttyUSB0
+  // becomes ttyUSB0, and the id follows to ttyusb0. Only while the name
+  // is still empty: it is a starting point, not a correction.
+  portInput.addEventListener('input', () => {
+    if (editId === null && !nameInput.value.trim()) {
+      nameInput.value = portInput.value.trim().split('/').pop();
+    }
+    followName();
+  });
+  if (editId === null) followName();
 
   // Match section — one row per USB attribute (vid, pid, ...). Each input
   // has an autocomplete listing every distinct value for that attribute
@@ -1535,9 +1597,9 @@ function _buildPortForm(cfg, editId, bundles) {
 
   // ----- Compose form -----
   root.appendChild(el('div', { class: 'section-title' }, 'Identity'));
-  root.appendChild(formRow('ID', idInput));
+  // Name first: it is the one that is typed, and the id follows it.
+  root.appendChild(pairRow('Name', nameInput, 'ID', idInput).row);
   root.appendChild(idHint);
-  root.appendChild(formRow('Name', nameInput));
 
   root.appendChild(el('div', { class: 'section-title' }, 'Serial port'));
   root.appendChild(formRow('Device', portWrap));
@@ -1950,7 +2012,10 @@ function _collectPortConfig(form) {
     cfg.id = id;
   }
   const name = form.nameInput.value.trim();
-  if (name) cfg.name = name;
+  // Required now that the id is derived from it - and it is what the
+  // card, the monitor route and every log line call this port.
+  if (!name) throw new Error('A port needs a name');
+  cfg.name = name;
   const portMax = form.portMaxInput.value.trim();
   if (portMax !== '') cfg.max_connections = parseInt(portMax);
 
@@ -2608,13 +2673,29 @@ function _showHttpEditorWithBundles(id, bundles) {
                     : servers.find(x => x.id === id);
   if (!isNew && !srv) return navigate('/settings');
 
-  const idInput = el('input', {
-    type: 'text',
-    value: srv.id || suggestId(),
-    placeholder: 'letters, digits, . - _',
-  });
+  // Same as a port: the name is typed, the id follows it until
+  // somebody says otherwise. An HTTP server's name is optional, so
+  // when there is none the fallback carries the whole weight.
   const nameInput = el('input', { type: 'text', value: srv.name || '',
     placeholder: 'optional' });
+  const idInput = el('input', {
+    type: 'text',
+    value: srv.id || '',
+    placeholder: 'letters, digits, . - _',
+  });
+  let idTouched = false;
+  const followName = () => {
+    if (idTouched) return;
+    idInput.value = suggestId(
+      nameInput.value, null, isNew ? null : srv.id, HTTP_FALLBACK_SLUG);
+    idInput.classList.add('is-derived');
+  };
+  idInput.oninput = () => {
+    idTouched = true;
+    idInput.classList.remove('is-derived');
+  };
+  nameInput.addEventListener('input', followName);
+  if (isNew) followName();
   const addrInput = el('input', { type: 'text',
     value: srv.address || '0.0.0.0', placeholder: '0.0.0.0' });
   const portInput = el('input', { type: 'number',
@@ -2623,11 +2704,12 @@ function _showHttpEditorWithBundles(id, bundles) {
 
   const body = el('div',
     {},
-    formRow('ID', idInput),
+    pairRow('Name', nameInput, 'ID', idInput).row,
     el('div', { class: 'field-hint' },
-      isNew ? 'Used in the API and in links.'
-        : 'Changing this breaks existing links to this server.'),
-    formRow('Name', nameInput),
+      isNew ? 'Used in the API and in links. Follows the name until '
+        + 'you change it.'
+        : 'Follows the name until you change it. Changing it breaks '
+          + 'existing links to this server.'),
     pairRow('Address', addrInput, 'Port', portInput).row,
     el('div', { style: 'margin:8px 0' },
       el('label', { class: 'checkbox-label' },
