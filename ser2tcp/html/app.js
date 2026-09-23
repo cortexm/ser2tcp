@@ -1739,7 +1739,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   // so port-SSL and HTTPS editors stay consistent. We always want the
   // ssl block when protocol=SSL, so we hide the SSL-enable checkbox the
   // helper exposes and treat the bundle as required.
-  const ssl = _buildSslFields(srv.ssl, bundles || []);
+  const ssl = _buildSslFields(srv.ssl, bundles || [], { clientCn: true });
   ssl.sslCb.checked = true;
   ssl.sslCb.style.display = 'none';
   ssl.wrap.classList.remove('hidden');
@@ -1766,7 +1766,10 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   // configured 0 reads the same as no key at all.
   const [aclCb, aclLabel] = enableCb('ACL', !!(
     (srv.allow || []).length || (srv.deny || []).length
-    || srv.max_connections));
+    || srv.max_connections
+    // Named clients live in the ssl block but are shown here, and a
+    // section that opened closed would drop them on the next save.
+    || ((srv.ssl || {}).allow_client_cn || []).length));
   const dataRow = formRow('Enable',
     [readLabel, writeLabel, ctlLabel, aclLabel]);
 
@@ -1877,7 +1880,13 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     title: '0 = unlimited',
   });
   const maxConnRow = formRow('Max clients', maxConnInput);
-  const ipDiv = el('div', { class: 'subgroup' }, ipRows, maxConnRow);
+  // Who may connect, by name rather than by address - the same
+  // question the rows above ask, so it is asked in the same place.
+  // Built with the SSL fields because the value is written into the
+  // ssl block, and hidden by them when the server is not SSL or mTLS
+  // is off.
+  const ipDiv = el('div', { class: 'subgroup' },
+    ipRows, maxConnRow, ssl.cnRow);
 
   box.appendChild(formRow('Protocol', [protoSel, removeBtn]));
   box.appendChild(wsRows);
@@ -1899,6 +1908,10 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   function updateSections() {
     ctlDiv.classList.toggle('hidden', ctlCb.disabled || !ctlCb.checked);
     ipDiv.classList.toggle('hidden', !aclCb.checked);
+    // The CN row lives in the ACL section but is owned by the SSL
+    // fields, so it is re-checked whenever either side could have
+    // moved: the protocol switch runs through here too.
+    ssl.syncCn();
   }
   [ctlCb, aclCb].forEach(
     cb => cb.addEventListener('change', updateSections));
@@ -2056,7 +2069,9 @@ function _collectPortConfig(form) {
       }
     }
     if (proto === 'ssl') {
-      const sslVal = d.ssl.getValue();
+      // The allowed-CN list is part of the ACL section, so it is saved
+      // only while that section is on.
+      const sslVal = d.ssl.getValue(d.aclCb.checked);
       if (!sslVal) throw new Error('SSL server requires a bundle');
       srv.ssl = sslVal;
     }
@@ -2104,11 +2119,14 @@ function _collectPortConfig(form) {
       // A limit of none is not a limit; it goes in as no key, which
       // is what the server already reads an absent one as.
       const mc = parseInt(d.maxConnInput.value.trim());
-      if (!rules && !blocked && !(mc > 0)) {
+      // Naming the clients that may connect is a rule like the others,
+      // so a section holding only that is not an empty one.
+      const named = d.ssl.clientCns().length;
+      if (!rules && !blocked && !(mc > 0) && !named) {
         throw new Error(proto === 'socket'
           ? 'ACL needs a client limit, or it does nothing'
-          : 'ACL needs an address rule or a client limit, '
-            + 'or it does nothing');
+          : 'ACL needs an address rule, a client limit or an allowed '
+            + 'CN, or it does nothing');
       }
       if (rules) {
         srv.allow = rules.split(',').map(s => s.trim()).filter(Boolean);
@@ -2593,7 +2611,13 @@ function showSessionEditor() {
 // editors. Returns {wrap, sslCb, getValue} — `wrap` is the div to insert,
 // `sslCb` is the enable checkbox (caller decides where to put it),
 // `getValue()` returns the ssl block or null.
-function _buildSslFields(currentSsl, bundles) {
+// `clientCn` builds the allowed-CN field, which serial SSL servers take
+// and HTTP servers do not - the API refuses the key there, so offering
+// the field would be offering a value that cannot be saved. The row is
+// returned rather than placed: naming who may connect is access
+// control, so the port editor puts it in the ACL section, while the
+// value still belongs to the ssl block and is written from here.
+function _buildSslFields(currentSsl, bundles, opts = {}) {
   const sslCb = el('input', { type: 'checkbox', checked: !!currentSsl });
   const bundleSelect = el('select');
   const placeholderOpt = el('option', { value: '' }, '-- select bundle --');
@@ -2614,15 +2638,35 @@ function _buildSslFields(currentSsl, bundles) {
   }
   const mtlsCb = el('input', { type: 'checkbox',
     checked: !!(currentSsl && currentSsl.require_client_cert) });
+  const cnInput = el('input', {
+    type: 'text', autocomplete: 'off',
+    placeholder: 'operator, gateway-2 — empty: any client the CA signed',
+    value: ((currentSsl && currentSsl.allow_client_cn) || []).join(', '),
+  });
+  const cnRow = opts.clientCn
+    ? formRow('Allowed CNs', cnInput)
+    : null;
   const updateMtlsState = () => {
     const sel = bundleSelect.value;
     const b = bundles.find(x => x.name === sel);
     const hasCa = b && _certFilePresent(b, 'ca.pem');
     mtlsCb.disabled = !hasCa;
     if (!hasCa) mtlsCb.checked = false;
+    updateCnState();
+  };
+  // The list only means anything while a client certificate is
+  // demanded; without mTLS there is no name to check. It also has
+  // nothing to say on a server that is not SSL at all - and that is
+  // read off the SSL section's own visibility, since the row now sits
+  // somewhere else and cannot go with it.
+  const updateCnState = () => {
+    if (!cnRow) return;
+    const on = mtlsCb.checked && !sslDiv.classList.contains('hidden');
+    cnInput.disabled = !on;
+    cnRow.classList.toggle('hidden', !on);
   };
   bundleSelect.onchange = updateMtlsState;
-  updateMtlsState();
+  mtlsCb.onchange = updateCnState;
   // Beside the bundle it depends on, rather than on a row of its own:
   // whether mTLS can be switched on at all is a property of the bundle
   // selected right there, and the checkbox greys out with it.
@@ -2633,17 +2677,37 @@ function _buildSslFields(currentSsl, bundles) {
   const sslDiv = el('div', { class: 'subgroup' },
     formRow('Bundle', [bundleSelect, mtlsLabel]));
   if (!sslCb.checked) sslDiv.classList.add('hidden');
-  sslCb.onchange = () => sslDiv.classList.toggle('hidden', !sslCb.checked);
+  sslCb.onchange = () => {
+    sslDiv.classList.toggle('hidden', !sslCb.checked);
+    updateCnState();
+  };
+  // After sslDiv exists: updateCnState reads its visibility.
+  updateMtlsState();
 
-  function getValue() {
+  function clientCns() {
+    if (!cnRow || !mtlsCb.checked || !sslCb.checked) return [];
+    return cnInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  // `withClientCn` false leaves the names out - the port editor passes
+  // the ACL checkbox, so switching ACL off drops them the same way it
+  // drops the address rules, rather than saving a limit that is no
+  // longer on screen.
+  function getValue(withClientCn = true) {
     if (!sslCb.checked) return null;
     const bundle = bundleSelect.value;
     if (!bundle) throw new Error('Select a certificate bundle');
     const out = { bundle };
     if (mtlsCb.checked) out.require_client_cert = true;
+    const names = withClientCn ? clientCns() : [];
+    // Empty means the key is left out entirely: the backend refuses an
+    // empty list, because a list that lets nobody in is far more likely
+    // a mistake than an intention.
+    if (names.length) out.allow_client_cn = names;
     return out;
   }
-  return { wrap: sslDiv, sslCb, getValue };
+  return { wrap: sslDiv, sslCb, cnRow, clientCns, syncCn: updateCnState,
+    getValue };
 }
 
 function showHttpEditor(id) {

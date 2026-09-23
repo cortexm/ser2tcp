@@ -319,8 +319,43 @@ Certificate Manager (see [below](#managing-certificates-via-web-ui)):
 |-----------|-------------|----------|
 | `bundle` | Name of bundle in `{config_dir}/certs/<bundle>/` (must contain `cert.pem` + `key.pem`) | yes |
 | `require_client_cert` | Enable mTLS — requires `ca.pem` in the bundle | no (default false) |
+| `allow_client_cn` | List of client Common Names allowed on this server | no (default: any client the CA signed) |
 
 When `require_client_cert: true`, clients must provide a valid certificate signed by `ca.pem` from the bundle.
+
+##### Limiting mTLS to named clients
+
+A CA answers *"is this a valid client"*, never *"is this that client"* —
+every certificate it signs is accepted. Where one server is meant for
+one client, name it:
+
+```json
+{
+    "address": "0.0.0.0",
+    "port": 10003,
+    "protocol": "ssl",
+    "ssl": {
+        "bundle": "main",
+        "require_client_cert": true,
+        "allow_client_cn": ["operator"]
+    }
+}
+```
+
+- The certificate is verified against `ca.pem` first; the name is
+  checked after that, and a client failing it is dropped right after
+  the handshake, with the reason in the log
+- Matching is exact, case included — a CN is an arbitrary string, not a
+  hostname
+- Requires `require_client_cert: true`. Without it a client need not
+  present a certificate at all, so the list would enforce nothing;
+  ser2tcp refuses that configuration rather than appearing to honour it
+- Serial `ssl` servers only. HTTP servers do not take this key — their
+  access control is users, tokens and IP filters
+
+The alternative, when clients come and go, is a CA per group of clients:
+a port trusting only `ca-service.pem` accepts exactly the certificates
+that CA signed, and nothing else has to be edited when one is added.
 
 #### IP filtering
 
@@ -457,8 +492,16 @@ certificate bundles without shell access. A bundle is a directory under
 - **Reload** — apply a renewed certificate to running servers without a
   restart
 - **Generate certificates** — self-signed server, CA, server signed by CA, client cert
-  (downloads cert+key+ca for installation on the mTLS client; private key is
-  not stored on the server)
+  (downloads cert+key+ca for installation on the mTLS client, separately or
+  as one combined PEM; private key is not stored on the server)
+
+Server certificates are given a Subject Alternative Name: the ones typed
+into the form, or the CN itself when none are. A certificate with no SAN
+at all still satisfies `curl` and OpenSSL, which fall back to the CN, and
+is refused by every browser — an easy trap to walk into and an annoying
+one to diagnose. Fill in every name and address the server will be
+reached at: verifying `https://192.168.1.10` needs that address in
+**SAN IP**, a DNS name will not do.
 
 For each bundle, the UI displays the parsed certificate metadata: CN, issuer
 (or "self-signed"), Subject Alternative Names, expiry with color-coded warnings

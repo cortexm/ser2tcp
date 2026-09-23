@@ -2151,6 +2151,23 @@ class TestPortConfigTypeValidation(unittest.TestCase):
         self.assertEqual(client.respond_status, 400)
         return client.responded['error']
 
+    def _ssl_server(self, ssl):
+        return [{'protocol': 'ssl', 'address': '127.0.0.1', 'port': 10443,
+            'ssl': ssl}]
+
+    def test_allow_client_cn_must_be_a_list(self):
+        err = self._assert_rejected(self._ssl_server({
+            'bundle': 'main', 'require_client_cert': True,
+            'allow_client_cn': 'operator'}))
+        self.assertIn('list of names', err)
+
+    def test_allow_client_cn_needs_mtls(self):
+        # Without require_client_cert the list would enforce nothing,
+        # so it is refused here rather than on the next restart.
+        err = self._assert_rejected(self._ssl_server({
+            'bundle': 'main', 'allow_client_cn': ['operator']}))
+        self.assertIn('require_client_cert', err)
+
     def test_protocol_must_be_a_string(self):
         self._assert_rejected([{'protocol': 5}])
 
@@ -2262,6 +2279,15 @@ class TestHttpConfigTypeValidation(unittest.TestCase):
         client = self._post({'address': '0.0.0.0', 'port': 8080,
             'name': ['main']})
         self.assertEqual(client.respond_status, 400)
+
+    def test_allow_client_cn_is_not_an_http_server_key(self):
+        # Serial SSL servers take it; an HTTP server does not enforce
+        # it, and accepting the key would store a limit that is not one.
+        client = self._post({'address': '0.0.0.0', 'port': 8443, 'ssl': {
+            'bundle': 'main', 'require_client_cert': True,
+            'allow_client_cn': ['operator']}})
+        self.assertEqual(client.respond_status, 400)
+        self.assertIn('allow_client_cn', client.responded['error'])
 
 
 class TestAuthFieldTypeValidation(unittest.TestCase):

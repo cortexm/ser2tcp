@@ -11,10 +11,13 @@ import os
 import select
 import shutil
 import socket
+import ssl
 import tempfile
 import threading
 import time
 import unittest
+
+import ser2tcp.cert_manager as cert_manager
 
 from tests.integration import base
 
@@ -28,6 +31,11 @@ def read_device(fd, size, timeout=3.0):
         if ready:
             out += os.read(fd, 65536)
     return out
+
+
+def _write_file(path, content):
+    with open(path, 'w', encoding='utf-8') as file:
+        file.write(content)
 
 
 def read_client(sock, size, timeout=5.0):
@@ -788,3 +796,87 @@ class TestEditingKeepsEverySetting(base.IntegrationTestCase):
         on_disk = self.proc.read_config()['ports'][0]
         self.assertEqual(on_disk['serial']['parity'], 'EVEN')
         self.assertEqual(on_disk['servers'][0]['allow'], ['127.0.0.0/8'])
+
+
+class TestAllowedClientCn(SerialPtyTestCase):
+    """One CA, two clients, and only one of them belongs on this port.
+
+    A CA answers "is this a valid client", never "is this *that*
+    client" - so both certificates below verify, and the name is the
+    only thing telling them apart. Run against a pty because the
+    difference is visible only in what happens *after* the handshake:
+    an accepted client moves bytes, a refused one is dropped.
+    """
+
+    ssl_port = None
+
+    @classmethod
+    def port_servers(cls):
+        return [{
+            'protocol': 'ssl', 'address': '127.0.0.1', 'port': cls.ssl_port,
+            'ssl': {
+                'bundle': 'port',
+                'require_client_cert': True,
+                'allow_client_cn': ['operator'],
+            },
+        }]
+
+    @classmethod
+    def prepare(cls, proc):
+        gen = cert_manager.generate_certificate
+        ca_cert, ca_key = gen('Pty CA', key_type='ec_p256', days=30,
+            is_ca=True)
+        signer = cert_manager.parse_signer(ca_cert, ca_key)
+        cert, key = gen('localhost', key_type='ec_p256', days=30,
+            san_dns=['localhost'], san_ip=['127.0.0.1'], signer=signer)
+        cert_manager.CertManager(proc.dir).save_files('port', [
+            ('cert.pem', cert), ('key.pem', key), ('ca.pem', ca_cert)])
+        cls.ca_file = os.path.join(proc.dir, 'cn-ca.pem')
+        _write_file(cls.ca_file, ca_cert)
+        cls.client_files = {}
+        for name in ('operator', 'intruder'):
+            ccert, ckey = gen(name, key_type='ec_p256', days=30,
+                is_client=True, signer=signer)
+            cert_file = os.path.join(proc.dir, f'cn-{name}-cert.pem')
+            key_file = os.path.join(proc.dir, f'cn-{name}-key.pem')
+            _write_file(cert_file, ccert)
+            _write_file(key_file, ckey)
+            cls.client_files[name] = (cert_file, key_file)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ssl_port = base.free_port()
+        super().setUpClass()
+
+    def connect_as(self, name):
+        """Open a TLS connection presenting that client's certificate"""
+        cert_file, key_file = self.client_files[name]
+        context = ssl.create_default_context(cafile=self.ca_file)
+        context.load_cert_chain(cert_file, key_file)
+        raw = socket.create_connection(('127.0.0.1', self.ssl_port), 10)
+        return context.wrap_socket(raw, server_hostname='localhost')
+
+    def test_the_listed_client_reaches_the_device(self):
+        with self.connect_as('operator') as tls:
+            self.wait_for_connections(1, port=self.ssl_port)
+            tls.sendall(b'from-operator')
+            self.assertEqual(
+                read_device(self.master_fd, len(b'from-operator')),
+                b'from-operator')
+        self.wait_for_connections(0, port=self.ssl_port)
+
+    def test_an_unlisted_client_is_dropped_after_the_handshake(self):
+        # Its certificate is valid and signed by the CA the server
+        # trusts: TLS has no objection, and the name is the whole
+        # difference. Under TLS 1.3 the client finishes the handshake
+        # before hearing about it, so the refusal surfaces on the read.
+        with self.connect_as('intruder') as tls:
+            tls.sendall(b'from-intruder')
+            tls.settimeout(5)
+            try:
+                self.assertEqual(tls.recv(1), b'')
+            except (ssl.SSLError, OSError):
+                pass        # a reset instead of a clean close is fine
+        self.wait_for_connections(0, port=self.ssl_port)
+        # Nothing it sent may have reached the device.
+        self.assertEqual(read_device(self.master_fd, 1, timeout=0.5), b'')

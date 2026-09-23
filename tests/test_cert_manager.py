@@ -10,7 +10,8 @@ from ser2tcp.cert_manager import (
     CertManager, CertManagerError,
     resolve_bundle_paths, build_ssl_context, reload_ssl_context,
     inspect_certificate, cert_key_match, load_cert_and_key,
-    generate_certificate, generate_private_key, parse_signer)
+    generate_certificate, generate_private_key, parse_signer,
+    parse_allowed_client_cns, client_cert_cn)
 
 
 # Minimal valid PEM blocks for testing — content is not parsed
@@ -1314,3 +1315,99 @@ class TestFilesystemErrorsBecomeCertManagerError(unittest.TestCase):
         self.mgr.delete_file('fine', 'cert.pem')
         self.mgr.delete_bundle('fine')
         self.assertEqual(self.mgr.list_bundles(), [])
+
+
+class TestParseAllowedClientCns(unittest.TestCase):
+    """A CA says "a valid client"; this says "that client"."""
+
+    def test_absent_means_every_client_the_ca_signed(self):
+        self.assertIsNone(parse_allowed_client_cns({'bundle': 'main'}))
+
+    def test_names_are_returned_stripped(self):
+        self.assertEqual(
+            parse_allowed_client_cns({
+                'require_client_cert': True,
+                'allow_client_cn': [' client-1 ', 'client-2'],
+            }),
+            ('client-1', 'client-2'))
+
+    def test_a_bare_string_is_refused(self):
+        # Iterated character by character it would match nothing, which
+        # is the silent-misconfiguration shape the IP filter also guards.
+        with self.assertRaises(CertManagerError) as ctx:
+            parse_allowed_client_cns({
+                'require_client_cert': True, 'allow_client_cn': 'client-1'})
+        self.assertIn('list of names', str(ctx.exception))
+
+    def test_an_empty_list_is_refused(self):
+        with self.assertRaises(CertManagerError):
+            parse_allowed_client_cns({
+                'require_client_cert': True, 'allow_client_cn': []})
+
+    def test_non_string_entries_are_refused(self):
+        with self.assertRaises(CertManagerError):
+            parse_allowed_client_cns({
+                'require_client_cert': True, 'allow_client_cn': [7]})
+
+    def test_blank_entries_are_refused(self):
+        with self.assertRaises(CertManagerError):
+            parse_allowed_client_cns({
+                'require_client_cert': True, 'allow_client_cn': ['  ']})
+
+    def test_without_mtls_it_is_refused(self):
+        # Without require_client_cert a client need not send one at all,
+        # so a name list would enforce nothing while reading as a limit.
+        with self.assertRaises(CertManagerError) as ctx:
+            parse_allowed_client_cns({'allow_client_cn': ['client-1']})
+        self.assertIn('require_client_cert', str(ctx.exception))
+
+
+class TestClientCertCn(unittest.TestCase):
+    def test_reads_the_cn_out_of_a_peer_cert(self):
+        cert = {'subject': ((('countryName', 'SK'),),
+                            (('commonName', 'client-1'),))}
+        self.assertEqual(client_cert_cn(cert), 'client-1')
+
+    def test_no_cn_and_no_cert_are_both_none(self):
+        self.assertIsNone(client_cert_cn({'subject': ((('countryName', 'SK'),),)}))
+        self.assertIsNone(client_cert_cn(None))
+        self.assertIsNone(client_cert_cn({}))
+
+
+class TestSanFallsBackToCn(unittest.TestCase):
+    """A server cert with no SAN works in curl and fails in a browser."""
+
+    def test_hostname_cn_becomes_a_dns_san(self):
+        cert_pem, _ = generate_certificate(
+            cn='myserver.local', key_type='ec_p256', days=5)
+        self.assertEqual(
+            inspect_certificate(cert_pem)['san_dns'], ['myserver.local'])
+
+    def test_ip_cn_becomes_an_ip_san(self):
+        cert_pem, _ = generate_certificate(
+            cn='192.168.1.10', key_type='ec_p256', days=5)
+        info = inspect_certificate(cert_pem)
+        self.assertEqual(info['san_ip'], ['192.168.1.10'])
+        self.assertNotIn('san_dns', info)
+
+    def test_an_explicit_san_is_left_alone(self):
+        cert_pem, _ = generate_certificate(
+            cn='myserver.local', key_type='ec_p256', days=5,
+            san_dns=['other.local'])
+        self.assertEqual(
+            inspect_certificate(cert_pem)['san_dns'], ['other.local'])
+
+    def test_a_descriptive_cn_is_not_copied(self):
+        # "My Server" as a DNS entry is a name no client will ask for.
+        cert_pem, _ = generate_certificate(
+            cn='My Server', key_type='ec_p256', days=5)
+        info = inspect_certificate(cert_pem)
+        self.assertNotIn('san_dns', info)
+        self.assertNotIn('san_ip', info)
+
+    def test_ca_and_client_certs_get_no_san(self):
+        for kwargs in ({'is_ca': True}, {'is_client': True}):
+            cert_pem, _ = generate_certificate(
+                cn='name.local', key_type='ec_p256', days=5, **kwargs)
+            info = inspect_certificate(cert_pem)
+            self.assertNotIn('san_dns', info, kwargs)

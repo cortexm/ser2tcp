@@ -109,6 +109,8 @@ class Server():
         self._max_connections = self._config.get('max_connections', 0)
         self._ip_filter = _ip_filter.create_filter(self._config, log=self._log)
         self._ssl_context = None
+        # Only SSL sets this; None means every client the CA signed.
+        self._allowed_cns = None
         self._socket = None
         # Set while the listening socket is deliberately not watched
         # after running out of file descriptors (see _accept_failed).
@@ -148,6 +150,7 @@ class Server():
                 self._protocol)
             if self._protocol == 'SSL':
                 self._ssl_context = self._create_ssl_context()
+                self._allowed_cns = self._parse_allowed_cns()
             self._socket = _socket.socket(
                 _socket.AF_INET, _socket.SOCK_STREAM, _socket.IPPROTO_TCP)
             self._socket.setsockopt(
@@ -176,6 +179,19 @@ class Server():
         ssl_config = self._config.get('ssl', {})
         try:
             return _cert_manager.build_ssl_context(ssl_config, self._certs_dir)
+        except _cert_manager.CertManagerError as err:
+            raise ConfigError(str(err)) from err
+
+    def _parse_allowed_cns(self):
+        """Read allow_client_cn, turning a bad list into a ConfigError.
+
+        Refusing here is what keeps a typo from becoming a server that
+        admits everyone: the caller turns it into a FailedProxy, which
+        does not listen but does say why.
+        """
+        try:
+            return _cert_manager.parse_allowed_client_cns(
+                self._config.get('ssl', {}))
         except _cert_manager.CertManagerError as err:
             raise ConfigError(str(err)) from err
 
@@ -274,6 +290,7 @@ class Server():
         }
         if self._ssl_context:
             kwargs['ssl_context'] = self._ssl_context
+            kwargs['allowed_cns'] = self._allowed_cns
         connection_class = self.CONNECTIONS[self._protocol]
         kwargs['can_write'] = self._can_write
         if self._control:

@@ -35,6 +35,13 @@ PRIVATE_FILES = ('key.pem',)  # never readable via API
 # Bundle names: alnum, dot, underscore, dash. Reject `.`, `..`, leading dot.
 _NAME_RE = _re.compile(r'^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$')
 
+# A CN worth copying into SAN as a DNS name — a hostname, or a wildcard
+# one. Deliberately loose (a label may start with a digit; many local
+# names do), but it does keep out the descriptive CNs like "My Server".
+_HOSTNAME_RE = _re.compile(
+    r'^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?'
+    r'(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$')
+
 # What each file has to be. Every block in it is checked against this,
 # not just the first: a certificate concatenated with a private key is
 # what most tools hand you, and as cert.pem it would be written 0644 and
@@ -233,6 +240,77 @@ def resolve_bundle_paths(certs_dir, bundle_name, require_client_cert=False):
     return (cert_path, key_path, None)
 
 
+def parse_allowed_client_cns(ssl_config):
+    """Read `allow_client_cn` from an ssl config block.
+
+    Returns a tuple of names, or None when the key is absent (every
+    client the CA vouches for is allowed, which is what mTLS alone
+    means).
+
+    A CA answers "is this a valid client", never "is this *that*
+    client" - so a port that wants one particular peer needs this on
+    top of `require_client_cert`. The check is exact, case included: a
+    CN is an arbitrary string, not a hostname, and guessing at
+    equivalences here would be guessing about who gets in.
+
+    Raises CertManagerError on anything it cannot read, and on a list
+    without `require_client_cert` - where it would silently allow
+    everyone, including clients presenting no certificate at all. Same
+    reasoning as the IP filter (D5): a config must not enforce less
+    than it says.
+    """
+    if not isinstance(ssl_config, dict):
+        raise CertManagerError('ssl config must be an object')
+    if 'allow_client_cn' not in ssl_config:
+        return None
+    names = ssl_config['allow_client_cn']
+    if isinstance(names, str):
+        # One name where a list belongs would otherwise be iterated
+        # character by character and match nothing.
+        raise CertManagerError(
+            'allow_client_cn must be a list of names, got a string - '
+            f'write ["{names}"]')
+    if not isinstance(names, list):
+        raise CertManagerError(
+            'allow_client_cn must be a list of names, got '
+            f'{type(names).__name__}')
+    cleaned = []
+    for name in names:
+        if not isinstance(name, str):
+            raise CertManagerError(
+                'allow_client_cn entries must be strings, got '
+                f'{type(name).__name__}')
+        if not name.strip():
+            raise CertManagerError('allow_client_cn entries must not be empty')
+        cleaned.append(name.strip())
+    if not cleaned:
+        raise CertManagerError(
+            'allow_client_cn is empty - that would let nobody in. Remove '
+            'the key to accept every client the CA signed')
+    if not ssl_config.get('require_client_cert'):
+        raise CertManagerError(
+            'allow_client_cn requires require_client_cert: true - without '
+            'it a client need not present a certificate at all')
+    return tuple(cleaned)
+
+
+def client_cert_cn(peer_cert):
+    """Common Name from a getpeercert() dict, or None.
+
+    The dict form nests the subject as a tuple of one-element tuples,
+    one per RDN. Returns the *last* CN: a subject may carry several and
+    OpenSSL's own hostname check reads the last one.
+    """
+    if not peer_cert:
+        return None
+    found = None
+    for rdn in peer_cert.get('subject', ()):
+        for pair in rdn:
+            if len(pair) == 2 and pair[0] == 'commonName':
+                found = pair[1]
+    return found
+
+
 KEY_TYPES = ('rsa2048', 'rsa4096', 'ec_p256', 'ed25519')
 
 # Ed25519 uses its native signature scheme — no separate hash algorithm
@@ -408,6 +486,21 @@ def generate_certificate(
         except (ValueError, TypeError) as err:
             raise CertManagerError(
                 f"Invalid IP address in SAN: {ip}") from err
+    # Nothing given: fall back to the CN. A server cert with no SAN at
+    # all is a quiet trap - OpenSSL and curl still read the CN, so it
+    # works everywhere you are likely to test it, and browsers (which
+    # dropped that fallback years ago) refuse it. A CA has no name to
+    # be reached at, so it is left alone.
+    if not san_entries and not is_ca and not is_client:
+        try:
+            san_entries.append(_x509.IPAddress(_ipaddress.ip_address(cn)))
+        except ValueError:
+            # Only when the CN could be reached at. "My Server" as a
+            # DNS entry would be a name no client will ever ask for -
+            # tidier to leave the extension out than to fill it with
+            # something that cannot match.
+            if _HOSTNAME_RE.match(cn):
+                san_entries.append(_x509.DNSName(cn))
     if san_entries:
         builder = builder.add_extension(
             _x509.SubjectAlternativeName(san_entries), critical=False)

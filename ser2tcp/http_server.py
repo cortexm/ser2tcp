@@ -1357,7 +1357,8 @@ class HttpServerWrapper():
             if proto == 'SSL':
                 if 'ssl' not in srv:
                     return 'SSL protocol requires ssl config'
-                err = self._validate_ssl_config(srv['ssl'])
+                err = self._validate_ssl_config(
+                    srv['ssl'], allow_client_cn=True)
                 if err:
                     return err
             if 'control' in srv:
@@ -1966,16 +1967,32 @@ class HttpServerWrapper():
         return (self._validate_trusted_proxies(data)
                 or self._validate_ip_rules(data))
 
-    def _validate_ssl_config(self, ssl):
+    def _validate_ssl_config(self, ssl, allow_client_cn=False):
         """Validate {"bundle": "...", "require_client_cert": bool} block.
-        Checks that the referenced bundle exists and has required files."""
+        Checks that the referenced bundle exists and has required files.
+
+        `allow_client_cn` says whether this caller supports the key of
+        that name - serial SSL servers do, HTTP servers do not. Saying
+        so is the point: accepted and then ignored is a config that
+        means less than it reads, which is the failure this whole
+        family of validators exists to prevent.
+        """
         if not isinstance(ssl, dict):
             return 'ssl must be an object'
         bundle = ssl.get('bundle')
         if not bundle:
             return 'ssl requires bundle name'
         mtls = bool(ssl.get('require_client_cert'))
+        if 'allow_client_cn' in ssl and not allow_client_cn:
+            return ('allow_client_cn is only supported on serial SSL '
+                    'servers, not on HTTP servers')
         try:
+            if allow_client_cn:
+                # Same parser the server runs, so a rejected config and
+                # a refused API call can never disagree. Before the
+                # bundle lookup: the shape of what was sent is this
+                # caller's mistake, a missing file is the server's.
+                _cert_manager.parse_allowed_client_cns(ssl)
             _cert_manager.resolve_bundle_paths(
                 self._cert_manager.certs_dir, bundle,
                 require_client_cert=mtls)
