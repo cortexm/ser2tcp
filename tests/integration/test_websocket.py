@@ -15,7 +15,16 @@ import time
 import os
 import unittest
 
-import websocket
+try:
+    import websocket
+except ImportError as err:
+    # Skipped, not failed: one missing extra should not turn the whole
+    # run red and leave the reason buried in an import traceback. Same
+    # handling as node in test_slug_agreement.py. CI installs it, so a
+    # skip here means the environment, not the code.
+    raise unittest.SkipTest(
+        'websocket-client is not installed (pip install -e ".[test]")'
+    ) from err
 
 from tests.integration import base
 from tests.integration.test_serial import SerialPtyTestCase, read_device

@@ -25,6 +25,15 @@ dependencies = [
     "cryptography>=42.0",
 ]
 
+# What the tests need on top of what ser2tcp itself needs. The
+# WebSocket integration tests drive a real client against the running
+# process; ser2tcp is the server there, so it has no WebSocket client
+# of its own and this belongs here rather than in dependencies.
+[project.optional-dependencies]
+test = [
+    "websocket-client>=1.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/cortexm/ser2tcp"
 

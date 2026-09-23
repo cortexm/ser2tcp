@@ -23,7 +23,7 @@ jobs:
         run: pip install build
 
       - name: Install package
-        run: pip install .
+        run: pip install .[test]
 
       - name: Run unit tests
         run: python -m unittest discover -v tests/
