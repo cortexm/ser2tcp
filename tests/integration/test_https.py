@@ -432,6 +432,7 @@ class TestEditingAnHttpServer(base.IntegrationTestCase):
         self.assertNotIn('allow', after)
         self.assertNotIn('deny', after)
 
+    @base.requires_bind_conflict
     def test_3_a_rebuild_that_fails_does_not_get_written(self):
         """The file must not promise what the process could not do"""
         blocker = socket.socket()

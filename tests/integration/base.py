@@ -22,7 +22,10 @@ import unittest as _unittest
 import urllib.error as _urlerror
 import urllib.request as _urlrequest
 
-from tests import requires_pty as _requires_pty
+from tests import (
+    requires_pty as _requires_pty,
+    requires_bind_conflict as _requires_bind_conflict,
+)
 
 
 # Run ser2tcp out of the source tree rather than relying on a console
@@ -32,9 +35,10 @@ _LAUNCH = 'from ser2tcp.main import main; main()'
 STARTUP_TIMEOUT = 15.0
 
 # Re-exported so a test that already has `base` does not need a second
-# import for it; the definition is in tests/__init__.py, because the
-# unit tests need the same one.
+# import for them; the definitions are in tests/__init__.py, because
+# the unit tests need the same ones.
 requires_pty = _requires_pty
+requires_bind_conflict = _requires_bind_conflict
 
 
 def free_port():

@@ -10,6 +10,7 @@ A fourth, grey, belongs to the page alone: no WebSocket, so nothing
 about the port can be vouched for.
 """
 
+import tempfile
 import unittest
 from unittest.mock import Mock
 
@@ -100,10 +101,17 @@ class TestWorkingItOut(unittest.TestCase):
 
     def test_a_device_that_exists_but_is_shut_is_offline(self):
         """Present is not the same as open, and the difference is the
-        one the two colours are for."""
-        self.proxy._serial_config = {'port': '/dev/null'}
-        self.wrapper.refresh_port_states()
-        self.assertEqual(self.proxy.state, 'offline')
+        one the two colours are for.
+
+        Any path that exists will do, and a temporary file is one on
+        every platform - which is the rule being tested: a configured
+        path that is there is taken as present, whoever put it there.
+        It used to be /dev/null, which is only a file on Unix.
+        """
+        with tempfile.NamedTemporaryFile(suffix='-device') as device:
+            self.proxy._serial_config = {'port': device.name}
+            self.wrapper.refresh_port_states()
+            self.assertEqual(self.proxy.state, 'offline')
 
     def test_the_clients_are_told_without_anyone_asking_for_status(self):
         server = Mock()

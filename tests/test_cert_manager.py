@@ -6,6 +6,7 @@ import stat
 import tempfile
 import unittest
 
+from tests import requires_posix_modes
 from ser2tcp.cert_manager import (
     CertManager, CertManagerError,
     resolve_bundle_paths, build_ssl_context, reload_ssl_context,
@@ -112,6 +113,7 @@ class TestPemValidation(unittest.TestCase):
             self.mgr.save_file('b', '../etc/passwd', CERT_PEM)
 
 
+@requires_posix_modes
 class TestFilePermissions(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -299,8 +301,11 @@ class TestResolveBundlePaths(unittest.TestCase):
 
     def test_basic_resolve(self):
         cert, key, ca = resolve_bundle_paths(self.certs_dir, 'main')
-        self.assertTrue(cert.endswith('main/cert.pem'))
-        self.assertTrue(key.endswith('main/key.pem'))
+        # os.path.join, not a literal '/': the separator is the
+        # platform's, and hardcoding one asserts about Unix rather
+        # than about resolve_bundle_paths.
+        self.assertTrue(cert.endswith(os.path.join('main', 'cert.pem')))
+        self.assertTrue(key.endswith(os.path.join('main', 'key.pem')))
         self.assertIsNone(ca)
 
     def test_mtls_requires_ca(self):
@@ -313,7 +318,7 @@ class TestResolveBundlePaths(unittest.TestCase):
         cert, key, ca = resolve_bundle_paths(
             self.certs_dir, 'mtls', require_client_cert=True)
         self.assertIsNotNone(ca)
-        self.assertTrue(ca.endswith('mtls/ca.pem'))
+        self.assertTrue(ca.endswith(os.path.join('mtls', 'ca.pem')))
 
     def test_missing_bundle(self):
         with self.assertRaises(CertManagerError):
@@ -1297,6 +1302,7 @@ class TestFilesystemErrorsBecomeCertManagerError(unittest.TestCase):
         with self.assertRaises(CertManagerError):
             self.mgr.read_public_file('binary', 'cert.pem')
 
+    @requires_posix_modes
     def test_writing_into_a_directory_that_cannot_be_written(self):
         self.mgr.create_bundle('locked')
         path = os.path.join(self.certs, 'locked')

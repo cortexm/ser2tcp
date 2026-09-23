@@ -9,6 +9,7 @@ from unittest.mock import patch, MagicMock
 
 import serial
 
+from tests import requires_bind_conflict
 from ser2tcp.serial_proxy import SerialProxy, _format_signals
 
 
@@ -1191,6 +1192,7 @@ class TestHalfBuiltProxyLeavesNothingBehind(unittest.TestCase):
         finally:
             proxy.close()
 
+    @requires_bind_conflict
     def test_the_first_server_is_closed_when_a_later_one_fails(self):
         first, blocked = self._free_port(), self._free_port()
         keep = socket.socket()
@@ -1215,6 +1217,7 @@ class TestHalfBuiltProxyLeavesNothingBehind(unittest.TestCase):
         finally:
             keep.close()
 
+    @requires_bind_conflict
     def test_the_selector_is_left_clean(self):
         first, blocked = self._free_port(), self._free_port()
         keep = socket.socket()
