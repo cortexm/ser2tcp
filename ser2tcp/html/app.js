@@ -1896,13 +1896,45 @@ function _getDetectedAttr(device, attr) {
 
 function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const box = el('div', { class: 'server-box' });
+  // Names the server it is about to take away, because one click used
+  // to be the whole thing: a box carrying an address, a control set and
+  // an ACL went, with nothing to say which one it had been. Cancel
+  // still restores it - the row is only gone from the form until the
+  // save - but that is not obvious with the dialog missing.
+  function describeServer() {
+    const proto = protoSel.value;
+    if (proto === 'WEBSOCKET') {
+      return 'the WEBSOCKET endpoint "'
+        + (wsEndpointInput.value.trim() || '(unnamed)') + '"';
+    }
+    if (proto === 'SOCKET') {
+      return 'the Unix socket '
+        + (addrInput.value.trim() || '(no path)');
+    }
+    return 'the ' + proto + ' server on '
+      + (addrInput.value.trim() || '0.0.0.0')
+      + ':' + (portInput.value.trim() || '?');
+  }
   const removeBtn = el('button', {
     type: 'button', class: 'server-remove',
     title: 'Remove server',
-    onclick: () => onRemove(),
+    onclick: () => {
+      if (!confirm('Remove ' + describeServer() + ' from this port?')) {
+        return;
+      }
+      onRemove();
+    },
   });
-  removeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'
-    + '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14"/></svg>';
+  // An open bin: a lid line, a body that is open at the top, and two
+  // ribs. The one before it closed the body across the top as well, so
+  // the lid ran through a sealed box and it read as a crate.
+  removeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none"'
+    + ' stroke="currentColor" stroke-width="2"'
+    + ' stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M3 6h18"/>'
+    + '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6'
+    + 'm3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'
+    + '<path d="M10 11v6M14 11v6"/></svg>';
   // Goes in the protocol row further down rather than floating in the
   // corner, where it sat on top of the select's own arrow.
 
