@@ -881,17 +881,20 @@ class HttpServerWrapper():
 
     @staticmethod
     def _find_port_by_filter(ports, port_name=None, endpoint=None):
-        """Find a single port matching a name or WS endpoint. Returns
-        (payload, index) or (None, None)."""
-        for i, p in enumerate(ports):
+        """Find a single port matching a name or WS endpoint, or None.
+
+        It used to return the port's position as well, which every
+        caller threw away - a position is not something to hand out.
+        """
+        for p in ports:
             if port_name and p.get('name') == port_name:
-                return p, i
+                return p
             if endpoint:
                 for s in p.get('servers', []):
                     if s.get('protocol') == 'WEBSOCKET' \
                             and s.get('endpoint') == endpoint:
-                        return p, i
-        return None, None
+                        return p
+        return None
 
     def _handle_api_status(self, client, user):
         """Runtime status with optional NDJSON streaming and filtering.
@@ -912,7 +915,9 @@ class HttpServerWrapper():
         Streaming wire format (`stream=1`):
           all-ports mode:
             {ports: [...], detected: [...], admin: bool}   full snapshot
-            {port_index: i, _delta: true, ...changed}      per-port delta
+            {id: <port id>, _delta: true, ...changed}      per-port delta
+              (only while the ports and their order are unchanged;
+              anything else is a full snapshot)
             {detected: [...]}                              USB plug/unplug
             {}                                             heartbeat
           filtered mode (`port=` or `endpoint=`):
@@ -931,7 +936,7 @@ class HttpServerWrapper():
         ports = self._build_ports_payload(detected=detected)
 
         if port_name or endpoint:
-            match, _idx = self._find_port_by_filter(
+            match = self._find_port_by_filter(
                 ports, port_name=port_name, endpoint=endpoint)
             if not is_stream:
                 if not match:
@@ -1056,26 +1061,44 @@ class HttpServerWrapper():
                 entry['last_ports'] = None
         return True
 
+    @staticmethod
+    def _same_port_ids(last_ports, current_ports):
+        """Whether a delta can be addressed at all.
+
+        Only when the client holds the same ports, in the same order, and
+        every one of them has an id to be named by. An id missing or
+        repeated means a delta could not say which port it was about.
+        """
+        if last_ports is None:
+            return False
+        last_ids = [p.get('id') for p in last_ports]
+        current_ids = [p.get('id') for p in current_ports]
+        return (last_ids == current_ids
+                and all(current_ids)
+                and len(set(current_ids)) == len(current_ids))
+
     def _broadcast_all(self, entry, client, now,
             current_ports, current_detected):
         last_ports = entry['last_ports']
         last_detected = entry['last_detected']
         ok = True
         sent_anything = False
-        if last_ports is None or len(last_ports) != len(current_ports):
-            # Port added/removed — replay full snapshot. Cheaper than
-            # diffing across mismatched indices.
+        if not self._same_port_ids(last_ports, current_ports):
+            # A port added, removed, moved or renamed - a delta cannot
+            # say that, so the whole list goes out again.
             ok = client.send_ndjson({
                 'ports': current_ports,
                 'detected': current_detected,
                 'admin': entry['admin']})
             sent_anything = True
         else:
-            for idx, (last, cur) in enumerate(
-                    zip(last_ports, current_ports)):
+            for last, cur in zip(last_ports, current_ports):
                 if last == cur:
                     continue
-                delta = {'port_index': idx, '_delta': True}
+                # Named by id: a position means something only until
+                # the list changes, and the list changing is exactly
+                # when a client most needs to know which port it is.
+                delta = {'id': cur['id'], '_delta': True}
                 keys = set(last) | set(cur)
                 for k in keys:
                     if last.get(k) != cur.get(k):
@@ -1099,7 +1122,7 @@ class HttpServerWrapper():
         return True
 
     def _broadcast_filter(self, entry, client, now, current_ports):
-        match, _idx = self._find_port_by_filter(
+        match = self._find_port_by_filter(
             current_ports,
             port_name=entry.get('port_name'),
             endpoint=entry.get('endpoint'))
@@ -1200,6 +1223,9 @@ class HttpServerWrapper():
                 bit = _control.SIGNAL_BITS[name]
                 signals[name] = bool(bitmask & (1 << bit))
             result.append({
+                # The name is optional, so without the id an unnamed
+                # port could only be told apart by where it sat.
+                'id': proxy.id,
                 'name': proxy.name,
                 'connected': proxy.is_connected,
                 'signals': signals,
@@ -1506,10 +1532,16 @@ class HttpServerWrapper():
             return
         if self._server_manager:
             self._server_manager.add_server(new_proxy)
+        old_id = ports[index].get('id')
         self._serial_proxies[index] = new_proxy
         ports[index] = data
         self._save_config()
-        self._log.info("Port updated: %d", index)
+        # By id, not position: a position names a different port as
+        # soon as the list moves. A rename moves the id, so say both.
+        if old_id != data['id']:
+            self._log.info("Port updated: %s (was %s)", data['id'], old_id)
+        else:
+            self._log.info("Port updated: %s", data['id'])
         client.respond({'ok': True})
 
     def _handle_api_ports_delete(self, client, user, index):
@@ -1525,10 +1557,11 @@ class HttpServerWrapper():
         old_proxy.close()
         if self._server_manager:
             self._server_manager.remove_server(old_proxy)
+        port_id = ports[index].get('id')
         del self._serial_proxies[index]
         del ports[index]
         self._save_config()
-        self._log.info("Port deleted: %d", index)
+        self._log.info("Port deleted: %s", port_id)
         client.respond({'ok': True})
 
     def _handle_api_set_signals(self, client, user, index):
@@ -2059,7 +2092,7 @@ class HttpServerWrapper():
         http_list.append(srv)
         self._servers.append(srv_tuple)
         self._save_config()
-        self._log.info("HTTP server added")
+        self._log.info("HTTP server added: %s", srv.get('id'))
         client.respond({'ok': True, 'id': srv.get('id')})
 
     def _handle_api_http_update(self, client, user, index):
@@ -2107,7 +2140,7 @@ class HttpServerWrapper():
                 return
         http_list[index] = srv
         self._save_config()
-        self._log.info("HTTP server updated")
+        self._log.info("HTTP server updated: %s", srv.get('id'))
         client.respond({'ok': True})
 
     def _handle_api_http_delete(self, client, user, index):
@@ -2122,11 +2155,12 @@ class HttpServerWrapper():
             self._error(client, 'Cannot delete last HTTP server', 400)
             return
         # Close server before removing from config
+        server_id = http_list[index].get('id')
         self._servers[index][0].close()
         del self._servers[index]
         del http_list[index]
         self._save_config()
-        self._log.info("HTTP server deleted")
+        self._log.info("HTTP server deleted: %s", server_id)
         client.respond({'ok': True})
 
     # ------------------------------------------------------------------
@@ -2140,17 +2174,19 @@ class HttpServerWrapper():
         currently in use. `mtls` says whether that server verifies
         client certificates, i.e. whether ca.pem matters to it."""
         usage = []
-        # Port TLS servers
-        for p_idx, port in enumerate(self._get_ports_config()):
-            for s_idx, srv in enumerate(port.get('servers', [])):
+        # Named by id, as everything else the API hands out is. These
+        # used to carry positions, and a server within a port still has
+        # no id of its own - but its protocol, address and port already
+        # say which one it is.
+        for port in self._get_ports_config():
+            for srv in port.get('servers', []):
                 tls_cfg = srv.get('tls')
                 if not tls_cfg or tls_cfg.get('bundle') != bundle_name:
                     continue
                 usage.append({
                     'type': 'port',
-                    'port_index': p_idx,
+                    'port_id': port.get('id'),
                     'port_name': port.get('name'),
-                    'server_index': s_idx,
                     'address': srv.get('address'),
                     'server_port': srv.get('port'),
                     'mtls': bool(tls_cfg.get('require_client_cert')),
@@ -2159,13 +2195,13 @@ class HttpServerWrapper():
         http_list = self._configuration.get('http', [])
         if isinstance(http_list, dict):
             http_list = [http_list]
-        for h_idx, srv in enumerate(http_list):
+        for srv in http_list:
             tls_cfg = srv.get('tls')
             if not tls_cfg or tls_cfg.get('bundle') != bundle_name:
                 continue
             usage.append({
                 'type': 'http',
-                'index': h_idx,
+                'http_id': srv.get('id'),
                 'name': srv.get('name'),
                 'address': srv.get('address'),
                 'server_port': srv.get('port'),

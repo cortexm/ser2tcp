@@ -65,8 +65,8 @@ The first frame, on an endpoint:
 
 ```json
 {
-  "port": {"name": "esp32", "device": "/dev/ttyUSB0", "baudrate": 115200,
-           "state": "online"},
+  "port": {"id": "esp32", "name": "esp32", "device": "/dev/ttyUSB0",
+           "baudrate": 115200, "state": "online"},
   "can": {"read": true, "write": true, "signals": ["rts"], "attach": true},
   "serial": {"connected": true},
   "signals": {"rts": true, "cts": false, "dsr": true},
@@ -79,6 +79,9 @@ The first frame, on an endpoint:
 What is on the other end, and how it is doing. **Always complete** —
 it is re-sent whole whenever any of it changes, so replace what you
 hold rather than merging into it.
+
+`id` is what the HTTP API addresses the port by (`/api/ports/<id>`).
+`name` is optional and only for showing.
 
 `state` is what to colour the port by:
 

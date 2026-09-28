@@ -60,7 +60,7 @@ class TestPassingItOn(unittest.TestCase):
         self.proxy.set_state('online')
         info = self.server.on_port_changed.call_args[0][0]
         self.assertEqual(
-            sorted(info), ['baudrate', 'device', 'name', 'state'])
+            sorted(info), ['baudrate', 'device', 'id', 'name', 'state'])
 
 
 class TestAPortThatNeverStarted(unittest.TestCase):

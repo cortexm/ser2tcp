@@ -888,6 +888,34 @@ class TestApiPortsCrud(unittest.TestCase):
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 404)
 
+    def _logged(self, wrapper):
+        return [call.args[0] % call.args[1:]
+                for call in wrapper._log.info.call_args_list]
+
+    def test_an_update_is_logged_by_id(self):
+        """A position says nothing once the list has moved"""
+        wrapper, _ = self._make_wrapper_with_ports(
+            [self._port_config(), self._port_config(port='/dev/ttyUSB1')])
+        token = self._admin_token(wrapper)
+        with patch.object(wrapper, '_create_proxy') as mock_create:
+            mock_create.return_value = Mock()
+            client = self._auth_client(
+                token, method='PUT', path='/api/ports/port1',
+                data=self._port_config(port='/dev/ttyUSB1', baudrate=9600))
+            wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 200)
+        self.assertIn('Port updated: port1', self._logged(wrapper))
+
+    def test_a_delete_is_logged_by_id(self):
+        wrapper, _ = self._make_wrapper_with_ports(
+            [self._port_config(), self._port_config(port='/dev/ttyUSB1')])
+        token = self._admin_token(wrapper)
+        client = self._auth_client(
+            token, method='DELETE', path='/api/ports/port1')
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 200)
+        self.assertIn('Port deleted: port1', self._logged(wrapper))
+
     def test_add_port_non_admin(self):
         wrapper, _ = self._make_wrapper_with_ports()
         wrapper._auth.add_user('viewer', 'pass')
@@ -1584,28 +1612,26 @@ class TestFindPortByFilter(unittest.TestCase):
         ]
 
     def test_match_by_name(self):
-        port, idx = HttpServerWrapper._find_port_by_filter(
+        port = HttpServerWrapper._find_port_by_filter(
             self.ports, port_name='esp')
-        self.assertEqual(idx, 1)
-        self.assertEqual(port['name'], 'esp')
+        self.assertIs(port, self.ports[1])
 
     def test_match_by_endpoint(self):
-        port, idx = HttpServerWrapper._find_port_by_filter(
+        port = HttpServerWrapper._find_port_by_filter(
             self.ports, endpoint='esp32c6')
-        self.assertEqual(idx, 1)
+        self.assertIs(port, self.ports[1])
 
     def test_no_match(self):
-        port, idx = HttpServerWrapper._find_port_by_filter(
+        port = HttpServerWrapper._find_port_by_filter(
             self.ports, port_name='nope')
         self.assertIsNone(port)
-        self.assertIsNone(idx)
 
     def test_endpoint_only_matches_websocket(self):
         # TCP server with the same name as an endpoint shouldn't match
         ports = [{'name': 'a', 'servers': [
             {'protocol': 'TCP', 'port': 1234},
             {'protocol': 'WEBSOCKET', 'endpoint': 'b'}]}]
-        port, _ = HttpServerWrapper._find_port_by_filter(
+        port = HttpServerWrapper._find_port_by_filter(
             ports, endpoint='1234')
         self.assertIsNone(port)
 
@@ -1707,6 +1733,7 @@ class TestBroadcastDeltas(unittest.TestCase):
             endpoint=None):
         proxy = _proxy(name='rpi', port='/dev/ttyUSB0',
             servers=[_server(protocol='WEBSOCKET', endpoint='rpi-ep')])
+        proxy.id = 'rpi'
         wrapper = make_wrapper(serial_proxies=[proxy])
         wrapper._detect_cache = [{'device': '/dev/ttyUSB0'}]
         wrapper._detect_cache_at = float("inf")
@@ -1734,7 +1761,7 @@ class TestBroadcastDeltas(unittest.TestCase):
         # signals appeared, serial.connected=True).
         self.assertEqual(len(client.ndjson_lines), 1)
         delta = client.ndjson_lines[0]
-        self.assertEqual(delta['port_index'], 0)
+        self.assertEqual(delta['id'], 'rpi')
         self.assertTrue(delta['_delta'])
 
     def test_port_count_change_sends_full_snapshot(self):
@@ -1769,8 +1796,7 @@ class TestBroadcastDeltas(unittest.TestCase):
         self.assertEqual(len(client.ndjson_lines), 1)
         delta = client.ndjson_lines[0]
         self.assertTrue(delta['_delta'])
-        # Filter mode delta has no port_index — single-port view.
-        self.assertNotIn('port_index', delta)
+        # A single-port view: the delta is about the one port there is.
         self.assertNotIn('ports', delta)
 
     def test_filter_mode_port_disappears_emits_removed(self):

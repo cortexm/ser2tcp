@@ -26,6 +26,9 @@ def port_info(proxy):
     """
     config = proxy.serial_config or {}
     return {
+        # What the API names this port by. The name is optional and a
+        # client cannot address anything with it.
+        'id': proxy.id,
         'name': proxy.name,
         # Resolved at connect time when the port is found by USB
         # match, so it can still be unknown here.

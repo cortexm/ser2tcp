@@ -156,7 +156,8 @@ class TestDescribingThePort(unittest.TestCase):
         """The topic is re-sent whole when any of it changes, so a
         client replaces what it holds instead of merging into it."""
         self.assertEqual(
-            sorted(self._info()), ['baudrate', 'device', 'name', 'state'])
+            sorted(self._info()),
+            ['baudrate', 'device', 'id', 'name', 'state'])
 
 
 class TestReportingTheState(WsTestCase):

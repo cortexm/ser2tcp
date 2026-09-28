@@ -848,10 +848,11 @@ function _rebuildUsedSets() {
   usedPorts = [];
   usedEndpoints = [];
   if (!portsStatus) return;
-  portsStatus.ports.forEach((p, i) => {
+  portsStatus.ports.forEach(p => {
     // Carry the id to tell the port being edited apart from the rest,
-    // and the label to say which port the clash is with.
-    const owner = { id: p.id, label: p.name || ('Port ' + (i + 1)) };
+    // and the label to say which port the clash is with - the same one
+    // its card is titled by.
+    const owner = { id: p.id, label: portTitle(p) };
     (p.servers || []).forEach(s => {
       if (s.port) {
         usedPorts.push({
@@ -1003,13 +1004,14 @@ function _applyStatusLine(line) {
     _refreshDetectedView();
     return;
   }
-  // Per-port delta
-  if (line.port_index !== undefined && portsStatus) {
-    const idx = line.port_index;
-    const port = portsStatus.ports[idx];
+  // Per-port delta, named by id. The server sends one only while the
+  // list holds the same ports in the same order; a port added, removed,
+  // moved or renamed comes as a whole snapshot instead.
+  if (line._delta && line.id !== undefined && portsStatus) {
+    const port = portsStatus.ports.find(p => p.id === line.id);
     if (!port) return;
     for (const [k, v] of Object.entries(line)) {
-      if (k === 'port_index' || k === '_delta') continue;
+      if (k === 'id' || k === '_delta') continue;
       if (v === null) delete port[k];
       else port[k] = v;
     }
@@ -1039,7 +1041,7 @@ function renderPortsList() {
   }
   _resolveEndpointTokens(portsStatus.ports);
   const grid = el('div', { class: 'card-grid' });
-  portsStatus.ports.forEach((p, i) => grid.appendChild(renderPortCard(p, i)));
+  portsStatus.ports.forEach(p => grid.appendChild(renderPortCard(p)));
   root.appendChild(grid);
 }
 
@@ -1110,7 +1112,16 @@ function _matchesPort(detected, match) {
   });
 }
 
-function renderPortCard(port, index) {
+// What to call a port where it is named for a person: its name, else
+// its device path, else its id. It used to end in "Port 2", a position,
+// which calls a different port by that name as soon as the list moves -
+// and the conflict message skipped the device path the card used, so
+// the two could call one port by different names.
+function portTitle(port) {
+  return port.name || (port.serial && port.serial.port) || port.id;
+}
+
+function renderPortCard(port) {
   const ser = port.serial || {};
   const state = _portState(port);
   const card = el('div', { class: 'card card-' + state });
@@ -1121,7 +1132,7 @@ function renderPortCard(port, index) {
   card.dataset.portId = id;
 
   // Header row: title + kebab
-  const titleText = port.name || ser.port || ('Port ' + (index + 1));
+  const titleText = portTitle(port);
   // Where the title *is* the device path - an unnamed port - it is the
   // one place the path is written, so it copies from here. A named
   // port carries it in the subtitle instead, and it copies from there.
@@ -3915,9 +3926,12 @@ function _showClientCertDownload(data) {
 
 // Short "where is this used" label for one entry of a bundle's used_by.
 function _usageLabel(u) {
+  // A name where there is one, the id where there is not - it used to
+  // fall back to "#2", a position that names another port once the
+  // list moves.
   const where = u.type === 'http'
-    ? 'HTTPS ' + (u.name || '')
-    : 'port ' + (u.port_name || '#' + u.port_index);
+    ? 'HTTPS ' + (u.name || u.http_id || '')
+    : 'port ' + (u.port_name || u.port_id);
   return where.trim() + ' ' + (u.address || '') + ':' + u.server_port;
 }
 

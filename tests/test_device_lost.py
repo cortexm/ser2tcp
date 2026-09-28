@@ -29,6 +29,7 @@ def _proxy():
     proxy._serial = Mock()
     proxy._serial_config = {'port': '/dev/ttyUSB0', 'baudrate': 9600}
     proxy._match = None
+    proxy._id = 'dev'
     proxy._name = 'dev'
     proxy._selector = None
     proxy._serial_source = None
