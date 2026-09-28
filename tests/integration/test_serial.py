@@ -128,10 +128,14 @@ class SerialPtyTestCase(base.IntegrationTestCase):
 
     def connections_on(self, port):
         """How many clients ser2tcp currently has on that server"""
+        # Every port, not ports[0]: a TCP port number is unique, and
+        # which place its port holds in the list is not this helper's
+        # business - it moves.
         body = self.get('/api/status')[1]
-        for server in body['ports'][0]['servers']:
-            if server.get('port') == port:
-                return len(server['connections'])
+        for entry in body['ports']:
+            for server in entry['servers']:
+                if server.get('port') == port:
+                    return len(server['connections'])
         return 0
 
     def wait_for_connections(self, count, port=None, timeout=5.0):
@@ -411,6 +415,42 @@ class TestUnixSocketPath(SerialPtyTestCase):
         os.write(self.master_fd, b'shared')
         self.assertEqual(read_client(unix_sock, 6), b'shared')
         self.assertEqual(read_client(tcp_sock, 6), b'shared')
+
+
+class TestMovingAPort(SerialPtyTestCase):
+    """Reordering ports on a running process changes the order and
+    nothing else - a client on the moved port does not notice."""
+
+    @classmethod
+    def build_config(cls):
+        config = super().build_config()
+        config['ports'][0]['id'] = 'pty'
+        config['ports'].append({
+            'id': 'elsewhere', 'name': 'elsewhere',
+            'serial': {'port': '/dev/ser2tcp-move-test-nowhere'},
+            'servers': [{'protocol': 'websocket', 'endpoint': 'elsewhere'}],
+        })
+        return config
+
+    def test_the_order_changes_and_the_client_stays(self):
+        sock = self.connect()
+        status, body = self.post(
+            '/api/ports/pty/move', {'after': 'elsewhere'})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['order'], ['elsewhere', 'pty'])
+        # Written down, and reported, in the new order.
+        self.assertEqual(
+            [p['id'] for p in self.proc.read_config()['ports']],
+            ['elsewhere', 'pty'])
+        self.assertEqual(
+            [p['id'] for p in self.get('/api/status')[1]['ports']],
+            ['elsewhere', 'pty'])
+        # The same connection, both ways - nothing was closed or rebuilt.
+        os.write(self.master_fd, b'still here')
+        self.assertEqual(read_client(sock, 10), b'still here')
+        sock.sendall(b'and back')
+        self.assertEqual(read_device(self.master_fd, 8), b'and back')
+        self.assertEqual(self.connections_on(self.tcp_port), 1)
 
 
 class TestPortReconfiguration(SerialPtyTestCase):

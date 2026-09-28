@@ -827,6 +827,7 @@ With IP filtering:
 | POST | `/api/ports` | admin | Add new port configuration |
 | PUT | `/api/ports/<id>` | admin | Update port configuration |
 | DELETE | `/api/ports/<id>` | admin | Delete port configuration |
+| POST | `/api/ports/<id>/move` | admin | Put the port `{"before": id}` or `{"after": id}` another one |
 | PUT | `/api/ports/<id>/signals` | admin | Set RTS/DTR signals |
 | GET | `/api/users` | admin | List users |
 | POST | `/api/users` | admin | Add user |
@@ -928,6 +929,23 @@ your editor open with the message rather than discarding what you typed.
 that writes a whole entry without reading it first keeps working. It is
 derived from the content rather than stored, so it never appears in
 `config.json` and an entry edited by hand is covered as well.
+
+### Port order
+
+Ports are listed in the order `config.json` holds them. To change it,
+put one port before or after another:
+
+```bash
+curl -X POST http://localhost:8080/api/ports/esp32/move \
+  -H 'Content-Type: application/json' -d '{"before": "rpi"}'
+```
+
+It takes exactly one of `before` or `after`, and an id, never a number:
+"before rpi" still means what you meant if somebody else has added a
+port in the meantime, where "to position 2" would not. If the port you
+anchored to has been deleted since, the answer is **409**. Only the
+order changes — no port is closed or rebuilt, and clients stay
+connected. The answer carries the new order as a list of ids.
 
 ### When something will not start
 

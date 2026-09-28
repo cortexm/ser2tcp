@@ -1271,11 +1271,74 @@ class HttpServerWrapper():
         elif len(parts) == 2 and parts[1] == 'signals' \
                 and client.method == 'PUT':
             self._handle_api_set_signals(client, user, index)
+        elif len(parts) == 2 and parts[1] == 'move':
+            if client.method == 'POST':
+                self._handle_api_ports_move(client, user, index)
+            else:
+                self._error(client, 'Method not allowed', 405)
         elif len(parts) == 3 and parts[1] == 'connections' \
                 and client.method == 'DELETE':
             self._handle_api_disconnect(client, user, index, parts[2])
         else:
             self._error(client, 'Not found', 404)
+
+    @staticmethod
+    def _move_anchor(data):
+        """Read {"before": id} or {"after": id}: (anchor, place, error).
+
+        Exactly one of the two, and an id - never a number. A position
+        or a step count means something else once another tab has added
+        or moved a port; "before esp32" still means what was meant.
+        """
+        if not isinstance(data, dict):
+            return None, None, 'Expected {"before": id} or {"after": id}'
+        given = [key for key in ('before', 'after') if key in data]
+        if len(given) != 1:
+            return None, None, 'Give exactly one of "before" or "after"'
+        place = given[0]
+        anchor = data[place]
+        if not isinstance(anchor, str) or not anchor:
+            return None, None, '"%s" takes the id of another port' % place
+        return anchor, place, None
+
+    def _handle_api_ports_move(self, client, user, index):
+        """Put a port before or after another one.
+
+        Only the order changes: the same entries and the same running
+        proxies, in a new sequence - nothing is closed or rebuilt, so
+        clients stay connected. Both lists are reordered together,
+        because they are paired by position and everything below the
+        id lookup relies on it.
+        """
+        if not self._require_admin(client, user):
+            return
+        anchor, place, error = self._move_anchor(client.data)
+        if error:
+            self._error(client, error, 400)
+            return
+        ports = self._get_ports_config()
+        target = self._port_index(anchor)
+        if target is None:
+            # Most likely deleted in another tab since this one looked.
+            self._error(
+                client,
+                'Port "%s" is not there any more - reload the list and '
+                'move it again' % anchor, 409)
+            return
+        order = list(range(len(ports)))
+        order.pop(index)
+        at = order.index(target) if target != index else index
+        if target != index and place == 'after':
+            at += 1
+        order.insert(at, index)
+        if order != sorted(order):
+            ports[:] = [ports[i] for i in order]
+            self._serial_proxies[:] = [self._serial_proxies[i] for i in order]
+            self._save_config()
+            self._log.info(
+                "Port moved: %s %s %s", ports[at].get('id'), place, anchor)
+        client.respond({
+            'ok': True, 'order': [p.get('id') for p in ports]})
 
     def _handle_api_ports_get(self, client, index):
         """Return one port's stored configuration.
