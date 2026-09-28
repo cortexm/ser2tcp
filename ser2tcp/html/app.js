@@ -1029,21 +1029,332 @@ function renderPortsActions() {
 }
 
 function renderPortsList() {
-  const root = $('ports-content');
-  root.innerHTML = '';
-  if (!portsStatus) {
-    root.appendChild(el('p', { class: 'empty' }, 'Loading…'));
+  // The port in hand was deleted meanwhile, in another tab: there is
+  // nothing left to move. Ending the drag draws the list again.
+  if (portDrag && portsStatus
+      && !portsStatus.ports.some(p => p.id === portDrag.id)) {
+    _endPortDrag(false);
     return;
   }
-  if (!portsStatus.ports.length) {
-    root.appendChild(el('p', { class: 'empty' }, 'No ports configured'));
+  const root = $('ports-content');
+  if (!portsStatus || !portsStatus.ports.length) {
+    root.innerHTML = '';
+    root.appendChild(el('p', { class: 'empty' },
+      portsStatus ? 'No ports configured' : 'Loading…'));
     return;
   }
   _resolveEndpointTokens(portsStatus.ports);
-  const grid = el('div', { class: 'card-grid' });
-  portsStatus.ports.forEach(p => grid.appendChild(renderPortCard(p)));
-  root.appendChild(grid);
+  let grid = root.querySelector(':scope > .card-grid');
+  if (!grid) {
+    root.innerHTML = '';
+    grid = el('div', { class: 'card-grid' });
+    // Once per grid; it asks whether this is an admin at every press.
+    _enablePortDrag(grid);
+    root.appendChild(grid);
+  }
+  grid.classList.toggle('movable', !!isAdmin);
+  _reconcilePortCards(grid, portsStatus.ports);
 }
+
+// Only a card whose port changed is drawn again. It used to be the
+// whole grid on every status push - and a port that reports its signals
+// pushes several times a second - so every card was rebuilt, and a menu
+// open on any of them closed under the pointer.
+//
+// Each card remembers what it was drawn from: its port, and the few
+// things outside it that a card shows - whether this is an admin, the
+// USB devices present (a card's colour), the endpoint tokens (its share
+// links). One that would come out the same is left as it is.
+//
+// A card in hand is the exception. Everything else stays live while it
+// is dragged - status, ports added or deleted, and an order changed
+// from another tab - but that card keeps the element under the pointer
+// and the slot it is being shown in, with the others arranged around
+// it. Redrawn, it would leave the hand; moved, it would leave the slot
+// the person is looking at. If the other tab moved this very port, the
+// drop still comes later and wins: the move sent is relative to where
+// it lands, and the server answers with the order that results.
+function _reconcilePortCards(grid, ports) {
+  const context = JSON.stringify(
+    [!!isAdmin, detectedPorts, [..._endpointTokens]]);
+  const existing = new Map(
+    [...grid.children].map(c => [c.dataset.portId, c]));
+  const held = portDrag && existing.get(portDrag.id);
+  if (held) {
+    const slot = [...grid.children].indexOf(held);
+    const others = ports.filter(p => p.id !== portDrag.id);
+    const mine = ports.find(p => p.id === portDrag.id);
+    ports = others.slice(0, slot).concat([mine], others.slice(slot));
+  }
+  const wanted = ports.map(p => {
+    const drawnFrom = JSON.stringify(p) + '\n' + context;
+    const old = existing.get(p.id);
+    existing.delete(p.id);
+    // Stale until it is let go, and drawn afresh then: the drawnFrom
+    // it keeps says what it was drawn from, not what it should be.
+    if (old && old === held) return old;
+    if (old && old._drawnFrom === drawnFrom) return old;
+    const card = renderPortCard(p);
+    card._drawnFrom = drawnFrom;
+    // In its old place, so the order pass below has nothing to move
+    // for a port that only changed.
+    if (old) old.replaceWith(card);
+    return card;
+  });
+  existing.forEach(c => c.remove());  // ports that are gone
+  // Then the order, moving only what is out of place - and letting it
+  // slide, so a port moved from another tab is seen going where it went.
+  const inOrder = wanted.length === grid.children.length
+    && wanted.every((c, i) => grid.children[i] === c);
+  if (inOrder) return;
+  _slideCards(grid, () => {
+    let ref = grid.firstChild;
+    wanted.forEach(c => {
+      if (c === ref) ref = ref.nextSibling;
+      else grid.insertBefore(c, ref);
+    });
+  });
+}
+
+// ===========================================================================
+// Port order: drag a card to move the port
+// ===========================================================================
+// Anywhere on a card that is not itself something to click - no handle.
+// The mouse starts a drag after a few pixels, so a press that does not
+// move is still a click. A finger has to hold still first, or every
+// swipe that happened to start on a card would move it instead of
+// scrolling the page.
+//
+// The cards change places while the pointer moves, and what the grid
+// shows at the release is the order sent: the dragged card's new
+// neighbour is its anchor, since the API takes {before: id} or
+// {after: id} and never a position. The answer carries the order and
+// the stream sends every tab a snapshot anyway, so when nobody else
+// has touched the list in between, neither changes anything on screen.
+const DRAG_THRESHOLD = 5;     // px the mouse or pen has to travel
+const DRAG_HOLD_MS = 400;     // how long a finger has to stay put
+
+let portDrag = null;          // the press or drag in progress, or null
+
+// A link, a button, a field, or anything with a click of its own - a
+// copyable path, a signal badge - keeps its click; the rest of the card
+// is for dragging.
+function _isCardControl(target, card) {
+  for (let n = target; n && n !== card; n = n.parentElement) {
+    if (n.matches('a, button, input, select, textarea, label')) return true;
+    if (n.onclick) return true;
+  }
+  return false;
+}
+
+function _enablePortDrag(grid) {
+  grid.addEventListener('pointerdown', e => {
+    if (!isAdmin || portDrag || e.button !== 0) return;
+    const card = e.target.closest('.card');
+    if (!card || !grid.contains(card) || _isCardControl(e.target, card)) {
+      return;
+    }
+    portDrag = {
+      grid, card,
+      id: card.dataset.portId,
+      pointerId: e.pointerId,
+      x: e.clientX,
+      y: e.clientY,
+      touch: e.pointerType === 'touch',
+      active: false,
+      timer: null,
+    };
+    if (portDrag.touch) {
+      portDrag.timer = setTimeout(_startPortDrag, DRAG_HOLD_MS);
+    }
+  });
+}
+
+function _startPortDrag() {
+  const drag = portDrag;
+  if (!drag) return;
+  clearTimeout(drag.timer);
+  drag.active = true;
+  drag.card.classList.add('dragging');
+  document.body.classList.add('port-dragging');
+  // A mouse that travelled the threshold has begun selecting text.
+  const sel = window.getSelection && window.getSelection();
+  if (sel) sel.removeAllRanges();
+}
+
+// Which card the pointer is over, and which half of it, decides where
+// the dragged one goes. Across a row the cards read left to right; in a
+// single column, top to bottom.
+function _placeDraggedCard(x, y) {
+  const { grid, card } = portDrag;
+  const over = document.elementFromPoint(x, y);
+  const target = over && over.closest('.card');
+  if (!target || target === card || !grid.contains(target)) return;
+  // A card still sliding to its new place is not where it will be; the
+  // pointer over it now would send the dragged one back and forth.
+  if (target.classList.contains('sliding')) return;
+  const r = target.getBoundingClientRect();
+  const oneColumn =
+    getComputedStyle(grid).gridTemplateColumns.split(' ').length === 1;
+  const before = oneColumn
+    ? y < r.top + r.height / 2
+    : x < r.left + r.width / 2;
+  const ref = before ? target : target.nextSibling;
+  if (ref === card || card.nextSibling === ref) return;
+  _slideCards(grid, () => grid.insertBefore(card, ref));
+}
+
+// Move cards so that the ones pushed aside can be seen going where they
+// went, rather than being somewhere else from one frame to the next.
+// Where each card is, is measured before the change and after; each is
+// then drawn back where it was and let slide to where it is now.
+const CARD_SLIDE_MS = 150;
+
+function _slideCards(grid, change) {
+  const cards = [...grid.children];
+  const reduced = window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduced) {
+    change();
+    return;
+  }
+  // Measured as drawn, mid-slide included, so a card already on its way
+  // carries on from where it is instead of jumping back first.
+  const was = new Map(cards.map(c => [c, c.getBoundingClientRect()]));
+  change();
+  const sliding = [];
+  cards.forEach(c => {
+    const a = was.get(c);
+    const b = c.getBoundingClientRect();
+    const dx = a.left - b.left;
+    const dy = a.top - b.top;
+    if (!dx && !dy) return;
+    c.style.transition = 'none';
+    c.style.transform = 'translate(' + dx + 'px, ' + dy + 'px)';
+    sliding.push(c);
+  });
+  if (!sliding.length) return;
+  grid.getBoundingClientRect();  // commit the start before the slide
+  sliding.forEach(c => {
+    // A slide still running from the last move gives way to this one;
+    // its timer would otherwise end this one early and snap the card.
+    if (c._cancelSlide) c._cancelSlide();
+    c.classList.add('sliding');
+    c.style.transition = 'transform ' + CARD_SLIDE_MS + 'ms ease-out';
+    c.style.transform = '';
+    // transitionend does not come for a slide that was cut short or a
+    // card taken out of the page, so a timer finishes the job as well.
+    const cancel = () => {
+      clearTimeout(timer);
+      c.removeEventListener('transitionend', onEnd);
+      c._cancelSlide = null;
+    };
+    const done = () => {
+      cancel();
+      c.classList.remove('sliding');
+      c.style.transition = '';
+    };
+    const onEnd = e => {
+      if (e.target === c && e.propertyName === 'transform') done();
+    };
+    const timer = setTimeout(done, CARD_SLIDE_MS + 50);
+    c._cancelSlide = cancel;
+    c.addEventListener('transitionend', onEnd);
+  });
+}
+
+function _endPortDrag(commit) {
+  const drag = portDrag;
+  if (!drag) return;
+  clearTimeout(drag.timer);
+  portDrag = null;
+  drag.card.classList.remove('dragging');
+  document.body.classList.remove('port-dragging');
+  if (drag.active) _swallowNextClick();
+
+  // Compared with the order the server last sent, not the one at the
+  // press: the list may have changed in another tab while this lasted.
+  const order = [...drag.grid.children].map(c => c.dataset.portId);
+  const serverOrder = portsStatus ? portsStatus.ports.map(p => p.id) : [];
+  const moved = drag.active && commit && order.length > 1
+    && order.join('\n') !== serverOrder.join('\n');
+  if (!moved) {
+    // Back to the server's order, and the card in hand drawn afresh if
+    // its port changed while it was held.
+    renderPortsList();
+    return;
+  }
+  const at = order.indexOf(drag.id);
+  const anchor = at + 1 < order.length
+    ? { before: order[at + 1] }
+    : { after: order[at - 1] };
+  // Shown as dropped until the server says otherwise.
+  _applyPortOrder(order);
+  renderPortsList();
+  api('POST', '/api/ports/' + encodeURIComponent(drag.id) + '/move', anchor)
+    .then(res => {
+      // Somebody else may have moved or added a port in between; the
+      // server's order is the one that stands.
+      if (res && res.order) {
+        _applyPortOrder(res.order);
+        renderPortsList();
+      }
+    })
+    .catch(e => {
+      if (e === 'unauthorized') return;
+      alert(e);
+      _applyPortOrder(serverOrder);
+      renderPortsList();
+    });
+}
+
+// Reorder the ports held for the stream to a list of ids. A port not in
+// it - added since - keeps its place at the end rather than vanishing.
+function _applyPortOrder(order) {
+  if (!portsStatus) return;
+  const byId = new Map(portsStatus.ports.map(p => [p.id, p]));
+  const next = order.filter(id => byId.has(id)).map(id => byId.get(id));
+  portsStatus.ports.forEach(p => { if (!next.includes(p)) next.push(p); });
+  portsStatus.ports = next;
+}
+
+// The release after a drag can arrive as a click on whatever is under
+// it by then.
+function _swallowNextClick() {
+  const stop = e => { e.stopPropagation(); e.preventDefault(); };
+  window.addEventListener('click', stop, { capture: true, once: true });
+  setTimeout(
+    () => window.removeEventListener('click', stop, { capture: true }), 0);
+}
+
+window.addEventListener('pointermove', e => {
+  const drag = portDrag;
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  if (!drag.active) {
+    const moved = Math.hypot(e.clientX - drag.x, e.clientY - drag.y);
+    if (drag.touch) {
+      // Moved before the hold was up: that is a scroll, not a drag.
+      if (moved > DRAG_THRESHOLD * 2) _endPortDrag(false);
+      return;
+    }
+    if (moved < DRAG_THRESHOLD) return;
+    _startPortDrag();
+  }
+  _placeDraggedCard(e.clientX, e.clientY);
+});
+window.addEventListener('pointerup', e => {
+  if (portDrag && e.pointerId === portDrag.pointerId) _endPortDrag(true);
+});
+window.addEventListener('pointercancel', e => {
+  if (portDrag && e.pointerId === portDrag.pointerId) _endPortDrag(false);
+});
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && portDrag && portDrag.active) _endPortDrag(false);
+});
+// Once a finger is dragging a card, it must not scroll the page too.
+window.addEventListener('touchmove', e => {
+  if (portDrag && portDrag.active) e.preventDefault();
+}, { passive: false });
 
 // The token a terminal link needs where this browser has no session to
 // fall back on, so that an endpoint with a token opens from here like

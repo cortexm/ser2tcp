@@ -932,8 +932,10 @@ derived from the content rather than stored, so it never appears in
 
 ### Port order
 
-Ports are listed in the order `config.json` holds them. To change it,
-put one port before or after another:
+Ports are listed in the order `config.json` holds them. In the web UI
+an admin changes it by dragging a port's card — anywhere that is not a
+link or a button; on a touch screen, hold the card still for a moment
+first. From a script, put one port before or after another:
 
 ```bash
 curl -X POST http://localhost:8080/api/ports/esp32/move \
