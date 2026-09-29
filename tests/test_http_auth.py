@@ -283,12 +283,36 @@ class TestSessionManager(unittest.TestCase):
         mgr.delete_user('viewer')
         self.assertIsNone(mgr.authenticate(token))
 
-    def test_delete_last_admin_refused(self):
+    def test_delete_last_account_asks_to_confirm(self):
+        """The only account left is the way out - but not by accident"""
         mgr = self._make_manager(users=[
             self._make_user(login='admin', admin=True)])
         result = mgr.delete_user('admin')
-        self.assertIsInstance(result, str)
-        self.assertIn('admin', result.lower())
+        self.assertEqual(result, http_auth.CONFIRM_DISABLE_AUTH)
+        self.assertFalse(mgr.is_empty)
+
+    def test_delete_last_account_confirmed_disables_auth(self):
+        mgr = self._make_manager(users=[
+            self._make_user(login='admin', admin=True)])
+        self.assertTrue(mgr.delete_user('admin', disable_auth=True))
+        self.assertTrue(mgr.is_empty)
+
+    def test_delete_last_admin_refused_with_other_user(self):
+        """Not the userless mode - auth stays on with nobody to run it"""
+        mgr = self._make_manager(users=[
+            self._make_user(login='admin', admin=True),
+            self._make_user(login='viewer')])
+        for confirmed in (False, True):
+            result = mgr.delete_user('admin', disable_auth=confirmed)
+            self.assertEqual(result, http_auth.LAST_ADMIN_ERROR)
+        self.assertIsNotNone(mgr.login('admin', 'pass'))
+
+    def test_delete_last_admin_refused_with_non_admin_token(self):
+        mgr = self._make_manager(
+            users=[self._make_user(login='admin', admin=True)],
+            tokens=[{'token': 'tok', 'name': 'api', 'admin': False}])
+        result = mgr.delete_user('admin', disable_auth=True)
+        self.assertEqual(result, http_auth.LAST_ADMIN_ERROR)
 
     def test_delete_last_admin_allowed_with_admin_token(self):
         mgr = self._make_manager(
@@ -296,6 +320,23 @@ class TestSessionManager(unittest.TestCase):
             tokens=[{'token': 'tok', 'name': 'api', 'admin': True}])
         self.assertTrue(mgr.delete_user('admin'))
         self.assertFalse(mgr.is_empty)
+
+    def test_delete_last_token_asks_to_confirm(self):
+        """The mirror of a user: an installation with only tokens
+        must be able to take the same way out"""
+        mgr = self._make_manager(
+            tokens=[{'token': 'tok', 'name': 'api', 'admin': True}])
+        self.assertEqual(
+            mgr.delete_token('tok'), http_auth.CONFIRM_DISABLE_AUTH)
+        self.assertTrue(mgr.delete_token('tok', disable_auth=True))
+        self.assertTrue(mgr.is_empty)
+
+    def test_delete_last_admin_token_refused_with_other_token(self):
+        mgr = self._make_manager(tokens=[
+            {'token': 'tok', 'name': 'api', 'admin': True},
+            {'token': 'ro', 'name': 'readonly', 'admin': False}])
+        result = mgr.delete_token('tok', disable_auth=True)
+        self.assertEqual(result, http_auth.LAST_ADMIN_ERROR)
 
     def test_delete_admin_when_another_exists(self):
         mgr = self._make_manager(users=[

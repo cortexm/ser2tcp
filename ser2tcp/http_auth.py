@@ -8,6 +8,26 @@ import time as _time
 
 DEFAULT_SESSION_TIMEOUT = 3600
 
+# What delete_user()/delete_token() answer when the only thing standing
+# in the way is that nobody has said yes yet: the account is the last
+# one there is, so removing it turns authentication off altogether.
+#
+# A plain string, so a caller that knows nothing about it still reads
+# the answer as a refusal rather than as success. A caller that can
+# offer the confirmation has to test for it *before* the generic "a
+# string means an error" branch, or the one refusal it could act on
+# reads like the one it cannot.
+CONFIRM_DISABLE_AUTH = 'confirm:disable_auth'
+
+# Removing the last admin while other accounts remain is the other
+# outcome, and it is not offered a confirmation: authentication would
+# stay on with nobody able to administer it. That is not the userless
+# mode, it is being locked out - the same state add_token() refuses to
+# create from the other end.
+LAST_ADMIN_ERROR = (
+    'Cannot delete the last admin while other accounts remain: delete '
+    'them as well, or make one of them an admin first')
+
 # sha256:<salt hex>:<digest hex>, exactly as hash_password() writes it.
 # The digest length is fixed by the algorithm; the salt is left open
 # because an older config may carry one of a different length. Lower
@@ -325,14 +345,33 @@ class SessionManager():
         """Count admin tokens"""
         return sum(1 for t in self._tokens.values() if t.get('admin'))
 
-    def delete_user(self, login):
-        """Delete user, return True on success, False/string on error"""
+    def delete_user(self, login, disable_auth=False):
+        """Delete user, return True on success, False/string on error.
+
+        Two different things can be meant by "the last admin", and they
+        need opposite answers.
+
+        Deleting the last account *of any kind* turns authentication
+        off: is_empty goes True and _require_auth() then hands admin to
+        everybody. That is a real thing to want - it is how an
+        installation goes back to being open - so it is allowed, but
+        only once the caller says so through `disable_auth`. Until
+        then the answer is CONFIRM_DISABLE_AUTH.
+
+        Deleting the last admin while *other* accounts remain leaves
+        authentication on with nobody able to administer it. No
+        confirmation is offered for that one, because there is nothing
+        to weigh: it is not a choice, it is a mistake.
+        """
         if login not in self._users:
             return False
         user = self._users[login]
-        if user.get('admin') and self._admin_count() <= 1:
+        if len(self._users) == 1 and not self._tokens:
+            if not disable_auth:
+                return CONFIRM_DISABLE_AUTH
+        elif user.get('admin') and self._admin_count() <= 1:
             if self._admin_token_count() == 0:
-                return 'Cannot delete last admin'
+                return LAST_ADMIN_ERROR
         del self._users[login]
         self._drop_sessions(login)
         return True
@@ -370,14 +409,22 @@ class SessionManager():
             token_cfg['admin'] = kwargs['admin']
         return True
 
-    def delete_token(self, token):
-        """Delete API token, return True on success, False/string on error"""
+    def delete_token(self, token, disable_auth=False):
+        """Delete API token, return True on success, False/string on error.
+
+        The mirror of delete_user(), and deliberately so: leaving the
+        way out open through users but not through tokens would only
+        mean the installation that has no users cannot take it.
+        """
         if token not in self._tokens:
             return False
         token_cfg = self._tokens[token]
-        if token_cfg.get('admin') and self._admin_token_count() <= 1:
+        if len(self._tokens) == 1 and not self._users:
+            if not disable_auth:
+                return CONFIRM_DISABLE_AUTH
+        elif token_cfg.get('admin') and self._admin_token_count() <= 1:
             if self._admin_count() == 0:
-                return 'Cannot delete last admin'
+                return LAST_ADMIN_ERROR
         del self._tokens[token]
         return True
 

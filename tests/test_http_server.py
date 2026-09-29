@@ -664,6 +664,48 @@ class TestApiUsers(unittest.TestCase):
         wrapper._handle_request(client)
         self.assertEqual(client.respond_status, 404)
 
+    def test_delete_last_account_needs_confirmation(self):
+        """409 names the parameter back, so curl learns what the UI knows"""
+        wrapper = make_wrapper(auth_config=self._auth_config())
+        token = self._admin_token(wrapper)
+        client = self._auth_client(
+            token, method='DELETE', path='/api/users/admin')
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 409)
+        self.assertEqual(client.responded['confirm'], 'disable_auth')
+        self.assertIn('disable_auth=1', client.responded['error'])
+        self.assertFalse(wrapper._auth.is_empty)
+
+    def test_delete_last_account_confirmed_turns_auth_off(self):
+        wrapper = make_wrapper(auth_config=self._auth_config())
+        token = self._admin_token(wrapper)
+        client = self._auth_client(
+            token, method='DELETE', path='/api/users/admin')
+        client.query = {'disable_auth': '1'}
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 200)
+        self.assertTrue(wrapper._auth.is_empty)
+        # And the API is open again - that is what was confirmed.
+        after = MockClient(path='/api/users')
+        wrapper._handle_request(after)
+        self.assertEqual(after.respond_status, 200)
+
+    def test_delete_last_admin_with_others_left_is_400(self):
+        """No confirmation offered: it would arm auth with no admin"""
+        auth = self._auth_config()
+        auth['users'].append({
+            'login': 'viewer', 'password': hash_password('x'),
+        })
+        wrapper = make_wrapper(auth_config=auth)
+        token = self._admin_token(wrapper)
+        client = self._auth_client(
+            token, method='DELETE', path='/api/users/admin')
+        client.query = {'disable_auth': '1'}
+        wrapper._handle_request(client)
+        self.assertEqual(client.respond_status, 400)
+        self.assertNotIn('confirm', client.responded)
+        self.assertFalse(wrapper._auth.is_empty)
+
     def test_users_list_no_auth(self):
         wrapper = make_wrapper()
         client = MockClient(path='/api/users')

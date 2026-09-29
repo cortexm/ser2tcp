@@ -753,7 +753,12 @@ With authentication (configured at root level, shared across all HTTP servers):
   when absent). Set in the web UI at the top of **Settings**; a new
   value holds from the next request of every session, no restart
 - First user added (via CLI or web UI) is automatically admin
-- Cannot delete last admin (user or token) — at least one admin must exist
+- Cannot delete the last admin while other accounts remain — that would
+  leave authentication on with nobody able to administer it
+- Deleting the very last account (user or token) is allowed and **turns
+  authentication off**: everyone who can reach the server then has full
+  admin access without signing in. The web UI asks first; over the API
+  it takes `?disable_auth=1`, and is refused with `409` without it
 
 A change to an account reaches whoever is signed in on it right away,
 without waiting for their session to lapse:

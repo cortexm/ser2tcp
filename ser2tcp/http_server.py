@@ -572,8 +572,13 @@ class HttpServerWrapper():
             return addr[0]
         return '-'
 
-    def _error(self, client, error, status):
+    def _error(self, client, error, status, extra=None):
         """Send an error response, and log the one line that explains it.
+
+        `extra` adds machine-readable keys beside `error` for a refusal
+        the caller can act on. It goes through here rather than through
+        a bare respond() so that such a refusal is still logged - that
+        is the whole reason every error response comes this way.
 
         Self-contained on purpose: status, method, path and address all
         on this line. fail2ban and friends match a line at a time, so a
@@ -587,7 +592,10 @@ class HttpServerWrapper():
         report = self._log.error if status >= 500 else self._log.warning
         report("%s %s %s from %s: %s", status, client.method,
                self._logged_path(client), self._client_ip(client), error)
-        client.respond({'error': error}, status=status)
+        body = {'error': error}
+        if extra:
+            body.update(extra)
+        client.respond(body, status=status)
 
     @staticmethod
     def _logged_path(client):
@@ -1950,6 +1958,48 @@ class HttpServerWrapper():
         self._log.info("User updated: %s", login)
         client.respond({'ok': True})
 
+    @staticmethod
+    def _disable_auth_confirmed(client):
+        """Whether the caller acknowledged that this turns auth off.
+
+        A query parameter, because a DELETE carries no body - and the
+        409 that asks for it spells the parameter back, so somebody
+        with curl gets the same answer the web UI does.
+        """
+        return bool(client.query) \
+            and client.query.get('disable_auth') == '1'
+
+    def _auth_delete_refused(self, client, result, not_found):
+        """Answer a delete_user()/delete_token() refusal, if it is one.
+
+        Returns True when it answered, so the caller can stop.
+
+        CONFIRM_DISABLE_AUTH is tested before the generic "a string is
+        an error" branch: it is the one refusal the caller can do
+        something about, and reading it as the one it cannot would hide
+        the way out altogether.
+
+        409 rather than 400 because that is already what this API means
+        by "say it again, knowing the state you are in" - the same
+        thing a stale `rev` gets.
+        """
+        if result is False:
+            self._error(client, not_found, 404)
+            return True
+        if result == _http_auth.CONFIRM_DISABLE_AUTH:
+            self._error(
+                client,
+                'This is the last account: deleting it turns '
+                'authentication off, and everyone who can reach this '
+                'server then gets full admin access without signing '
+                'in. Repeat with ?disable_auth=1 to confirm.',
+                409, extra={'confirm': 'disable_auth'})
+            return True
+        if isinstance(result, str):
+            self._error(client, result, 400)
+            return True
+        return False
+
     def _handle_api_users_delete(self, client, user, login):
         """Delete user"""
         if not self._auth:
@@ -1957,12 +2007,9 @@ class HttpServerWrapper():
             return
         if not self._require_admin(client, user):
             return
-        result = self._auth.delete_user(login)
-        if result is False:
-            self._error(client, 'User not found', 404)
-            return
-        if isinstance(result, str):
-            self._error(client, result, 400)
+        result = self._auth.delete_user(
+            login, disable_auth=self._disable_auth_confirmed(client))
+        if self._auth_delete_refused(client, result, 'User not found'):
             return
         self._save_auth_config()
         self._log.info("User deleted: %s", login)
@@ -2043,12 +2090,9 @@ class HttpServerWrapper():
         if not self._require_admin(client, user):
             return
         name = self._token_name(token)
-        result = self._auth.delete_token(token)
-        if result is False:
-            self._error(client, 'Token not found', 404)
-            return
-        if isinstance(result, str):
-            self._error(client, result, 400)
+        result = self._auth.delete_token(
+            token, disable_auth=self._disable_auth_confirmed(client))
+        if self._auth_delete_refused(client, result, 'Token not found'):
             return
         self._save_auth_config()
         self._log.info("Token deleted: %s", name)

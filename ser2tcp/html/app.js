@@ -466,7 +466,13 @@ function api(method, path, body) {
       navigate('/login');
       return Promise.reject('unauthorized');
     }
-    return r.json().then(d => r.ok ? d : Promise.reject(d.error || 'Error'));
+    return r.json().then(d => {
+      if (r.ok) return d;
+      // A refusal the caller can act on carries more than a sentence,
+      // so hand back the whole body. Everything else stays a string,
+      // which is what every other .catch() in here is written for.
+      return Promise.reject(d.confirm ? d : (d.error || 'Error'));
+    });
   });
 }
 
@@ -3105,19 +3111,43 @@ function renderTokenCard(tok) {
   return card;
 }
 
+// Deleting the last account of all turns authentication off, and the
+// server refuses that once and says what it would mean. That refusal is
+// what prompts here, rather than a check against the list this page
+// happens to hold: the list can be out of date, the server cannot.
+function deleteAccount(path, onDeleted) {
+  function run(confirmed) {
+    return api('DELETE', path + (confirmed ? '?disable_auth=1' : ''))
+      .then(() => {
+        // Authentication is off now, so whatever token this page held
+        // is dead - and the API hands out admin without one. Dropping
+        // it keeps a stale token from turning up if auth comes back.
+        if (confirmed) setCredentials(null, null);
+        else if (onDeleted) onDeleted();
+        navigate('/users');
+      })
+      .catch(e => {
+        if (e === 'unauthorized') return;
+        if (e && e.confirm === 'disable_auth') {
+          if (confirm(e.error)) run(true);
+          return;
+        }
+        alert(e && e.error ? e.error : e);
+      });
+  }
+  run(false);
+}
+
 function confirmDeleteUser(login) {
   if (!confirm('Delete user "' + login + '"?')) return;
-  api('DELETE', '/api/users/' + encodeURIComponent(login)).then(() => {
+  deleteAccount('/api/users/' + encodeURIComponent(login), () => {
     if (login === username) setCredentials(null, null);
-    navigate('/users');
-  }).catch(e => { if (e !== 'unauthorized') alert(e); });
+  });
 }
 
 function confirmDeleteToken(tokenId) {
   if (!confirm('Delete this token?')) return;
-  api('DELETE', '/api/tokens/' + encodeURIComponent(tokenId))
-    .then(() => navigate('/users'))
-    .catch(e => { if (e !== 'unauthorized') alert(e); });
+  deleteAccount('/api/tokens/' + encodeURIComponent(tokenId), null);
 }
 
 // ----- User editor -----
