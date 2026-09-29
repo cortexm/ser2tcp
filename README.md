@@ -958,6 +958,11 @@ In the web UI's port editor the servers can be put in another order by
 dragging a server by the grip after its delete icon; the new order is
 saved with the rest of the form, and moves no client anywhere.
 
+A server added in the editor that is switched to WEBSOCKET is offered
+the port's id as its endpoint, with `-1`, `-2` added if that is taken.
+It is only a starting value: renaming the port later does not move the
+endpoint, which is what links and devices connect to.
+
 ### Port order
 
 Ports are listed in the order `config.json` holds them. In the web UI

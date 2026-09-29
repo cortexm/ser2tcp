@@ -2278,15 +2278,40 @@ function _buildPortForm(cfg, editId, bundles) {
     const globalUsed = new Set(usedPorts.map(u => u.port));
     while (globalUsed.has(p) || editorPorts.has(p)) p++;
     const seed = initSrv || { protocol: 'tcp', address: '0.0.0.0', port: p };
+    // A server that is not in the file yet - added here, or all of a
+    // new port's - is offered the port's id as its endpoint.
+    const isNew = !initSrv || editId === null;
     const sb = _buildServerBox(seed, () => {
       const idx = serverBoxes.indexOf(sb);
       if (idx >= 0) serverBoxes.splice(idx, 1);
       sb.box.remove();
       _refreshRemoveButtons();
-    }, editId, () => serverBoxes, bundles);
+    }, editId, () => serverBoxes, bundles,
+    isNew ? suggestEndpoint : null);
     serverBoxes.push(sb);
     serversDiv.appendChild(sb.box);
     _refreshRemoveButtons();
+  }
+  // The port's id as it stands, made unique the way ids are: against
+  // every other port's endpoints, and against the other boxes here,
+  // whose endpoints may not be saved yet. Nothing while there is no id
+  // yet - including the stand-in `port` a new port shows until it has a
+  // name or a device, which is not what it will be called.
+  function suggestEndpoint(box) {
+    const base = idInput.value.trim();
+    if (!base) return '';
+    const standIn = idInput.classList.contains('is-derived')
+      && !slugId(nameInput.value)
+      && !slugId(String(portInput.value || '').split('/').pop());
+    if (standIn) return '';
+    const taken = new Set(usedEndpoints
+      .filter(u => u.id !== editId).map(u => u.endpoint));
+    serverBoxes.forEach(b => {
+      if (b.box === box || b.boxData.proto !== 'WEBSOCKET') return;
+      const ep = b.boxData.epInput.value.trim();
+      if (ep) taken.add(ep);
+    });
+    return uniqueId(base, taken);
   }
   function _refreshRemoveButtons() {
     serverBoxes.forEach(sb => {
@@ -2329,7 +2354,8 @@ function _getDetectedAttr(device, attr) {
   return found ? (found[attr] || '') : '';
 }
 
-function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
+function _buildServerBox(
+    srv, onRemove, editId, getAllBoxes, bundles, suggestEndpoint) {
   const box = el('div', { class: 'server-box' });
   // Names the server it is about to take away, because one click used
   // to be the whole thing: a box carrying an address, a control set and
@@ -2690,7 +2716,29 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
       ? 'Port already used by ' + conflict.label : '';
   }
 
-  protoSel.onchange = () => { updateProtoFields(); recheckConflicts(); };
+  // A new server is offered an endpoint once, when it first becomes a
+  // WebSocket - a new box starts as TCP, and a new port has no id until
+  // its name is typed, so the moment it is created is too early. Taken
+  // from the id as it is then, and not kept in step with it afterwards:
+  // an endpoint is in links and devices, and renaming the port is no
+  // reason to move it.
+  let endpointOffered = !suggestEndpoint;
+  function offerEndpoint() {
+    if (endpointOffered || protoSel.value !== 'WEBSOCKET'
+        || wsEndpointInput.value.trim()) {
+      return;
+    }
+    const ep = suggestEndpoint(box);
+    if (!ep) return;
+    wsEndpointInput.value = ep;
+    endpointOffered = true;
+  }
+
+  protoSel.onchange = () => {
+    offerEndpoint();
+    updateProtoFields();
+    recheckConflicts();
+  };
   portInput.oninput = recheckConflicts;
   addrInput.oninput = recheckConflicts;
   wsEndpointInput.oninput = recheckConflicts;
