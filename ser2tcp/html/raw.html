@@ -162,12 +162,12 @@ function connect() {
     renderSignals();
     if (wsEverOpened) {
       setStatus('offline');
-      appendInfo('Disconnected (code: ' + ev.code + ')');
+      appendInfo(wsCloseText(ev) || 'Disconnected (code: ' + ev.code + ')');
     } else {
       setStatus('error');
       appendInfo('Cannot open connection');
     }
-    retry.schedule(wantConnected);
+    retry.schedule(wantConnected, ev);
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return applyMessage(ev.data);

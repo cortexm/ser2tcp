@@ -358,7 +358,7 @@ class HttpServerWrapper():
                 _uhttp_server.EVENT_COMPLETE, _uhttp_server.EVENT_REQUEST):
             self._handle_request(client)
 
-    def drop_monitor(self, port_name):
+    def drop_monitor(self, port_name, why='removed'):
         """Let go of the monitor for a port that is being taken apart.
 
         A ServerMonitor holds the SerialProxy it was built for, and
@@ -366,6 +366,10 @@ class HttpServerWrapper():
         its watchers *and* anyone connecting afterwards bound to the
         proxy that had been closed, watching a device nothing drives.
         Neither ever saw another byte, and nothing said so.
+
+        `why` is what the watchers are told: 'removed' for a deleted
+        port, 'reconfigured' for one rebuilt - whose page reconnects,
+        to a monitor built for the new proxy.
         """
         if not port_name:
             return
@@ -374,7 +378,7 @@ class HttpServerWrapper():
             return
         for client in list(monitor.connections):
             self._ws_clients.pop(client, None)
-        monitor.port_gone()
+        monitor.port_gone(why=why)
 
     def refresh_port_states(self):
         """Keep the port state current for WebSocket clients.
@@ -1625,8 +1629,9 @@ class HttpServerWrapper():
         old_proxy = self._serial_proxies[index]
         # By the old name: a rename leaves the new one free for a
         # monitor built against the proxy this is about to become.
-        self.drop_monitor(old_proxy.name)
-        old_proxy.close()
+        # Everyone on it is told it was reconfigured, not stopped.
+        self.drop_monitor(old_proxy.name, why='reconfigured')
+        old_proxy.close(why='reconfigured')
         if self._server_manager:
             self._server_manager.remove_server(old_proxy)
         try:
@@ -1665,8 +1670,8 @@ class HttpServerWrapper():
             self._error(client, 'Port not found', 404)
             return
         old_proxy = self._serial_proxies[index]
-        self.drop_monitor(old_proxy.name)
-        old_proxy.close()
+        self.drop_monitor(old_proxy.name, why='removed')
+        old_proxy.close(why='removed')
         if self._server_manager:
             self._server_manager.remove_server(old_proxy)
         port_id = ports[index].get('id')

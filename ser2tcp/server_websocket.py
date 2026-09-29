@@ -7,6 +7,21 @@ import ser2tcp.connection_control as _control
 import ser2tcp.ip_filter as _ip_filter
 import ser2tcp.server as _server
 
+# Why a server lets its clients go, as the close frame says it. The code
+# tells a page what to do and the reason what happened:
+#   1012  restarting, come back now - the server is already rebuilt
+#   4404  not there any more, do not come back - from the range the
+#         standard leaves to applications, read like the HTTP answer.
+#         1001 would have said the same as a server stopping, and a
+#         page would have gone on knocking on a port that is gone
+# Everything above this module speaks in the key; only here does it
+# become a WebSocket's code and text.
+CLOSE_REASONS = {
+    'shutdown': (1001, 'Server shutting down'),
+    'reconfigured': (1012, 'Reconfigured'),
+    'removed': (4404, 'Port removed'),
+}
+
 
 class ServerWebSocket():
     """WebSocket virtual server for one endpoint.
@@ -466,12 +481,15 @@ class ServerWebSocket():
         if changed:
             self._broadcast_json({'signals': changed})
 
-    def close_connections(self):
-        """Close all WebSocket connections"""
+    def close_connections(self, why='shutdown'):
+        """Close all WebSocket connections, saying why"""
+        if why not in CLOSE_REASONS:
+            raise ValueError('unknown reason to close: %r' % (why,))
+        code, reason = CLOSE_REASONS[why]
         while self._connections:
             client = self._connections.pop()
             try:
-                client.ws_close(1001, 'Server shutting down')
+                client.ws_close(code, reason)
             except OSError:
                 pass
         # Nobody is holding the port any more; leaving the list behind
@@ -484,9 +502,9 @@ class ServerWebSocket():
         self._reported = None
         self._serial.disconnect()
 
-    def close(self):
-        """Close all connections"""
-        self.close_connections()
+    def close(self, why='shutdown'):
+        """Close all connections; `why` is one of CLOSE_REASONS"""
+        self.close_connections(why)
 
     def _send_hello(self, client):
         """Everything a new client needs, in one frame.

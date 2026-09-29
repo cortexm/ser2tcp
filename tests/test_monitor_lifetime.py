@@ -54,11 +54,13 @@ class TestTellingTheWatchers(unittest.TestCase):
         self.monitor.port_gone()
         self.assertEqual(order, ['sent', 'closed'])
 
-    def test_the_close_says_the_server_is_going_away(self):
-        """1001, so a page can tell being hung up on from a link that
-        dropped - and not reconnect to something that is not there."""
+    def test_the_close_says_the_port_is_gone(self):
+        """4404, so a page can tell a port that is gone from a server
+        stopping or a link that dropped - and not reconnect to something
+        that is not there. It was 1001, which says the same as a server
+        shutting down, and a page could not tell them apart."""
         self.monitor.port_gone()
-        self.assertEqual(self.client.close_code, 1001)
+        self.assertEqual(self.client.close_code, 4404)
 
     def test_it_stops_watching_the_port(self):
         self.monitor.port_gone()

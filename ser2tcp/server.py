@@ -441,8 +441,13 @@ class Server():
             self._conn_by_socket.pop(con.socket(), None)
             con.close()
 
-    def close(self):
-        """Close socket and all connections"""
+    def close(self, why=None):
+        """Close socket and all connections.
+
+        `why` is taken so a proxy can close every kind of server the same
+        way, and ignored: a TCP, TELNET, TLS or Unix socket has no close
+        frame to carry a reason in. A WebSocket server says it.
+        """
         if self._socket is not None:
             self.close_connections()
             if self._selector is not None:

@@ -378,6 +378,23 @@ class TestWebSocketAfterReconfiguration(WebSocketTestCase):
             baudrate=57600 if current == 115200 else 115200)
         return config
 
+    def test_a_client_is_told_it_was_a_reconfiguration(self):
+        """1012, not 1001: the page reconnects on it, and says why the
+        terminal went away for a second rather than looking broken"""
+        conn = self.ws_connect('/ws/' + ENDPOINT)
+        status, body = self.put(
+            '/api/ports/' + self.port_id(), self.port_config())
+        self.assertEqual(status, 200, body)
+        conn.settimeout(5)
+        for _ in range(20):
+            opcode, data = conn.recv_data(control_frame=True)
+            if opcode == websocket.ABNF.OPCODE_CLOSE:
+                break
+        else:
+            self.fail('no close frame arrived')
+        self.assertEqual(int.from_bytes(data[:2], 'big'), 1012)
+        self.assertEqual(data[2:].decode(), 'Reconfigured')
+
     def test_device_output_survives_a_port_update(self):
         conn = self.ws_connect('/ws/' + ENDPOINT)
         os.write(self.master_fd, b'before')

@@ -145,7 +145,7 @@ class FailedProxy():
     def process_stale(self):
         """Nothing ages here"""
 
-    def close(self):
+    def close(self, why='shutdown'):
         """Nothing to close"""
 
 
@@ -306,9 +306,11 @@ class SerialProxy():
 
         old_servers = list(self._servers)
         # The ones that go let go of their addresses first: a changed
-        # server usually wants its own address back.
+        # server usually wants its own address back. Their clients are
+        # told it was a change, not the process stopping - a WebSocket
+        # page reconnects on that, to a server that is already back.
         for i in removed:
-            old_servers[i].close()
+            old_servers[i].close(why='reconfigured')
         built = []
         try:
             for config, i in zip(new_configs, kept):
@@ -669,10 +671,11 @@ class SerialProxy():
         if getattr(self, '_match', None):
             del self._serial_config['port']
 
-    def close(self):
-        """Close socket and all connections"""
+    def close(self, why='shutdown'):
+        """Close every server and the port; `why` is passed to the
+        servers, whose WebSocket clients are told it"""
         while self._servers:
-            self._servers.pop().close()
+            self._servers.pop().close(why=why)
         self.disconnect()
 
     def _register_serial(self):

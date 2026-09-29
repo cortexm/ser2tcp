@@ -36,9 +36,12 @@ function wsRetry(reconnect, minDelay, maxDelay) {
     },
     // From onclose. `wanted` is false where the page has a Disconnect
     // button and the user pressed it: a link somebody hung up stays
-    // hung up.
-    schedule(wanted) {
+    // hung up. `ev` is the close event: 4404 is the server saying the
+    // port was deleted, and knocking on it with backoff for as long as
+    // the tab stays open would be the old drumbeat again.
+    schedule(wanted, ev) {
       if (timer || wanted === false || !everOpened) return;
+      if (ev && ev.code === 4404) return;
       const wait = delay;
       delay = Math.min(delay * 2, max);
       timer = setTimeout(() => {
@@ -57,4 +60,16 @@ function wsRetry(reconnect, minDelay, maxDelay) {
       delay = min;
     },
   };
+}
+
+// What to tell the person when the server closed the link, or null
+// where it said nothing - a dropped network, or the page hanging up
+// itself. The server names why where it knows: 'Reconfigured' when the
+// port or its server was just changed and is already back, 'Port
+// removed', 'Server shutting down'. 1012 is its way of saying "come
+// back", and the page does, so it says that too.
+function wsCloseText(ev) {
+  if (!ev || !ev.reason) return null;
+  if (ev.code === 1012) return ev.reason + ' - reconnecting';
+  return 'Disconnected: ' + ev.reason;
 }

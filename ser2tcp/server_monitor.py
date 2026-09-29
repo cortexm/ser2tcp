@@ -5,6 +5,7 @@ import logging as _logging
 
 import ser2tcp.connection as _connection
 import ser2tcp.connection_control as _control
+import ser2tcp.server_websocket as _server_websocket
 
 
 class ServerMonitor():
@@ -147,22 +148,25 @@ class ServerMonitor():
         self._refresh_peers()
         self._refresh_signals()
 
-    def port_gone(self):
-        """The port this monitor watches is not there any more.
+    def port_gone(self, why='removed'):
+        """The port this monitor watches is not there any more - deleted,
+        or rebuilt as another SerialProxy, which this one was not built
+        for. `why` says which, in the close.
 
         Said before the close rather than left to it: a close code is
         a number, and a client that was watching a named port deserves
         to hear the name stopped meaning anything.
         """
         self._broadcast_json({'port': None})
-        self.close('Port removed')
+        self.close(why)
 
-    def close(self, reason='Server shutting down'):
-        """Close all connections"""
+    def close(self, why='shutdown'):
+        """Close all connections; `why` is one of CLOSE_REASONS"""
+        code, reason = _server_websocket.CLOSE_REASONS[why]
         while self._connections:
             client = self._connections.pop()
             try:
-                client.ws_close(1001, reason)
+                client.ws_close(code, reason)
             except OSError:
                 pass
         self._serial.remove_monitor(self)

@@ -321,3 +321,27 @@ A connection can still be lost — a slept machine, a network that went,
 a restarted server. Reconnect when the page becomes visible again
 (`visibilitychange`) rather than on a timer, and leave a connection the
 user closed on purpose closed.
+
+## When the server closes
+
+The close frame says why, and the code says what to do about it:
+
+| Code | Reason | What happened | Reconnect? |
+|------|--------|---------------|------------|
+| `1012` | `Reconfigured` | The port or this endpoint's server was changed and rebuilt | **Yes, right away** — it is already back |
+| `4404` | `Port removed` | The port was deleted | **No** — it is not coming back |
+| `1001` | `Server shutting down` | ser2tcp is stopping | Later, with backoff |
+| `1000` | `Disconnected by administrator` | Somebody pressed Disconnect on this client | Only if the user asks |
+| `1013` | `Server limit reached` / `Port limit reached` | Too many clients | Later, and expect the same answer |
+
+`4404` is from the range the standard leaves to applications, chosen
+to read like the HTTP answer for something that is not there — `1001`
+would say the same as a server stopping, and a client could not tell
+"wait" from "give up".
+
+A monitor is closed the same way when its port is rebuilt or deleted,
+and is sent `{"port": null}` just before, so a page watching a named
+port hears in words that the name stopped meaning what it did.
+
+A change that touches other servers of the port, or only the order of
+its servers, closes nothing on this one.

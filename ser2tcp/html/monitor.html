@@ -189,14 +189,14 @@ function connect() {
     renderPeers();
     if (wsEverOpened) {
       setStatus('offline');
-      appendInfo('Disconnected (code: ' + ev.code + ')');
+      appendInfo(wsCloseText(ev) || 'Disconnected (code: ' + ev.code + ')');
     } else {
       setStatus('error');
       // Not the device: a monitor connects to a configured port
       // whether or not anything is on the other end of it.
       appendInfo('Cannot open connection (no such port?)');
     }
-    retry.schedule();
+    retry.schedule(undefined, ev);
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return applyMessage(ev.data);

@@ -153,7 +153,7 @@ function connect() {
     retry.succeeded();
     setStatus('online');
   };
-  ws.onclose = () => {
+  ws.onclose = ev => {
     ws = null;
     // What we were told describes a connection we no longer have;
     // stale badges are worse than none.
@@ -163,7 +163,12 @@ function connect() {
     settable = [];
     renderSignals();
     setStatus(wsEverOpened ? 'offline' : 'error');
-    retry.schedule(wantConnected);
+    // Why, where the server said - a port changed in the editor drops
+    // the terminal for a second, and without a word that looks like a
+    // fault.
+    const why = wsCloseText(ev);
+    if (why) notice(why);
+    retry.schedule(wantConnected, ev);
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return applyMessage(ev.data);
