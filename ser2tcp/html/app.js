@@ -3264,7 +3264,7 @@ function renderSettingsList() {
     root.appendChild(el('p', { class: 'empty' }, 'No HTTP servers configured'));
   } else {
     const grid = el('div', { class: 'card-grid' });
-    servers.forEach((s, i) => grid.appendChild(renderHttpCard(s, i)));
+    servers.forEach(s => grid.appendChild(renderHttpCard(s)));
     // Moved like a port's card. Nothing redraws this list while a card
     // is in hand, so there is no card to pin and no end to redraw.
     const movable = () => isAdmin && servers.length > 1;
@@ -3299,7 +3299,7 @@ function _showHttpOrder(order) {
   renderSettingsList();
 }
 
-function renderHttpCard(srv, index) {
+function renderHttpCard(srv) {
   const id = srv.id;
   // A server that did not bind is still configured, so it still has a
   // card - red, with the reason. Leaving it out of the list made a
