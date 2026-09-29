@@ -1054,7 +1054,7 @@ function renderPortsList() {
     // back to its order if the drag was given up, and the card that was
     // held drawn afresh if its port changed meanwhile.
     portSort = makeSortable(grid, {
-      item: '.card', hold: true,
+      item: '.card', handle: '.card-title', hold: true,
       enabled: () => isAdmin,
       onDrop: _dropPort,
       onEnd: renderPortsList,
@@ -1135,13 +1135,15 @@ function _reconcilePortCards(grid, ports) {
 // HTTP server cards, the server boxes in the port editor - written once,
 // so the three cannot drift apart:
 //
-// - taken by a grip where the list has one (`handle`), otherwise by
-//   anywhere that is not itself something to click (_isCardControl)
+// - taken by its `handle` and nowhere else: the title of a card, the
+//   grip of a server box. Anywhere-that-is-not-a-control was tried on
+//   the cards, and a card is mostly things to read and copy - so a
+//   press on one was as likely to mean selecting text as moving it
 // - a mouse or pen starts after a few pixels, so a press that does not
-//   travel is still a click. A finger on an anywhere-to-drag item holds
-//   still first (`hold`), or every swipe that started on one would move
-//   it instead of scrolling; a grip takes the touch as its own and
-//   needs no hold
+//   travel is still a click - an unnamed port's title copies its path.
+//   A finger on a card's title holds still first (`hold`), or every
+//   swipe that started on one would move it instead of scrolling; a
+//   grip takes the touch as its own and needs no hold
 // - the others slide aside (_slideCards), and one still sliding is not
 //   a drop target: it is not where it will be, and aiming at it sent
 //   the dragged one back and forth
@@ -1158,19 +1160,9 @@ const DRAG_THRESHOLD = 5;     // px the mouse or pen has to travel
 const DRAG_HOLD_MS = 400;     // how long a finger has to stay put
 const DRAG_SCROLL_EDGE = 48;  // px from the edge where it scrolls
 const DRAG_SCROLL_STEP = 12;  // px per tick while it does
+const SORT_ENTER = 0.05;      // how far into another item, of its size
 
 let sortDrag = null;          // the press or drag in progress, or null
-
-// A link, a button, a field, or anything with a click of its own - a
-// copyable path, a signal badge - keeps its click; the rest of the item
-// is for dragging.
-function _isCardControl(target, card) {
-  for (let n = target; n && n !== card; n = n.parentElement) {
-    if (n.matches('a, button, input, select, textarea, label')) return true;
-    if (n.onclick) return true;
-  }
-  return false;
-}
 
 function makeSortable(list, opts) {
   list.addEventListener('pointerdown', e => {
@@ -1178,11 +1170,11 @@ function makeSortable(list, opts) {
     if (opts.enabled && !opts.enabled()) return;
     const item = e.target.closest(opts.item);
     if (!item || item.parentElement !== list) return;
-    const taken = opts.handle
-      ? e.target.closest(opts.handle)
-      : !_isCardControl(e.target, item);
-    if (!taken || list.children.length < 2) return;
-    if (opts.handle) e.preventDefault();  // no text selection from a grip
+    const handle = e.target.closest(opts.handle);
+    if (!handle || !item.contains(handle) || list.children.length < 2) {
+      return;
+    }
+    e.preventDefault();  // no text selection from what is dragged by
     sortDrag = {
       list, item, opts,
       pointerId: e.pointerId,
@@ -1246,6 +1238,18 @@ function _scrollWhileSorting() {
 // the dragged one goes. Across a row of a grid the items read left to
 // right; in a single column - a grid of one, or no grid at all - top to
 // bottom.
+// The item in hand takes the slot of the one it is moved onto, as soon
+// as the pointer is a little way into it. It used to wait for the
+// middle, and a card that stayed put under a pointer plainly on top of
+// the next one read as the drag not working.
+//
+// Except when the item in hand is the smaller of the two. After the
+// swap it fills only the far end of the slot the other one had - the
+// part it is entered by is the other one's again - so a pointer short of
+// that end is over the other item once more, and they swapped back and
+// forth for as long as it stayed there. So the way in is as deep as the
+// difference in size: past it the pointer lands on the item it holds,
+// and nothing is left to swap back.
 function _placeSorted(x, y) {
   const { list, item, opts } = sortDrag;
   const over = document.elementFromPoint(x, y);
@@ -1253,14 +1257,22 @@ function _placeSorted(x, y) {
   if (!target || target === item || target.parentElement !== list) return;
   if (target.classList.contains('sliding')) return;
   const r = target.getBoundingClientRect();
-  const oneColumn =
-    getComputedStyle(list).gridTemplateColumns.split(' ').length === 1;
-  const before = oneColumn
-    ? y < r.top + r.height / 2
-    : x < r.left + r.width / 2;
-  const ref = before ? target : target.nextSibling;
-  if (ref === item || item.nextSibling === ref) return;
-  _slideCards(list, () => list.insertBefore(item, ref));
+  const own = item.getBoundingClientRect();
+  const items = [...list.children];
+  const forward = items.indexOf(item) < items.indexOf(target);
+  // Along a row it is entered from the side, between rows from above or
+  // below - and only that edge counts: a grip sits at the right edge of
+  // a server box, so the pointer is always near that one.
+  const alongX = Math.abs(own.top - r.top) < r.height / 2;
+  const into = alongX
+    ? (forward ? x - r.left : r.right - x) / r.width
+    : (forward ? y - r.top : r.bottom - y) / r.height;
+  const smaller = alongX
+    ? 1 - own.width / r.width
+    : 1 - own.height / r.height;
+  if (into < Math.max(SORT_ENTER, smaller)) return;
+  _slideCards(list, () =>
+    list.insertBefore(item, forward ? target.nextSibling : target));
 }
 
 function _endSortDrag(commit) {
@@ -1405,8 +1417,7 @@ function _slideCards(grid, change) {
 // ===========================================================================
 // Port order: drag a card to move the port
 // ===========================================================================
-// Anywhere on a card that is not itself something to click - no handle.
-// Everything else stays live while a card is dragged (see
+// Taken by its title. Everything else stays live while a card is dragged (see
 // _reconcilePortCards), which is why the grid's sortable is kept: a
 // redraw asks it which card is in hand.
 let portSort = null;
@@ -2280,8 +2291,10 @@ function _buildPortForm(cfg, editId, bundles) {
   function _refreshRemoveButtons() {
     serverBoxes.forEach(sb => {
       sb.removeBtn.disabled = serverBoxes.length <= 1;
-      // One box has no order to change.
-      sb.grip.classList.toggle('hidden', serverBoxes.length <= 1);
+      // One box has no order to change - greyed like the bin beside it
+      // rather than hidden, so the row does not shift when a second
+      // server is added.
+      sb.grip.classList.toggle('disabled', serverBoxes.length <= 1);
     });
     serverBoxes.forEach(sb => sb.recheckConflicts && sb.recheckConflicts());
   }
@@ -2362,7 +2375,8 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
 
   // Where the box is taken to move it: six dots, the usual sign for
   // "hold here". Not a button - a press on it is the start of a drag,
-  // not a click - and hidden while the box is the only one.
+  // not a click - and greyed while the box is the only one. Last in the
+  // row, after the bin: the edge of the box is where a hand goes.
   const grip = el('span', {
     class: 'box-grip', title: 'Drag to change the order',
   });
@@ -2575,7 +2589,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const ipDiv = el('div', { class: 'subgroup' },
     ipRows, maxConnRow, tls.cnRow);
 
-  box.appendChild(formRow('Protocol', [protoSel, grip, removeBtn]));
+  box.appendChild(formRow('Protocol', [protoSel, removeBtn, grip]));
   box.appendChild(wsRows);
   box.appendChild(addrRow);      // carries the port half with it
   box.appendChild(tlsDiv);
@@ -3270,7 +3284,7 @@ function renderSettingsList() {
     const movable = () => isAdmin && servers.length > 1;
     grid.classList.toggle('movable', movable());
     makeSortable(grid, {
-      item: '.card', hold: true,
+      item: '.card', handle: '.card-title', hold: true,
       enabled: movable,
       onDrop: _dropHttp,
     });

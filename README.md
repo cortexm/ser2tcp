@@ -955,15 +955,17 @@ change anything about one, and to the process it is a server removed
 and another added.
 
 In the web UI's port editor the servers can be put in another order by
-dragging a server by the grip beside its delete icon; the new order is
+dragging a server by the grip after its delete icon; the new order is
 saved with the rest of the form, and moves no client anywhere.
 
 ### Port order
 
 Ports are listed in the order `config.json` holds them. In the web UI
-an admin changes it by dragging a port's card — anywhere that is not a
-link or a button; on a touch screen, hold the card still for a moment
-first. From a script, put one port before or after another:
+an admin changes it by dragging a port's card by its name; on a touch
+screen, hold the name still for a moment first. A card takes the place
+of the one it is dragged onto as soon as the pointer is a little way
+into it — or, onto a bigger one, far enough in to be over the card
+once it has moved. From a script, put one port before or after another:
 
 ```bash
 curl -X POST http://localhost:8080/api/ports/esp32/move \

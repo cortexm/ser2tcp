@@ -435,10 +435,13 @@ body {
   transition: box-shadow 0.15s, transform 0.05s;
   position: relative;
 }
-/* An admin moves a port or an HTTP server by dragging its card -
-   anywhere that is not itself something to click. The hand says so;
-   links, buttons and the copyable paths keep their own pointer. */
-.card-grid.movable .card { cursor: grab; }
+/* An admin moves a port or an HTTP server by dragging its card by the
+   title. Only as wide as the name, so the hand shows over the name and
+   not over the empty space up to the menu. */
+.card-grid.movable .card-title {
+  flex: 0 1 auto;
+  cursor: grab;
+}
 /* The card in hand stays in the grid, in the slot it would land in,
    and says it is the one moving. */
 .card.dragging {
@@ -454,10 +457,10 @@ body.sorting * {
   user-select: none;
   -webkit-user-select: none;
 }
-/* A finger holds a card still to pick it up, which on a phone also
-   starts a text selection and the callout menu. */
+/* A finger holds a title still to pick the card up, which on a phone
+   also starts a text selection and the callout menu. */
 @media (pointer: coarse) {
-  .card-grid.movable .card {
+  .card-grid.movable .card-title {
     -webkit-user-select: none;
     user-select: none;
     -webkit-touch-callout: none;
@@ -1153,13 +1156,16 @@ tbody tr:hover { background: var(--table-hover); }
   display: flex;
   align-items: center;
   padding: 6px 2px;
-  color: var(--text-faint);
+  color: var(--text-muted);
   cursor: grab;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
 }
-.server-box .box-grip:hover { color: var(--text-muted); }
+.server-box .box-grip:hover { color: var(--text); }
+/* The only box: nothing to reorder, greyed exactly as the bin is. */
+.server-box .box-grip.disabled { opacity: 0.3; cursor: default; }
+.server-box .box-grip.disabled:hover { color: var(--text-muted); }
 .server-box .box-grip svg { width: 16px; height: 16px; }
 /* The box in hand, as the card in hand is on the port grid. */
 .server-box.dragging {
