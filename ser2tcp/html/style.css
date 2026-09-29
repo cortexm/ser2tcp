@@ -1087,6 +1087,36 @@ tbody tr:hover { background: var(--table-hover); }
 }
 .section-title:first-child { margin-top: 0; }
 
+/* The settings that apply to the whole process, at the top of the
+   Settings tab - fields on the page itself, not in a modal. */
+.settings-form { margin-bottom: 18px; }
+.settings-form .form-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.settings-form .form-row > label { min-width: 9em; }
+.settings-form input[type="range"] {
+  width: 16em;
+  max-width: 100%;
+  accent-color: var(--accent);
+}
+/* Wide enough for "1 h 30 min (default)", so the Save button beside it
+   does not shift as the slider moves. */
+.settings-form .field-value {
+  min-width: 10em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.settings-form .field-hint { margin: 0 0 6px 0; }
+.settings-error {
+  font-size: 13px;
+  color: var(--error);
+  margin-top: 4px;
+}
+
 /* --- Server box (inside port editor) --- */
 /* What a server box insets its contents by: 12px of padding and 1px of
    border. The box is widened by exactly that much on both sides, so

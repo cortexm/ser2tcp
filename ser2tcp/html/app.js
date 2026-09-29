@@ -616,7 +616,6 @@ const routes = [
   [/^\/tokens\/new$/,              () => showTokenEditor(null)],
   [/^\/tokens\/([^/]+)\/edit$/,    m => showTokenEditor(decodeURIComponent(m[1]))],
   [/^\/settings$/,                 () => showSettings()],
-  [/^\/settings\/session$/,        () => showSessionEditor()],
   [/^\/settings\/http\/new$/,      () => showHttpEditor(null)],
   [/^\/settings\/http\/([^/]+)\/edit$/, m => showHttpEditor(
       decodeURIComponent(m[1]))],
@@ -3294,31 +3293,128 @@ function renderSettingsActions() {
   }
 }
 
+// What applies to the whole process, as fields at the top of the tab
+// rather than a card of one line with an editor behind a menu. Grouped
+// by what they are about, so what comes later has somewhere to go.
+// Save is live only while something differs from what was loaded, and
+// sends the rev it was loaded with: another admin's change in between
+// is reported, not overwritten.
+let _generalSettingsError = null;  // a refused save, shown after re-reading
+
+// Where the session-timeout slider stops: about double each time, since
+// the difference that matters between 5 and 10 minutes does not between
+// 7 and 8 hours - and nobody needs 3601 s.
+const SESSION_TIMEOUT_STEPS = [
+  300, 600, 900, 1800, 3600, 7200, 14400, 28800, 43200,
+  86400, 172800, 604800, 2592000];
+
+// 5400 -> "1 h 30 min": the two largest units it has, which is all a
+// timeout needs and all that fits beside a slider.
+function formatDuration(seconds) {
+  const units = [['d', 86400], ['h', 3600], ['min', 60], ['s', 1]];
+  const parts = [];
+  let left = seconds;
+  for (const [name, size] of units) {
+    if (left >= size && parts.length < 2) {
+      parts.push(Math.floor(left / size) + ' ' + name);
+      left %= size;
+    }
+  }
+  return parts.join(' ') || '0 s';
+}
+
+function renderGeneralSettings() {
+  const form = el('form', { class: 'settings-form' });
+  const loaded = currentSettings.session_timeout;
+  const fallback = (currentSettings.defaults || {}).session_timeout;
+  const current = loaded != null ? loaded : fallback;
+  // A value set by hand, or a default that moved, gets a stop of its
+  // own where it belongs: opening the form must not change it, and
+  // snapping it to a neighbour would.
+  const steps = [...new Set([...SESSION_TIMEOUT_STEPS, current, fallback]
+    .filter(s => s != null))].sort((a, b) => a - b);
+  const timeout = el('input', {
+    type: 'range', min: '0', max: String(steps.length - 1), step: '1',
+    value: String(Math.max(0, steps.indexOf(current))),
+  });
+  const shown = el('span', { class: 'field-value' });
+  const error = el('div', { class: 'settings-error hidden' });
+  const save = el('button', { type: 'submit', class: 'btn btn-primary' },
+    'Save');
+
+  // What the slider says, as the API takes it: the default is null, so
+  // the file keeps saying nothing and follows the default if it moves.
+  function value() {
+    const s = steps[Number(timeout.value)];
+    return s === fallback ? null : s;
+  }
+  function show() {
+    const s = steps[Number(timeout.value)];
+    shown.textContent = formatDuration(s)
+      + (s === fallback ? ' (default)' : '');
+  }
+  // Compared with where the slider started rather than with what was
+  // loaded: a default written out by hand (3600) sits on the default's
+  // stop, which reads as null, and is not worth a save of its own.
+  let start;
+  function sync() {
+    show();
+    save.disabled = value() === start;
+    error.classList.add('hidden');
+  }
+
+  form.appendChild(el('div', { class: 'section-title' }, 'Authentication'));
+  form.appendChild(el('div', { class: 'form-row' },
+    el('label', {}, 'Session timeout'),
+    timeout,
+    shown,
+    isAdmin ? save : null));
+  form.appendChild(el('div', { class: 'field-hint' },
+    'How long a sign-in lasts without being used. '
+    + 'API tokens do not expire.'));
+  form.appendChild(error);
+  show();
+
+  if (!isAdmin) {
+    timeout.disabled = true;
+    return form;
+  }
+  start = value();
+  timeout.oninput = sync;
+  save.disabled = true;
+  form.onsubmit = e => {
+    e.preventDefault();
+    const v = value();
+    save.disabled = true;
+    api('PUT', '/api/settings',
+      { session_timeout: v, rev: currentSettings.rev })
+      .then(res => {
+        currentSettings.session_timeout = res.session_timeout;
+        currentSettings.rev = res.rev;
+        renderSettingsList();
+      })
+      .catch(e => {
+        if (e === 'unauthorized') return;
+        // Read again whatever the refusal: after a conflict the form
+        // would otherwise carry a rev that can never be saved against,
+        // and it should show what the other admin set. The reason
+        // outlives the redraw that shows it.
+        _generalSettingsError = String(e);
+        loadSettings().catch(logFailure);
+      });
+  };
+  if (_generalSettingsError) {
+    error.textContent = _generalSettingsError;
+    error.classList.remove('hidden');
+    _generalSettingsError = null;
+  }
+  return form;
+}
+
 function renderSettingsList() {
   const root = $('settings-content');
   root.innerHTML = '';
-
-  // Session card
-  const sessionCard = el('div', { class: 'card card-online' });
-  const sessionHeader = el('div', { class: 'card-header-row' },
-    el('span', { class: 'card-title' }, 'Session'));
-  if (isAdmin) {
-    sessionHeader.appendChild(kebabMenu([
-      { label: 'Edit', cls: 'btn-accent',
-        onclick: () => navigate('/settings/session') },
-    ]));
-  }
-  sessionCard.appendChild(sessionHeader);
-  const t = currentSettings.session_timeout;
-  sessionCard.appendChild(el('div', { class: 'card-meta' },
-    el('div', { class: 'card-meta-row' },
-      el('span', { class: 'card-meta-label' }, 'Timeout'),
-      el('span', {}, t != null ? t + ' s' : 'default'))));
-
-  root.appendChild(el('div', { class: 'section-title' }, 'Session'));
-  const sessGrid = el('div', { class: 'card-grid' });
-  sessGrid.appendChild(sessionCard);
-  root.appendChild(sessGrid);
+  root.appendChild(renderGeneralSettings());
 
   const servers = currentSettings.http || [];
   root.appendChild(el('div', { class: 'section-title' }, 'HTTP servers'));
@@ -3404,37 +3500,6 @@ function renderHttpCard(srv) {
   }
   card.appendChild(meta);
   return card;
-}
-
-function showSessionEditor() {
-  if (!isAdmin) { navigate('/settings'); return; }
-  if (!currentSettings) {
-    whenLoaded(loadSettings, showSessionEditor);
-    return;
-  }
-  const t = currentSettings.session_timeout;
-  const input = el('input', {
-    type: 'number', min: '0', placeholder: '3600',
-    value: t || '',
-  });
-  openModal({
-    title: 'Session settings',
-    body: el('div', {}, formGroup('Timeout (seconds)', input,
-      { hint: 'Leave empty for default (3600 s).' })),
-    footer: [
-      btn('Cancel', '', () => backToList()),
-      btn('Save', 'btn-primary', () => {
-        const val = input.value.trim();
-        const num = val === '' ? null : parseInt(val);
-        if (val !== '' && (isNaN(num) || num < 0)) {
-          return modalError('Invalid timeout value');
-        }
-        api('PUT', '/api/settings', { session_timeout: num })
-          .then(() => navigate('/settings'))
-          .catch(e => modalError(String(e)));
-      }),
-    ],
-  });
 }
 
 // Build the bundle dropdown + mTLS toggle used by both HTTP and port TLS

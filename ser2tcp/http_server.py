@@ -88,6 +88,11 @@ class HttpServerWrapper():
     # before a quiet connection would be closed.
     WS_PING_INTERVAL = _uhttp_server.KEEP_ALIVE_TIMEOUT / 3.0
 
+    # Root-level keys the settings form edits, over one rev. A new one
+    # goes here, and into _handle_api_settings_update() for its check
+    # and wherever it has to take effect.
+    GENERAL_SETTINGS = ('session_timeout',)
+
     @staticmethod
     def ws_keep_alive_timeout():
         """How long uhttp lets a WebSocket go quiet before closing it.
@@ -1834,7 +1839,11 @@ class HttpServerWrapper():
     def _ensure_auth(self):
         """Create auth if not exists, return SessionManager"""
         if not self._auth:
-            self._auth = _http_auth.SessionManager({})
+            # A timeout set before there was anybody to sign in is still
+            # the timeout once there is.
+            self._auth = _http_auth.SessionManager({
+                'session_timeout': self._configuration.get('session_timeout'),
+            })
         return self._auth
 
     def _save_auth_config(self):
@@ -1851,8 +1860,12 @@ class HttpServerWrapper():
             self._configuration['tokens'] = auth_config['tokens']
         elif 'tokens' in self._configuration:
             del self._configuration['tokens']
+        # Absent stays absent: the default written out as 3600 would be a
+        # choice nobody made.
         if 'session_timeout' in auth_config:
             self._configuration['session_timeout'] = auth_config['session_timeout']
+        else:
+            self._configuration.pop('session_timeout', None)
         # Remove old auth from http configs (migration)
         http_configs = self._configuration.get('http', [])
         if isinstance(http_configs, dict):
@@ -2052,16 +2065,32 @@ class HttpServerWrapper():
                 return entry.get('name') or '(unnamed)'
         return None
 
+    def _general_settings(self):
+        """The settings that apply to the whole process, as one entry.
+
+        What the settings form edits, and what its `rev` is taken over -
+        the HTTP servers carry a rev each and are not part of it, so a
+        change to one of them is no conflict for a form that does not
+        show it.
+        """
+        return {key: self._configuration.get(key)
+                for key in self.GENERAL_SETTINGS}
+
     def _handle_api_settings_get(self, client):
         """Return settings (http servers, session_timeout)"""
-        settings = {
+        general = self._general_settings()
+        settings = dict(
+            general,
+            rev=_config_ids.entry_rev(general),
+            # What an unset one means, so the form can say it without a
+            # copy of the number that could drift from this one.
+            defaults={
+                'session_timeout': _http_auth.DEFAULT_SESSION_TIMEOUT},
             # Normalised to a list: the config allows a single object,
             # and a client that got one had to special-case it or
             # conclude there were no servers at all.
-            'http': [self._describe_http(index, srv)
-                     for index, srv in enumerate(self._http_list())],
-            'session_timeout': self._configuration.get('session_timeout'),
-        }
+            http=[self._describe_http(index, srv)
+                  for index, srv in enumerate(self._http_list())])
         client.respond(settings)
 
     def _describe_http(self, index, entry):
@@ -2085,18 +2114,39 @@ class HttpServerWrapper():
         if not isinstance(data, dict):
             self._error(client, f'Expected JSON object, got {type(data).__name__}', 400)
             return
-        if 'session_timeout' in data:
-            val = data['session_timeout']
-            if val is not None and (not isinstance(val, int) or val < 0):
-                self._error(client, 'session_timeout must be positive integer or null', 400)
-                return
-            if val is None:
-                self._configuration.pop('session_timeout', None)
-            else:
-                self._configuration['session_timeout'] = val
-        self._save_config()
-        self._log.info("Settings updated")
-        client.respond({'ok': True})
+        # A key nobody reads would be answered with "ok" and do nothing.
+        unknown = sorted(set(data) - set(self.GENERAL_SETTINGS) - {'rev'})
+        if unknown:
+            self._error(
+                client, 'Unknown setting: ' + ', '.join(unknown), 400)
+            return
+        error = self._validate_auth_fields(
+            data, {'session_timeout': 'timeout'})
+        if error:
+            self._error(client, error, 400)
+            return
+        general = self._general_settings()
+        if 'rev' in data and data['rev'] != _config_ids.entry_rev(general):
+            self._error(
+                client, 'Settings were changed since they were read', 409)
+            return
+        changed = {key: data[key] for key in self.GENERAL_SETTINGS
+                   if key in data and data[key] != general[key]}
+        if changed:
+            if 'session_timeout' in changed:
+                # Where it takes effect - the config is only where it
+                # is kept, and changing that alone waited for a restart.
+                if self._auth:
+                    self._auth.set_default_timeout(changed['session_timeout'])
+            for key, value in changed.items():
+                if value is None:
+                    self._configuration.pop(key, None)
+                else:
+                    self._configuration[key] = value
+            self._save_config()
+            self._log.info("Settings updated: %s", ', '.join(sorted(changed)))
+        general = self._general_settings()
+        client.respond(dict(general, rev=_config_ids.entry_rev(general)))
 
     @staticmethod
     def _validate_trusted_proxies(config):

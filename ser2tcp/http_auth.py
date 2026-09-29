@@ -93,10 +93,8 @@ class SessionManager():
         self._users = {}
         self._tokens = {}
         self._sessions = {}
-        if 'session_timeout' in config:
-            _check_timeout(config['session_timeout'], 'config')
-        self._default_timeout = config.get(
-            'session_timeout', DEFAULT_SESSION_TIMEOUT)
+        self._configured_timeout = None
+        self.set_default_timeout(config.get('session_timeout'))
         for index, user in enumerate(config.get('users', [])):
             self._users[self._check_user(user, index)] = user
         for index, token_cfg in enumerate(config.get('tokens', [])):
@@ -172,6 +170,30 @@ class SessionManager():
             'expires': _time.time() + self._timeout_for(user),
         }
         return token
+
+    @property
+    def configured_timeout(self):
+        """The session timeout the config sets, or None for the default"""
+        return self._configured_timeout
+
+    def set_default_timeout(self, value):
+        """Set the session timeout, None meaning the default.
+
+        Kept apart from the default so that "not set" survives being
+        written back: saving 3600 into the file would be a choice nobody
+        made. Sessions already running keep the expiry they were given
+        and take the new one when they are next used.
+        Raises ValueError on a value that is not a usable timeout.
+        """
+        if value is not None:
+            _check_timeout(value, 'config')
+        self._configured_timeout = value
+
+    @property
+    def _default_timeout(self):
+        if self._configured_timeout is None:
+            return DEFAULT_SESSION_TIMEOUT
+        return self._configured_timeout
 
     def _timeout_for(self, user):
         """How long this user's sessions last between requests"""
@@ -361,7 +383,9 @@ class SessionManager():
 
     def get_auth_config(self):
         """Return auth config for persistence"""
-        config = {'session_timeout': self._default_timeout}
+        config = {}
+        if self._configured_timeout is not None:
+            config['session_timeout'] = self._configured_timeout
         if self._users:
             config['users'] = list(self._users.values())
         if self._tokens:

@@ -749,7 +749,9 @@ With authentication (configured at root level, shared across all HTTP servers):
 
 - `users`: login credentials with optional `admin` flag and per-user `session_timeout`
 - `tokens`: permanent API tokens for automation (no expiration)
-- `session_timeout`: global default session timeout in seconds
+- `session_timeout`: global default session timeout in seconds (3600
+  when absent). Set in the web UI at the top of **Settings**; a new
+  value holds from the next request of every session, no restart
 - First user added (via CLI or web UI) is automatically admin
 - Cannot delete last admin (user or token) — at least one admin must exist
 
@@ -826,7 +828,7 @@ With IP filtering:
 | GET | `/api/status` | yes | Runtime status (serial ports, servers, connections) |
 | GET | `/api/detect` | yes | Available serial ports with USB/device attributes |
 | GET | `/api/signals` | yes | Signal states for all ports |
-| GET | `/api/settings` | yes | Get settings (http servers, session_timeout) |
+| GET | `/api/settings` | yes | Get settings (session_timeout + `rev` + `defaults`, http servers) |
 | GET | `/api/ports/<id>` | admin | Port configuration (what to edit) |
 | DELETE | `/api/ports/<id>/connections/<conn_id>` | yes | Disconnect client |
 | POST | `/api/ports` | admin | Add new port configuration |
@@ -842,7 +844,7 @@ With IP filtering:
 | POST | `/api/tokens` | admin | Add API token |
 | PUT | `/api/tokens/<token>` | admin | Update API token |
 | DELETE | `/api/tokens/<token>` | admin | Delete API token |
-| PUT | `/api/settings` | admin | Update session_timeout |
+| PUT | `/api/settings` | admin | Update session_timeout (`null` = default; optional `rev` → 409) |
 | POST | `/api/settings/http` | admin | Add HTTP server |
 | PUT | `/api/settings/http/<id>` | admin | Update HTTP server |
 | DELETE | `/api/settings/http/<id>` | admin | Delete HTTP server |
@@ -914,7 +916,10 @@ would not work: a client hanging up moves every connection after it.
 ### Concurrent edits
 
 `GET /api/ports/<id>` and `GET /api/settings` report a `rev` alongside
-each entry — a fingerprint of what that entry currently says. Send it
+each entry — a fingerprint of what that entry currently says. In
+`/api/settings` that is one for each HTTP server and one at the top
+level for the settings themselves (`session_timeout`), which
+`PUT /api/settings` takes. Send it
 back in the `PUT` and the change is refused with **409** if the entry
 was saved by somebody else in between:
 
