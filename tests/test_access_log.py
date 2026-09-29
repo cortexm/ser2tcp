@@ -120,6 +120,69 @@ class TestAFailedLoginIsBannable(AccessLogTestCase):
         self.assertFalse(self._lines(output, 'WARNING'), output)
 
 
+class TestATokenInThePathIsNotLogged(AccessLogTestCase):
+    """An API token is addressed by itself: /api/tokens/<token>.
+
+    That path went into the request line and into _error(), so every
+    edit or delete of a token wrote the credential into the log - and a
+    404 wrote whatever somebody guessed.
+    """
+
+    ADMIN = 'admin-credential-7f3a'
+    OTHER = 'reader-credential-91c2'
+    auth_config = {'tokens': [
+        {'token': ADMIN, 'name': 'automation', 'admin': True},
+        {'token': OTHER, 'name': 'monitoring', 'admin': False},
+    ]}
+
+    def _as_admin(self, method, path, data=None):
+        return self._request(
+            method, path, data,
+            headers={'authorization': 'Bearer ' + self.ADMIN})
+
+    def assertNoSecret(self, output, secret):
+        for line in output:
+            self.assertNotIn(secret, line)
+        self.assertNotIn(secret[:8], '\n'.join(output))
+
+    def test_an_update(self):
+        client, output = self._as_admin(
+            'PUT', '/api/tokens/' + self.OTHER, {'name': 'grafana'})
+        self.assertEqual(client.respond_status, 200, client.responded)
+        self.assertNoSecret(output, self.OTHER)
+
+    def test_a_delete(self):
+        client, output = self._as_admin('DELETE', '/api/tokens/' + self.OTHER)
+        self.assertEqual(client.respond_status, 200, client.responded)
+        self.assertNoSecret(output, self.OTHER)
+
+    def test_a_guess(self):
+        """A 404 would otherwise log what was tried - maybe a real token
+        with a typo in it"""
+        guess = 'reader-credential-91c3'
+        client, output = self._as_admin('DELETE', '/api/tokens/' + guess)
+        self.assertEqual(client.respond_status, 404)
+        self.assertNoSecret(output, guess)
+
+    def test_a_refusal(self):
+        client, output = self._request(
+            'DELETE', '/api/tokens/' + self.OTHER,
+            headers={'authorization': 'Bearer ' + self.OTHER})
+        self.assertEqual(client.respond_status, 403)
+        self.assertNoSecret(output, self.OTHER)
+
+    def test_the_lines_still_say_what_was_asked(self):
+        _client, output = self._as_admin('DELETE', '/api/tokens/nope')
+        self.assertIn('DELETE /api/tokens/', self._lines(output, 'INFO')[0])
+        self.assertIn('/api/tokens/', self._lines(output, 'WARNING')[0])
+
+    def test_a_change_names_the_token_by_its_name(self):
+        _client, output = self._as_admin(
+            'DELETE', '/api/tokens/' + self.OTHER)
+        self.assertTrue(
+            any('monitoring' in line for line in output), output)
+
+
 class TestASuccessSaysNothingExtra(AccessLogTestCase):
 
     def test_no_second_line_for_a_success(self):

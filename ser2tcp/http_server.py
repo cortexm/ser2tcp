@@ -29,6 +29,9 @@ HTML_DIR = _pathlib.Path(__file__).parent / 'html'
 # configured - they must never find their way back into config.json.
 _REPORTED_ONLY_KEYS = ('id', 'rev', 'error')
 
+# Followed by a credential - see HttpServerWrapper._logged_path().
+_TOKEN_PATH = '/api/tokens/'
+
 # Defined in connection.py, where the monitor can reach it too.
 connection_id = _connection.connection_id
 
@@ -577,9 +580,22 @@ class HttpServerWrapper():
         log carries failures and nothing else.
         """
         report = self._log.error if status >= 500 else self._log.warning
-        report("%s %s %s from %s: %s", status, client.method, client.path,
-               self._client_ip(client), error)
+        report("%s %s %s from %s: %s", status, client.method,
+               self._logged_path(client), self._client_ip(client), error)
         client.respond({'error': error}, status=status)
+
+    @staticmethod
+    def _logged_path(client):
+        """The path as the log may print it.
+
+        An API token is addressed by itself, /api/tokens/<token>, so the
+        path of every edit or delete carries a credential - and a 404
+        whatever somebody guessed. The rest of it stays readable.
+        """
+        path = client.path
+        if path.startswith(_TOKEN_PATH):
+            return _TOKEN_PATH + '***'
+        return path
 
     def _require_auth(self, client):
         """Check authentication, return user info or None (sends 401)"""
@@ -606,8 +622,8 @@ class HttpServerWrapper():
         _error().
         """
         if self._log.isEnabledFor(_logging.INFO):
-            self._log.info("%s %s from %s", client.method, client.path,
-                           self._client_ip(client))
+            self._log.info("%s %s from %s", client.method,
+                           self._logged_path(client), self._client_ip(client))
         # Login endpoint - no auth required
         if client.method == 'POST' and client.path == '/api/login':
             self._handle_api_login(client)
@@ -672,8 +688,8 @@ class HttpServerWrapper():
                 self._handle_api_tokens_add(client, user)
             else:
                 self._error(client, 'Method not allowed', 405)
-        elif client.path.startswith('/api/tokens/'):
-            token_id = client.path[len('/api/tokens/'):]
+        elif client.path.startswith(_TOKEN_PATH):
+            token_id = client.path[len(_TOKEN_PATH):]
             if client.method == 'PUT':
                 self._handle_api_tokens_update(client, user, token_id)
             elif client.method == 'DELETE':
@@ -1994,6 +2010,7 @@ class HttpServerWrapper():
             kwargs['name'] = data['name']
         if 'admin' in data:
             kwargs['admin'] = bool(data['admin'])
+        name = self._token_name(token)
         result = self._auth.update_token(token, **kwargs)
         if result is False:
             self._error(client, 'Token not found', 404)
@@ -2002,7 +2019,7 @@ class HttpServerWrapper():
             self._error(client, result, 400)
             return
         self._save_auth_config()
-        self._log.info("Token updated: %s", token[:8] + '...')
+        self._log.info("Token updated: %s", name)
         client.respond({'ok': True})
 
     def _handle_api_tokens_delete(self, client, user, token):
@@ -2012,6 +2029,7 @@ class HttpServerWrapper():
             return
         if not self._require_admin(client, user):
             return
+        name = self._token_name(token)
         result = self._auth.delete_token(token)
         if result is False:
             self._error(client, 'Token not found', 404)
@@ -2020,8 +2038,19 @@ class HttpServerWrapper():
             self._error(client, result, 400)
             return
         self._save_auth_config()
-        self._log.info("Token deleted: %s", token[:8] + '...')
+        self._log.info("Token deleted: %s", name)
         client.respond({'ok': True})
+
+    def _token_name(self, token):
+        """What the log calls a token: its name, never any of the token.
+
+        Eight characters of it used to be printed, which is most of a
+        short hand-written one.
+        """
+        for entry in self._auth.list_tokens():
+            if entry.get('token') == token:
+                return entry.get('name') or '(unnamed)'
+        return None
 
     def _handle_api_settings_get(self, client):
         """Return settings (http servers, session_timeout)"""

@@ -85,6 +85,11 @@ I: POST /api/login from 192.168.1.5
 W: 401 POST /api/login from 192.168.1.5: Login failed: admin
 ```
 
+An API token is addressed by itself (`/api/tokens/<token>`), so in those
+lines its path is printed as `/api/tokens/***`, and a token that was
+changed or deleted is named by its `name`. A reverse proxy in front of
+ser2tcp keeps its own access log, which will still carry the full path.
+
 That second line is deliberately self-contained, so log-watching tools
 can act on it without stitching lines together. A fail2ban filter for
 failed logins is just:
