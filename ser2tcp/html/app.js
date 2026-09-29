@@ -1351,10 +1351,140 @@ window.addEventListener('pointercancel', e => {
 window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && portDrag && portDrag.active) _endPortDrag(false);
 });
-// Once a finger is dragging a card, it must not scroll the page too.
+// Once a finger is dragging a card or a box, it must not scroll the
+// page too.
 window.addEventListener('touchmove', e => {
-  if (portDrag && portDrag.active) e.preventDefault();
+  if ((portDrag && portDrag.active) || (boxDrag && boxDrag.active)) {
+    e.preventDefault();
+  }
 }, { passive: false });
+
+// ===========================================================================
+// Server order in the port editor: drag a server box by its grip
+// ===========================================================================
+// The card's gesture - a few pixels with a mouse, a hold with a finger,
+// the others sliding aside - but taken by a grip rather than anywhere.
+// A box is mostly fields, and a click into the gaps between them is part
+// of filling a form in; anywhere-to-drag there moved boxes nobody meant
+// to move.
+//
+// Nothing is sent on the drop. The order is part of the form, and Save
+// writes it like everything else there - and a save that only reorders
+// servers rebuilds none of them.
+let boxDrag = null;
+const BOX_SCROLL_EDGE = 48;   // px from the edge where the modal scrolls
+const BOX_SCROLL_STEP = 12;   // px per tick while it does
+
+function _enableBoxDrag(list, onReorder) {
+  list.addEventListener('pointerdown', e => {
+    if (boxDrag || e.button !== 0 || !e.target.closest('.box-grip')) return;
+    const box = e.target.closest('.server-box');
+    if (!box || box.parentElement !== list || list.children.length < 2) {
+      return;
+    }
+    // No text selection from the grip. A finger needs no hold here, as
+    // it does on a card: the grip is for nothing but this, and its
+    // touch-action keeps the page from taking the touch as a scroll.
+    e.preventDefault();
+    boxDrag = {
+      list, box, onReorder,
+      pointerId: e.pointerId,
+      x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY,
+      active: false,
+      scrollTimer: null,
+      scroller: box.closest('.modal-overlay') || document.scrollingElement,
+      // What Escape puts back.
+      before: [...list.children],
+    };
+  });
+}
+
+function _startBoxDrag() {
+  const drag = boxDrag;
+  if (!drag) return;
+  drag.active = true;
+  drag.box.classList.add('dragging');
+  document.body.classList.add('port-dragging');
+  // Near the top or bottom of the dialog it scrolls, so a box can be
+  // taken past what fits on the screen - on a timer, since holding the
+  // pointer still at the edge sends no events to scroll on.
+  drag.scrollTimer = setInterval(_scrollWhileDragging, 16);
+}
+
+function _scrollWhileDragging() {
+  const drag = boxDrag;
+  if (!drag || !drag.active) return;
+  const s = drag.scroller;
+  const r = s === document.scrollingElement
+    ? { top: 0, bottom: window.innerHeight }
+    : s.getBoundingClientRect();
+  const before = s.scrollTop;
+  if (drag.lastY < r.top + BOX_SCROLL_EDGE) s.scrollTop -= BOX_SCROLL_STEP;
+  else if (drag.lastY > r.bottom - BOX_SCROLL_EDGE) {
+    s.scrollTop += BOX_SCROLL_STEP;
+  }
+  // What is under a still pointer changed with the scroll.
+  if (s.scrollTop !== before) _placeDraggedBox(drag.lastX, drag.lastY);
+}
+
+// The boxes stand in one column, so the half of a box the pointer is
+// over says which side of it the dragged one goes.
+function _placeDraggedBox(x, y) {
+  const { list, box } = boxDrag;
+  const over = document.elementFromPoint(x, y);
+  const target = over && over.closest('.server-box');
+  if (!target || target === box || target.parentElement !== list) return;
+  if (target.classList.contains('sliding')) return;
+  const r = target.getBoundingClientRect();
+  const ref = y < r.top + r.height / 2 ? target : target.nextSibling;
+  if (ref === box || box.nextSibling === ref) return;
+  _slideCards(list, () => list.insertBefore(box, ref));
+}
+
+function _endBoxDrag(commit) {
+  const drag = boxDrag;
+  if (!drag) return;
+  clearInterval(drag.scrollTimer);
+  boxDrag = null;
+  drag.box.classList.remove('dragging');
+  document.body.classList.remove('port-dragging');
+  if (!drag.active) return;
+  _swallowNextClick();
+  if (!commit) {
+    _slideCards(drag.list,
+      () => drag.before.forEach(b => drag.list.appendChild(b)));
+    return;
+  }
+  drag.onReorder([...drag.list.children]);
+}
+
+window.addEventListener('pointermove', e => {
+  const drag = boxDrag;
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  drag.lastX = e.clientX;
+  drag.lastY = e.clientY;
+  if (!drag.active) {
+    if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD) {
+      return;
+    }
+    _startBoxDrag();
+  }
+  _placeDraggedBox(e.clientX, e.clientY);
+});
+window.addEventListener('pointerup', e => {
+  if (boxDrag && e.pointerId === boxDrag.pointerId) _endBoxDrag(true);
+});
+window.addEventListener('pointercancel', e => {
+  if (boxDrag && e.pointerId === boxDrag.pointerId) _endBoxDrag(false);
+});
+// Captured, and kept from going further: Escape also closes the editor,
+// and a drag given up is not a form given up with everything typed in.
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && boxDrag && boxDrag.active) {
+    e.stopPropagation();
+    _endBoxDrag(false);
+  }
+}, true);
 
 // The token a terminal link needs where this browser has no session to
 // fall back on, so that an endpoint with a token opens from here like
@@ -2157,6 +2287,11 @@ function _buildPortForm(cfg, editId, bundles) {
   root.appendChild(serversDiv);
 
   const serverBoxes = [];
+  // The list the form collects from follows the order on screen: Save
+  // sends the servers in it, and that is the order they are kept in.
+  _enableBoxDrag(serversDiv, boxes => {
+    serverBoxes.sort((a, b) => boxes.indexOf(a.box) - boxes.indexOf(b.box));
+  });
   function addServerBox(initSrv) {
     const editorPorts = new Set();
     serverBoxes.forEach(b => {
@@ -2182,6 +2317,8 @@ function _buildPortForm(cfg, editId, bundles) {
   function _refreshRemoveButtons() {
     serverBoxes.forEach(sb => {
       sb.removeBtn.disabled = serverBoxes.length <= 1;
+      // One box has no order to change.
+      sb.grip.classList.toggle('hidden', serverBoxes.length <= 1);
     });
     serverBoxes.forEach(sb => sb.recheckConflicts && sb.recheckConflicts());
   }
@@ -2259,6 +2396,19 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
     + '<path d="M10 11v6M14 11v6"/></svg>';
   // Goes in the protocol row further down rather than floating in the
   // corner, where it sat on top of the select's own arrow.
+
+  // Where the box is taken to move it: six dots, the usual sign for
+  // "hold here". Not a button - a press on it is the start of a drag,
+  // not a click - and hidden while the box is the only one.
+  const grip = el('span', {
+    class: 'box-grip', title: 'Drag to change the order',
+  });
+  grip.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"'
+    + ' aria-hidden="true">'
+    + '<circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/>'
+    + '<circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/>'
+    + '<circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/>'
+    + '</svg>';
 
   const protoSel = el('select');
   PROTOCOLS.forEach(p => {
@@ -2403,6 +2553,13 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const pollOptions = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
   const curPoll = srv.control
     ? Math.round((srv.control.poll_interval || 0.1) * 1000) : 100;
+  // A configured interval the list does not offer - 250 ms, written by
+  // hand - joins it. Missing, nothing was selected, the select showed
+  // its first entry, and a Save wrote 1 ms without anybody choosing it.
+  if (!pollOptions.includes(curPoll)) {
+    pollOptions.push(curPoll);
+    pollOptions.sort((a, b) => a - b);
+  }
   pollOptions.forEach(ms => {
     const o = el('option', { value: String(ms) },
       ms < 1000 ? ms + ' ms' : (ms / 1000) + ' s');
@@ -2455,7 +2612,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   const ipDiv = el('div', { class: 'subgroup' },
     ipRows, maxConnRow, tls.cnRow);
 
-  box.appendChild(formRow('Protocol', [protoSel, removeBtn]));
+  box.appendChild(formRow('Protocol', [protoSel, grip, removeBtn]));
   box.appendChild(wsRows);
   box.appendChild(addrRow);      // carries the port half with it
   box.appendChild(tlsDiv);
@@ -2564,7 +2721,7 @@ function _buildServerBox(srv, onRemove, editId, getAllBoxes, bundles) {
   recheckConflicts();
 
   return {
-    box, removeBtn, recheckConflicts,
+    box, removeBtn, grip, recheckConflicts,
     boxData: {
       get proto() { return protoSel.value; },
       protoSel, addrInput, portInput, epInput: wsEndpointInput,
@@ -2703,9 +2860,58 @@ function _collectPortConfig(form) {
       }
       if (mc > 0) srv.max_connections = mc;
     }
-    cfg.servers.push(srv);
+    // A server that still means what it meant goes back exactly as it
+    // was written. The form spells things its own way - a default made
+    // explicit, the reported lines in its order, a false or a zero left
+    // out - and the server now rebuilds only a server whose JSON
+    // changed, so a re-spelling alone dropped its clients on a Save that
+    // changed nothing.
+    const original = d.original;
+    const sameMeaning = Object.keys(original).length
+      && _serverMeaning(srv) === _serverMeaning(original);
+    cfg.servers.push(sameMeaning ? JSON.parse(JSON.stringify(original)) : srv);
   });
   return cfg;
+}
+
+// A server's configuration reduced to what it means, as a string two
+// spellings of the same thing agree on: defaults dropped, a false or an
+// empty value treated as absent, the reported lines as a set, and the
+// old data flag read as the access it stands for.
+const DEFAULT_POLL_INTERVAL = 0.1;  // as connection_control.py has it
+
+function _serverMeaning(server) {
+  const s = JSON.parse(JSON.stringify(server));
+  s.protocol = String(s.protocol || '').toLowerCase();
+  if ('data' in s) {
+    if (s.data === false && !('access' in s)) s.access = 'none';
+    delete s.data;
+  }
+  if (s.access === 'rw') delete s.access;
+  if (s.control) {
+    const c = s.control;
+    ['rts', 'dtr'].forEach(k => { if (!c[k]) delete c[k]; });
+    if (Array.isArray(c.signals)) {
+      c.signals = [...new Set(c.signals)].sort();
+      if (!c.signals.length) delete c.signals;
+    }
+    if (c.poll_interval === DEFAULT_POLL_INTERVAL) delete c.poll_interval;
+  }
+  if (s.tls) {
+    if (!s.tls.require_client_cert) delete s.tls.require_client_cert;
+    if (Array.isArray(s.tls.allow_client_cn) && !s.tls.allow_client_cn.length) {
+      delete s.tls.allow_client_cn;
+    }
+  }
+  ['max_connections'].forEach(k => { if (!s[k]) delete s[k]; });
+  ['allow', 'deny'].forEach(k => {
+    if (Array.isArray(s[k]) && !s[k].length) delete s[k];
+  });
+  const sorted = v => Array.isArray(v) ? v.map(sorted)
+    : (v && typeof v === 'object')
+      ? Object.fromEntries(Object.keys(v).sort().map(k => [k, sorted(v[k])]))
+      : v;
+  return JSON.stringify(sorted(s));
 }
 
 function _savePortFromForm(form, id) {

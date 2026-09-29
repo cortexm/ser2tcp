@@ -1144,6 +1144,29 @@ tbody tr:hover { background: var(--table-hover); }
 .server-box .server-remove:hover { color: var(--error); }
 .server-box .server-remove:disabled { opacity: 0.3; cursor: default; }
 .server-box .server-remove svg { width: 16px; height: 16px; }
+/* The grip a server box is dragged by, beside its delete icon. It takes
+   the touch as its own - no scrolling from here - since a finger on it
+   can only mean one thing. */
+.server-box .box-grip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 6px 2px;
+  color: var(--text-faint);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.server-box .box-grip:hover { color: var(--text-muted); }
+.server-box .box-grip svg { width: 16px; height: 16px; }
+/* The box in hand, as the card in hand is on the port grid. */
+.server-box.dragging {
+  opacity: 0.6;
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  box-shadow: 0 6px 18px var(--shadow);
+}
 
 /* Two attributes to a row; each one drops to its own line when the
    modal is too narrow to hold the pair. */

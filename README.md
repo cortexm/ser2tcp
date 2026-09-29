@@ -948,6 +948,10 @@ A server is matched by its configuration, not by an id or a position:
 change anything about one, and to the process it is a server removed
 and another added.
 
+In the web UI's port editor the servers can be put in another order by
+dragging a server by the grip beside its delete icon; the new order is
+saved with the rest of the form, and moves no client anywhere.
+
 ### Port order
 
 Ports are listed in the order `config.json` holds them. In the web UI
