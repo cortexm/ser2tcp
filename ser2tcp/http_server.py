@@ -1545,6 +1545,46 @@ class HttpServerWrapper():
         self._log.info("Port added: %s", data.get('id'))
         client.respond({'ok': True, 'id': data.get('id')}, status=201)
 
+    @staticmethod
+    def _same_apart_from_servers(old, new):
+        """Whether two versions of a port differ in their servers alone.
+
+        Everything else is the port itself - its serial settings, name
+        and id, limit, USB match - and a change there rebuilds it whole.
+        """
+        # The id is compared: a rename moves it, and that is the port's.
+        # rev and error describe an entry and are not part of it.
+        def rest(entry):
+            return _json.dumps(
+                {k: v for k, v in entry.items()
+                 if k not in ('servers', 'rev', 'error')},
+                sort_keys=True)
+        return rest(old) == rest(new)
+
+    def _update_port_servers(self, client, index, data):
+        """Save a port whose servers changed and nothing else.
+
+        The editor sends the whole port, as always; the running port is
+        made to match it one server at a time. A save that changes
+        nothing - the editor opened and saved again - writes nothing and
+        drops nobody, where it used to rebuild the port and every client
+        on it.
+        """
+        ports = self._get_ports_config()
+        proxy = self._serial_proxies[index]
+        try:
+            changed = proxy.reconcile_servers(
+                ports[index].get('servers', []), data.get('servers', []))
+        except (ValueError, KeyError, OSError, _server.ConfigError) as err:
+            # What ran before is running again; the file is left alone.
+            self._error(client, str(err), 400)
+            return
+        if changed:
+            ports[index] = data
+            self._save_config()
+            self._log.info("Port updated: %s (servers only)", data['id'])
+        client.respond({'ok': True})
+
     def _handle_api_ports_update(self, client, user, index):
         """Update port configuration"""
         if not self._require_admin(client, user):
@@ -1572,6 +1612,15 @@ class HttpServerWrapper():
             data, ports[index].get('id'))
         if id_error:
             self._error(client, id_error, 400)
+            return
+        # Nothing about the port itself changed - only its servers, or
+        # nothing at all: those are reconciled in place, and every
+        # server that is the same as before keeps running with its
+        # clients. A port that never started has nothing running to
+        # keep, and the save is its chance to start.
+        if not self._serial_proxies[index].error \
+                and self._same_apart_from_servers(ports[index], data):
+            self._update_port_servers(client, index, data)
             return
         old_proxy = self._serial_proxies[index]
         # By the old name: a rename leaves the new one free for a

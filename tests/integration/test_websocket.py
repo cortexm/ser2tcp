@@ -362,8 +362,21 @@ class TestWebSocketAfterReconfiguration(WebSocketTestCase):
     """
 
     def port_config(self):
-        """The port entry as currently configured, for a PUT"""
-        return self.build_config()['ports'][0]
+        """The port entry, changed where it forces a rebuild, for a PUT.
+
+        These tests are about a port rebuilt through the API, and only a
+        change to the port itself does that now: servers are reconciled
+        in place, and a save that changes nothing changes nothing. The
+        baud rate flips on every call, so each PUT rebuilds the port
+        however many have run before in this shared process.
+        """
+        config = self.build_config()['ports'][0]
+        stored = self.get('/api/ports/' + self.port_id())[1]
+        current = stored['serial'].get('baudrate')
+        config['serial'] = dict(
+            config['serial'],
+            baudrate=57600 if current == 115200 else 115200)
+        return config
 
     def test_device_output_survives_a_port_update(self):
         conn = self.ws_connect('/ws/' + ENDPOINT)

@@ -930,6 +930,24 @@ that writes a whole entry without reading it first keeps working. It is
 derived from the content rather than stored, so it never appears in
 `config.json` and an entry edited by hand is covered as well.
 
+### What a save disconnects
+
+`PUT /api/ports/<id>` takes the whole port, and changes only what is
+different:
+
+- **Only servers changed** — a server that is the same as before keeps
+  running, and its clients stay connected. A server that was changed,
+  added or removed is the only one rebuilt. A new order of the servers
+  moves them and nothing else.
+- **Nothing changed** — nothing happens; saving the editor without
+  touching anything no longer drops anybody.
+- **The port itself changed** — serial settings, name, limit, USB
+  match — the whole port is rebuilt, and every client on it reconnects.
+
+A server is matched by its configuration, not by an id or a position:
+change anything about one, and to the process it is a server removed
+and another added.
+
 ### Port order
 
 Ports are listed in the order `config.json` holds them. In the web UI

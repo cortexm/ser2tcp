@@ -1,6 +1,7 @@
 """Serial proxy - serial port management and USB device matching"""
 
 import fnmatch as _fnmatch
+import json as _json
 import logging as _logging
 import os as _os
 import selectors as _selectors
@@ -245,8 +246,11 @@ class SerialProxy():
             self._log.info("Serial: %s %d", name, baudrate)
         else:
             self._log.info("Serial: %s", name)
+        # Kept for servers built later, when a save changes only some.
+        self._server_log = log
         try:
-            self._build_servers(config['servers'], log)
+            for server_config in config['servers']:
+                self._servers.append(self._build_server(server_config))
         except Exception:
             # __init__ is about to raise, so the caller never sees this
             # object and has nothing to close - but the servers built so
@@ -256,20 +260,89 @@ class SerialProxy():
             self.close()
             raise
 
-    def _build_servers(self, server_configs, log):
-        """Create every server this port serves"""
-        for server_config in server_configs:
-            proto = server_config.get('protocol', '').upper()
-            if proto == 'WEBSOCKET':
-                self._servers.append(
-                    _server_websocket.ServerWebSocket(
-                        server_config, self, log))
-            else:
-                self._servers.append(
-                    _server.Server(
-                        server_config, self, log,
-                        certs_dir=self._certs_dir,
-                        selector=self._selector))
+    def _build_server(self, server_config):
+        """Create one server of this port, registered in the loop"""
+        proto = server_config.get('protocol', '').upper()
+        if proto == 'WEBSOCKET':
+            return _server_websocket.ServerWebSocket(
+                server_config, self, self._server_log)
+        return _server.Server(
+            server_config, self, self._server_log,
+            certs_dir=self._certs_dir,
+            selector=self._selector)
+
+    def reconcile_servers(self, old_configs, new_configs):
+        """Make the running servers match new_configs, touching only what
+        changed. True if anything did.
+
+        old_configs[i] is what self._servers[i] was built from - the two
+        are paired by position, as the ports are with the config. A
+        server whose configuration is in both lists keeps running, and
+        keeps its clients. One that changed is a server removed and a
+        server added: with no id there is no telling them apart, and no
+        need to, since its clients go either way. A new order only moves
+        the servers.
+        """
+        def key(config):
+            # Configuration, not spelling: key order means nothing.
+            return _json.dumps(config, sort_keys=True)
+
+        unused = {}
+        for i, config in enumerate(old_configs):
+            unused.setdefault(key(config), []).append(i)
+        # For every new entry, the running server built from the same
+        # configuration, or None where there is none.
+        kept = []
+        for config in new_configs:
+            same = unused.get(key(config))
+            kept.append(same.pop(0) if same else None)
+        removed = [i for left in unused.values() for i in left]
+
+        if not removed and None not in kept:
+            if kept == list(range(len(self._servers))):
+                return False
+            self._servers[:] = [self._servers[i] for i in kept]
+            return True
+
+        old_servers = list(self._servers)
+        # The ones that go let go of their addresses first: a changed
+        # server usually wants its own address back.
+        for i in removed:
+            old_servers[i].close()
+        built = []
+        try:
+            for config, i in zip(new_configs, kept):
+                if i is None:
+                    built.append(self._build_server(config))
+        except Exception:
+            for server in built:
+                server.close()
+            self._restore_servers(old_servers, removed, old_configs)
+            raise
+        fresh = iter(built)
+        self._servers[:] = [
+            old_servers[i] if i is not None else next(fresh)
+            for i in kept]
+        # Whoever held the device open may have left with their server.
+        self.disconnect()
+        return True
+
+    def _restore_servers(self, old_servers, removed, old_configs):
+        """Put back what ran before a reconcile that could not finish.
+
+        The kept servers never stopped; the removed ones are built again
+        from what they were. One that cannot be - its address taken in
+        the meantime - stays in its place closed, so the pairing with the
+        configuration holds, and says so.
+        """
+        for i in removed:
+            try:
+                old_servers[i] = self._build_server(old_configs[i])
+            except Exception as err:
+                self._log.error(
+                    "Server %s could not be put back: %s",
+                    old_configs[i], err)
+        self._servers[:] = old_servers
 
     def _init_serial_config(self, config):
         """Initialize serial configuration - validate and convert enum values"""

@@ -518,6 +518,77 @@ class TestPortReconfiguration(SerialPtyTestCase):
         self.update_port()
         self.assert_data_flows(b'unchanged')
 
+    def test_data_flows_after_the_port_itself_is_rebuilt(self):
+        """The changes above are to a server, and are reconciled in place
+        now. A change to the port - its baud rate - still rebuilds it
+        whole, through _create_proxy: the path the selector was once
+        forgotten on, which is what this class was written for."""
+        config = self.port_config()
+        config['serial']['baudrate'] = 57600
+        status, body = self.put('/api/ports/' + self.port_id(), config)
+        self.assertEqual(status, 200, body)
+        self.assert_data_flows(b'rebuilt1')
+        # Back as the other tests expect it: they share this process.
+        status, body = self.put(
+            '/api/ports/' + self.port_id(), self.port_config())
+        self.assertEqual(status, 200, body)
+        self.assert_data_flows(b'rebuilt2')
+
+
+class TestSavingOnlyServers(SerialPtyTestCase):
+    """A save that changes a port's servers and nothing else rebuilds
+    only those servers: a client on one that stayed the same does not
+    notice. It used to be the whole port, and every client on it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.other_port = base.free_port()
+        super().setUpClass()
+
+    @classmethod
+    def port_servers(cls):
+        return [
+            {'protocol': 'tcp', 'address': '127.0.0.1',
+             'port': cls.tcp_port},
+            {'protocol': 'tcp', 'address': '127.0.0.1',
+             'port': cls.other_port},
+        ]
+
+    def save(self, servers):
+        config = self.build_config()['ports'][0]
+        config['servers'] = servers
+        status, body = self.put('/api/ports/' + self.port_id(), config)
+        self.assertEqual(status, 200, body)
+
+    def assert_still_connected(self, sock, marker):
+        os.write(self.master_fd, marker)
+        self.assertEqual(read_client(sock, len(marker)), marker)
+        sock.sendall(marker)
+        self.assertEqual(read_device(self.master_fd, len(marker)), marker)
+
+    def test_a_client_stays_when_another_server_changes(self):
+        sock = self.connect(self.tcp_port)
+        first, second = self.port_servers()
+        self.save([first, dict(second, access='ro')])
+        self.assert_still_connected(sock, b'kept1')
+        self.save([first, second])
+        self.assert_still_connected(sock, b'kept2')
+
+    def test_a_client_stays_when_the_servers_are_reordered(self):
+        sock = self.connect(self.tcp_port)
+        first, second = self.port_servers()
+        self.save([second, first])
+        self.assert_still_connected(sock, b'kept3')
+        servers = self.get('/api/status')[1]['ports'][0]['servers']
+        self.assertEqual(
+            [s['port'] for s in servers], [self.other_port, self.tcp_port])
+        self.save([first, second])
+
+    def test_a_client_stays_when_nothing_changed(self):
+        sock = self.connect(self.tcp_port)
+        self.save(self.port_servers())
+        self.assert_still_connected(sock, b'kept4')
+
 
 if __name__ == '__main__':
     unittest.main()
