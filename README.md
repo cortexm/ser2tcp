@@ -841,6 +841,7 @@ With IP filtering:
 | POST | `/api/settings/http` | admin | Add HTTP server |
 | PUT | `/api/settings/http/<id>` | admin | Update HTTP server |
 | DELETE | `/api/settings/http/<id>` | admin | Delete HTTP server |
+| POST | `/api/settings/http/<id>/move` | admin | Put the HTTP server `{"before": id}` or `{"after": id}` another one |
 | GET | `/api/certs` | yes | List certificate bundles |
 | POST | `/api/certs` | admin | Create empty bundle |
 | GET | `/api/certs/<bundle>` | yes | Bundle detail (files, mtime, symlink target) |
@@ -970,6 +971,10 @@ port in the meantime, where "to position 2" would not. If the port you
 anchored to has been deleted since, the answer is **409**. Only the
 order changes — no port is closed or rebuilt, and clients stay
 connected. The answer carries the new order as a list of ids.
+
+HTTP servers are put in order the same way: by dragging their cards
+under **Settings**, or with `POST /api/settings/http/<id>/move` and the
+same `before` / `after`. None of them stops listening.
 
 ### When something will not start
 

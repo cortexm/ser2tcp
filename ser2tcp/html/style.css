@@ -435,9 +435,9 @@ body {
   transition: box-shadow 0.15s, transform 0.05s;
   position: relative;
 }
-/* An admin moves a port by dragging its card - anywhere that is not
-   itself something to click. The hand says so; links, buttons and the
-   copyable paths keep their own pointer. */
+/* An admin moves a port or an HTTP server by dragging its card -
+   anywhere that is not itself something to click. The hand says so;
+   links, buttons and the copyable paths keep their own pointer. */
 .card-grid.movable .card { cursor: grab; }
 /* The card in hand stays in the grid, in the slot it would land in,
    and says it is the one moving. */
@@ -447,8 +447,9 @@ body {
   outline-offset: -2px;
   box-shadow: 0 6px 18px var(--shadow);
 }
-body.port-dragging,
-body.port-dragging * {
+/* While anything is being put in order (makeSortable). */
+body.sorting,
+body.sorting * {
   cursor: grabbing !important;
   user-select: none;
   -webkit-user-select: none;

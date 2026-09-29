@@ -707,16 +707,25 @@ class HttpServerWrapper():
             else:
                 self._error(client, 'Method not allowed', 405)
         elif client.path.startswith('/api/settings/http/'):
-            index = self._http_index(client.path[len('/api/settings/http/'):])
+            parts = client.path[len('/api/settings/http/'):].split('/')
+            index = self._http_index(parts[0])
             if index is None:
                 self._error(client, 'HTTP server not found', 404)
                 return
-            if client.method == 'PUT':
-                self._handle_api_http_update(client, user, index)
-            elif client.method == 'DELETE':
-                self._handle_api_http_delete(client, user, index)
+            if len(parts) == 1:
+                if client.method == 'PUT':
+                    self._handle_api_http_update(client, user, index)
+                elif client.method == 'DELETE':
+                    self._handle_api_http_delete(client, user, index)
+                else:
+                    self._error(client, 'Method not allowed', 405)
+            elif len(parts) == 2 and parts[1] == 'move':
+                if client.method == 'POST':
+                    self._handle_api_http_move(client, user, index)
+                else:
+                    self._error(client, 'Method not allowed', 405)
             else:
-                self._error(client, 'Method not allowed', 405)
+                self._error(client, 'Not found', 404)
         else:
             self._error(client, 'Not found', 404)
 
@@ -1287,12 +1296,12 @@ class HttpServerWrapper():
             self._error(client, 'Not found', 404)
 
     @staticmethod
-    def _move_anchor(data):
+    def _move_anchor(data, noun):
         """Read {"before": id} or {"after": id}: (anchor, place, error).
 
         Exactly one of the two, and an id - never a number. A position
         or a step count means something else once another tab has added
-        or moved a port; "before esp32" still means what was meant.
+        or moved an entry; "before esp32" still means what was meant.
         """
         if not isinstance(data, dict):
             return None, None, 'Expected {"before": id} or {"after": id}'
@@ -1302,47 +1311,64 @@ class HttpServerWrapper():
         place = given[0]
         anchor = data[place]
         if not isinstance(anchor, str) or not anchor:
-            return None, None, '"%s" takes the id of another port' % place
+            return None, None, '"%s" takes the id of another %s' % (
+                place, noun)
         return anchor, place, None
 
-    def _handle_api_ports_move(self, client, user, index):
-        """Put a port before or after another one.
+    def _move_entry(self, client, user, index, entries, runtime, find,
+            noun):
+        """Put entries[index] before or after another entry, by id.
 
-        Only the order changes: the same entries and the same running
-        proxies, in a new sequence - nothing is closed or rebuilt, so
-        clients stay connected. Both lists are reordered together,
-        because they are paired by position and everything below the
-        id lookup relies on it.
+        Ports and HTTP servers are the same shape - a list in the config
+        and a list of running objects paired with it by position - and
+        move the same way. Only the order changes: the same entries and
+        the same running objects in a new sequence, nothing closed or
+        rebuilt, so every client stays connected. Both lists move
+        together, because everything below the id lookup relies on the
+        pairing. `find` resolves an id to a position; `noun` is what the
+        messages call the thing.
         """
         if not self._require_admin(client, user):
             return
-        anchor, place, error = self._move_anchor(client.data)
+        anchor, place, error = self._move_anchor(client.data, noun)
         if error:
             self._error(client, error, 400)
             return
-        ports = self._get_ports_config()
-        target = self._port_index(anchor)
+        target = find(anchor)
         if target is None:
             # Most likely deleted in another tab since this one looked.
             self._error(
                 client,
-                'Port "%s" is not there any more - reload the list and '
-                'move it again' % anchor, 409)
+                '%s "%s" is not there any more - reload the list and '
+                'move it again' % (noun[0].upper() + noun[1:], anchor), 409)
             return
-        order = list(range(len(ports)))
+        order = list(range(len(entries)))
         order.pop(index)
         at = order.index(target) if target != index else index
         if target != index and place == 'after':
             at += 1
         order.insert(at, index)
         if order != sorted(order):
-            ports[:] = [ports[i] for i in order]
-            self._serial_proxies[:] = [self._serial_proxies[i] for i in order]
+            entries[:] = [entries[i] for i in order]
+            runtime[:] = [runtime[i] for i in order]
             self._save_config()
             self._log.info(
-                "Port moved: %s %s %s", ports[at].get('id'), place, anchor)
+                "%s moved: %s %s %s", noun[0].upper() + noun[1:],
+                entries[at].get('id'), place, anchor)
         client.respond({
-            'ok': True, 'order': [p.get('id') for p in ports]})
+            'ok': True, 'order': [e.get('id') for e in entries]})
+
+    def _handle_api_ports_move(self, client, user, index):
+        """Put a port before or after another one"""
+        self._move_entry(
+            client, user, index, self._get_ports_config(),
+            self._serial_proxies, self._port_index, 'port')
+
+    def _handle_api_http_move(self, client, user, index):
+        """Put an HTTP server before or after another one"""
+        self._move_entry(
+            client, user, index, self._http_list(), self._servers,
+            self._http_index, 'HTTP server')
 
     def _handle_api_ports_get(self, client, index):
         """Return one port's stored configuration.

@@ -1031,9 +1031,10 @@ function renderPortsActions() {
 function renderPortsList() {
   // The port in hand was deleted meanwhile, in another tab: there is
   // nothing left to move. Ending the drag draws the list again.
-  if (portDrag && portsStatus
-      && !portsStatus.ports.some(p => p.id === portDrag.id)) {
-    _endPortDrag(false);
+  const inHand = portSort && portSort.item;
+  if (inHand && portsStatus
+      && !portsStatus.ports.some(p => p.id === inHand.dataset.portId)) {
+    portSort.cancel();
     return;
   }
   const root = $('ports-content');
@@ -1049,7 +1050,15 @@ function renderPortsList() {
     root.innerHTML = '';
     grid = el('div', { class: 'card-grid' });
     // Once per grid; it asks whether this is an admin at every press.
-    _enablePortDrag(grid);
+    // After every press the list is drawn from what the server said:
+    // back to its order if the drag was given up, and the card that was
+    // held drawn afresh if its port changed meanwhile.
+    portSort = makeSortable(grid, {
+      item: '.card', hold: true,
+      enabled: () => isAdmin,
+      onDrop: _dropPort,
+      onEnd: renderPortsList,
+    });
     root.appendChild(grid);
   }
   grid.classList.toggle('movable', !!isAdmin);
@@ -1079,11 +1088,14 @@ function _reconcilePortCards(grid, ports) {
     [!!isAdmin, detectedPorts, [..._endpointTokens]]);
   const existing = new Map(
     [...grid.children].map(c => [c.dataset.portId, c]));
-  const held = portDrag && existing.get(portDrag.id);
+  const inHand = portSort && portSort.item;
+  const held = inHand && existing.get(inHand.dataset.portId) === inHand
+    ? inHand : null;
   if (held) {
+    const heldId = held.dataset.portId;
     const slot = [...grid.children].indexOf(held);
-    const others = ports.filter(p => p.id !== portDrag.id);
-    const mine = ports.find(p => p.id === portDrag.id);
+    const others = ports.filter(p => p.id !== heldId);
+    const mine = ports.find(p => p.id === heldId);
     ports = others.slice(0, slot).concat([mine], others.slice(slot));
   }
   const wanted = ports.map(p => {
@@ -1117,27 +1129,40 @@ function _reconcilePortCards(grid, ports) {
 }
 
 // ===========================================================================
-// Port order: drag a card to move the port
+// Putting things in order by dragging them
 // ===========================================================================
-// Anywhere on a card that is not itself something to click - no handle.
-// The mouse starts a drag after a few pixels, so a press that does not
-// move is still a click. A finger has to hold still first, or every
-// swipe that happened to start on a card would move it instead of
-// scrolling the page.
+// One gesture for every list that has an order - the port cards, the
+// HTTP server cards, the server boxes in the port editor - written once,
+// so the three cannot drift apart:
 //
-// The cards change places while the pointer moves, and what the grid
-// shows at the release is the order sent: the dragged card's new
-// neighbour is its anchor, since the API takes {before: id} or
-// {after: id} and never a position. The answer carries the order and
-// the stream sends every tab a snapshot anyway, so when nobody else
-// has touched the list in between, neither changes anything on screen.
+// - taken by a grip where the list has one (`handle`), otherwise by
+//   anywhere that is not itself something to click (_isCardControl)
+// - a mouse or pen starts after a few pixels, so a press that does not
+//   travel is still a click. A finger on an anywhere-to-drag item holds
+//   still first (`hold`), or every swipe that started on one would move
+//   it instead of scrolling; a grip takes the touch as its own and
+//   needs no hold
+// - the others slide aside (_slideCards), and one still sliding is not
+//   a drop target: it is not where it will be, and aiming at it sent
+//   the dragged one back and forth
+// - near the top or bottom of what scrolls, it scrolls - on a timer,
+//   since a pointer held still at the edge sends no events to scroll on
+// - Escape puts everything back and goes no further: in a dialog it
+//   would close the dialog too, and a drag given up is not a form given
+//   up with everything typed in it
+//
+// What the new order means is the caller's: `onDrop(items, item)` gets
+// the items as they stand after a drag, and `onEnd()` runs after every
+// press, dragged or not.
 const DRAG_THRESHOLD = 5;     // px the mouse or pen has to travel
 const DRAG_HOLD_MS = 400;     // how long a finger has to stay put
+const DRAG_SCROLL_EDGE = 48;  // px from the edge where it scrolls
+const DRAG_SCROLL_STEP = 12;  // px per tick while it does
 
-let portDrag = null;          // the press or drag in progress, or null
+let sortDrag = null;          // the press or drag in progress, or null
 
 // A link, a button, a field, or anything with a click of its own - a
-// copyable path, a signal badge - keeps its click; the rest of the card
+// copyable path, a signal badge - keeps its click; the rest of the item
 // is for dragging.
 function _isCardControl(target, card) {
   for (let n = target; n && n !== card; n = n.parentElement) {
@@ -1147,61 +1172,175 @@ function _isCardControl(target, card) {
   return false;
 }
 
-function _enablePortDrag(grid) {
-  grid.addEventListener('pointerdown', e => {
-    if (!isAdmin || portDrag || e.button !== 0) return;
-    const card = e.target.closest('.card');
-    if (!card || !grid.contains(card) || _isCardControl(e.target, card)) {
-      return;
-    }
-    portDrag = {
-      grid, card,
-      id: card.dataset.portId,
+function makeSortable(list, opts) {
+  list.addEventListener('pointerdown', e => {
+    if (sortDrag || e.button !== 0) return;
+    if (opts.enabled && !opts.enabled()) return;
+    const item = e.target.closest(opts.item);
+    if (!item || item.parentElement !== list) return;
+    const taken = opts.handle
+      ? e.target.closest(opts.handle)
+      : !_isCardControl(e.target, item);
+    if (!taken || list.children.length < 2) return;
+    if (opts.handle) e.preventDefault();  // no text selection from a grip
+    sortDrag = {
+      list, item, opts,
       pointerId: e.pointerId,
-      x: e.clientX,
-      y: e.clientY,
-      touch: e.pointerType === 'touch',
+      x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY,
+      hold: !!opts.hold && e.pointerType === 'touch',
       active: false,
       timer: null,
+      scrollTimer: null,
+      scroller: (opts.scroller && opts.scroller(item))
+        || document.scrollingElement,
+      // What Escape puts back.
+      before: [...list.children],
     };
-    if (portDrag.touch) {
-      portDrag.timer = setTimeout(_startPortDrag, DRAG_HOLD_MS);
+    if (sortDrag.hold) {
+      sortDrag.timer = setTimeout(_startSortDrag, DRAG_HOLD_MS);
     }
   });
+  return {
+    // The item pressed or in hand, or null - what a list redrawn under
+    // a drag has to leave where it is.
+    get item() {
+      return sortDrag && sortDrag.list === list ? sortDrag.item : null;
+    },
+    // Give the drag up from outside: the thing in hand was deleted.
+    cancel() {
+      if (sortDrag && sortDrag.list === list) _endSortDrag(false);
+    },
+  };
 }
 
-function _startPortDrag() {
-  const drag = portDrag;
+function _startSortDrag() {
+  const drag = sortDrag;
   if (!drag) return;
   clearTimeout(drag.timer);
   drag.active = true;
-  drag.card.classList.add('dragging');
-  document.body.classList.add('port-dragging');
+  drag.item.classList.add('dragging');
+  document.body.classList.add('sorting');
   // A mouse that travelled the threshold has begun selecting text.
   const sel = window.getSelection && window.getSelection();
   if (sel) sel.removeAllRanges();
+  drag.scrollTimer = setInterval(_scrollWhileSorting, 16);
 }
 
-// Which card the pointer is over, and which half of it, decides where
-// the dragged one goes. Across a row the cards read left to right; in a
-// single column, top to bottom.
-function _placeDraggedCard(x, y) {
-  const { grid, card } = portDrag;
+function _scrollWhileSorting() {
+  const drag = sortDrag;
+  if (!drag || !drag.active) return;
+  const s = drag.scroller;
+  const r = s === document.scrollingElement
+    ? { top: 0, bottom: window.innerHeight }
+    : s.getBoundingClientRect();
+  const before = s.scrollTop;
+  if (drag.lastY < r.top + DRAG_SCROLL_EDGE) s.scrollTop -= DRAG_SCROLL_STEP;
+  else if (drag.lastY > r.bottom - DRAG_SCROLL_EDGE) {
+    s.scrollTop += DRAG_SCROLL_STEP;
+  }
+  // What is under a still pointer changed with the scroll.
+  if (s.scrollTop !== before) _placeSorted(drag.lastX, drag.lastY);
+}
+
+// Which item the pointer is over, and which half of it, decides where
+// the dragged one goes. Across a row of a grid the items read left to
+// right; in a single column - a grid of one, or no grid at all - top to
+// bottom.
+function _placeSorted(x, y) {
+  const { list, item, opts } = sortDrag;
   const over = document.elementFromPoint(x, y);
-  const target = over && over.closest('.card');
-  if (!target || target === card || !grid.contains(target)) return;
-  // A card still sliding to its new place is not where it will be; the
-  // pointer over it now would send the dragged one back and forth.
+  const target = over && over.closest(opts.item);
+  if (!target || target === item || target.parentElement !== list) return;
   if (target.classList.contains('sliding')) return;
   const r = target.getBoundingClientRect();
   const oneColumn =
-    getComputedStyle(grid).gridTemplateColumns.split(' ').length === 1;
+    getComputedStyle(list).gridTemplateColumns.split(' ').length === 1;
   const before = oneColumn
     ? y < r.top + r.height / 2
     : x < r.left + r.width / 2;
   const ref = before ? target : target.nextSibling;
-  if (ref === card || card.nextSibling === ref) return;
-  _slideCards(grid, () => grid.insertBefore(card, ref));
+  if (ref === item || item.nextSibling === ref) return;
+  _slideCards(list, () => list.insertBefore(item, ref));
+}
+
+function _endSortDrag(commit) {
+  const drag = sortDrag;
+  if (!drag) return;
+  clearTimeout(drag.timer);
+  clearInterval(drag.scrollTimer);
+  // Before the callbacks: a list redrawn from them must not see this
+  // item as still in hand.
+  sortDrag = null;
+  drag.item.classList.remove('dragging');
+  document.body.classList.remove('sorting');
+  if (drag.active) {
+    _swallowNextClick();
+    if (commit) {
+      drag.opts.onDrop([...drag.list.children], drag.item);
+    } else {
+      // Back as it was - but only what is still there: the list may
+      // have lost an item while this lasted, and gained one at the end.
+      const now = new Set(drag.list.children);
+      _slideCards(drag.list, () => drag.before
+        .filter(b => now.has(b))
+        .forEach(b => drag.list.appendChild(b)));
+    }
+  }
+  if (drag.opts.onEnd) drag.opts.onEnd();
+}
+
+window.addEventListener('pointermove', e => {
+  const drag = sortDrag;
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  drag.lastX = e.clientX;
+  drag.lastY = e.clientY;
+  if (!drag.active) {
+    const moved = Math.hypot(e.clientX - drag.x, e.clientY - drag.y);
+    if (drag.hold) {
+      // Moved before the hold was up: that is a scroll, not a drag.
+      if (moved > DRAG_THRESHOLD * 2) _endSortDrag(false);
+      return;
+    }
+    if (moved < DRAG_THRESHOLD) return;
+    _startSortDrag();
+  }
+  _placeSorted(e.clientX, e.clientY);
+});
+window.addEventListener('pointerup', e => {
+  if (sortDrag && e.pointerId === sortDrag.pointerId) _endSortDrag(true);
+});
+window.addEventListener('pointercancel', e => {
+  if (sortDrag && e.pointerId === sortDrag.pointerId) _endSortDrag(false);
+});
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && sortDrag && sortDrag.active) {
+    e.stopPropagation();
+    _endSortDrag(false);
+  }
+}, true);
+// Once a finger is dragging, it must not scroll the page too.
+window.addEventListener('touchmove', e => {
+  if (sortDrag && sortDrag.active) e.preventDefault();
+}, { passive: false });
+
+// Send a drop as a move: the dragged item's new neighbour is its anchor,
+// since the API takes {before: id} or {after: id} and never a position.
+// `show(order)` puts an order on screen: the dropped one at once, then
+// the server's - somebody may have moved or added something in between
+// - or `previous` again if the move was refused.
+function _sendMove(url, order, id, show, previous) {
+  const at = order.indexOf(id);
+  const anchor = at + 1 < order.length
+    ? { before: order[at + 1] }
+    : { after: order[at - 1] };
+  show(order);
+  api('POST', url, anchor)
+    .then(res => { if (res && res.order) show(res.order); })
+    .catch(e => {
+      if (e === 'unauthorized') return;
+      alert(e);
+      show(previous);
+    });
 }
 
 // Move cards so that the ones pushed aside can be seen going where they
@@ -1263,49 +1402,26 @@ function _slideCards(grid, change) {
   });
 }
 
-function _endPortDrag(commit) {
-  const drag = portDrag;
-  if (!drag) return;
-  clearTimeout(drag.timer);
-  portDrag = null;
-  drag.card.classList.remove('dragging');
-  document.body.classList.remove('port-dragging');
-  if (drag.active) _swallowNextClick();
+// ===========================================================================
+// Port order: drag a card to move the port
+// ===========================================================================
+// Anywhere on a card that is not itself something to click - no handle.
+// Everything else stays live while a card is dragged (see
+// _reconcilePortCards), which is why the grid's sortable is kept: a
+// redraw asks it which card is in hand.
+let portSort = null;
 
-  // Compared with the order the server last sent, not the one at the
-  // press: the list may have changed in another tab while this lasted.
-  const order = [...drag.grid.children].map(c => c.dataset.portId);
+// Compared with the order the server last sent, not the one at the
+// press: the list may have changed in another tab while it lasted.
+function _dropPort(cards, card) {
+  const order = cards.map(c => c.dataset.portId);
   const serverOrder = portsStatus ? portsStatus.ports.map(p => p.id) : [];
-  const moved = drag.active && commit && order.length > 1
-    && order.join('\n') !== serverOrder.join('\n');
-  if (!moved) {
-    // Back to the server's order, and the card in hand drawn afresh if
-    // its port changed while it was held.
-    renderPortsList();
+  if (order.length < 2 || order.join('\n') === serverOrder.join('\n')) {
     return;
   }
-  const at = order.indexOf(drag.id);
-  const anchor = at + 1 < order.length
-    ? { before: order[at + 1] }
-    : { after: order[at - 1] };
-  // Shown as dropped until the server says otherwise.
-  _applyPortOrder(order);
-  renderPortsList();
-  api('POST', '/api/ports/' + encodeURIComponent(drag.id) + '/move', anchor)
-    .then(res => {
-      // Somebody else may have moved or added a port in between; the
-      // server's order is the one that stands.
-      if (res && res.order) {
-        _applyPortOrder(res.order);
-        renderPortsList();
-      }
-    })
-    .catch(e => {
-      if (e === 'unauthorized') return;
-      alert(e);
-      _applyPortOrder(serverOrder);
-      renderPortsList();
-    });
+  const id = card.dataset.portId;
+  _sendMove('/api/ports/' + encodeURIComponent(id) + '/move', order, id,
+    o => { _applyPortOrder(o); renderPortsList(); }, serverOrder);
 }
 
 // Reorder the ports held for the stream to a list of ids. A port not in
@@ -1326,165 +1442,6 @@ function _swallowNextClick() {
   setTimeout(
     () => window.removeEventListener('click', stop, { capture: true }), 0);
 }
-
-window.addEventListener('pointermove', e => {
-  const drag = portDrag;
-  if (!drag || e.pointerId !== drag.pointerId) return;
-  if (!drag.active) {
-    const moved = Math.hypot(e.clientX - drag.x, e.clientY - drag.y);
-    if (drag.touch) {
-      // Moved before the hold was up: that is a scroll, not a drag.
-      if (moved > DRAG_THRESHOLD * 2) _endPortDrag(false);
-      return;
-    }
-    if (moved < DRAG_THRESHOLD) return;
-    _startPortDrag();
-  }
-  _placeDraggedCard(e.clientX, e.clientY);
-});
-window.addEventListener('pointerup', e => {
-  if (portDrag && e.pointerId === portDrag.pointerId) _endPortDrag(true);
-});
-window.addEventListener('pointercancel', e => {
-  if (portDrag && e.pointerId === portDrag.pointerId) _endPortDrag(false);
-});
-window.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && portDrag && portDrag.active) _endPortDrag(false);
-});
-// Once a finger is dragging a card or a box, it must not scroll the
-// page too.
-window.addEventListener('touchmove', e => {
-  if ((portDrag && portDrag.active) || (boxDrag && boxDrag.active)) {
-    e.preventDefault();
-  }
-}, { passive: false });
-
-// ===========================================================================
-// Server order in the port editor: drag a server box by its grip
-// ===========================================================================
-// The card's gesture - a few pixels with a mouse, a hold with a finger,
-// the others sliding aside - but taken by a grip rather than anywhere.
-// A box is mostly fields, and a click into the gaps between them is part
-// of filling a form in; anywhere-to-drag there moved boxes nobody meant
-// to move.
-//
-// Nothing is sent on the drop. The order is part of the form, and Save
-// writes it like everything else there - and a save that only reorders
-// servers rebuilds none of them.
-let boxDrag = null;
-const BOX_SCROLL_EDGE = 48;   // px from the edge where the modal scrolls
-const BOX_SCROLL_STEP = 12;   // px per tick while it does
-
-function _enableBoxDrag(list, onReorder) {
-  list.addEventListener('pointerdown', e => {
-    if (boxDrag || e.button !== 0 || !e.target.closest('.box-grip')) return;
-    const box = e.target.closest('.server-box');
-    if (!box || box.parentElement !== list || list.children.length < 2) {
-      return;
-    }
-    // No text selection from the grip. A finger needs no hold here, as
-    // it does on a card: the grip is for nothing but this, and its
-    // touch-action keeps the page from taking the touch as a scroll.
-    e.preventDefault();
-    boxDrag = {
-      list, box, onReorder,
-      pointerId: e.pointerId,
-      x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY,
-      active: false,
-      scrollTimer: null,
-      scroller: box.closest('.modal-overlay') || document.scrollingElement,
-      // What Escape puts back.
-      before: [...list.children],
-    };
-  });
-}
-
-function _startBoxDrag() {
-  const drag = boxDrag;
-  if (!drag) return;
-  drag.active = true;
-  drag.box.classList.add('dragging');
-  document.body.classList.add('port-dragging');
-  // Near the top or bottom of the dialog it scrolls, so a box can be
-  // taken past what fits on the screen - on a timer, since holding the
-  // pointer still at the edge sends no events to scroll on.
-  drag.scrollTimer = setInterval(_scrollWhileDragging, 16);
-}
-
-function _scrollWhileDragging() {
-  const drag = boxDrag;
-  if (!drag || !drag.active) return;
-  const s = drag.scroller;
-  const r = s === document.scrollingElement
-    ? { top: 0, bottom: window.innerHeight }
-    : s.getBoundingClientRect();
-  const before = s.scrollTop;
-  if (drag.lastY < r.top + BOX_SCROLL_EDGE) s.scrollTop -= BOX_SCROLL_STEP;
-  else if (drag.lastY > r.bottom - BOX_SCROLL_EDGE) {
-    s.scrollTop += BOX_SCROLL_STEP;
-  }
-  // What is under a still pointer changed with the scroll.
-  if (s.scrollTop !== before) _placeDraggedBox(drag.lastX, drag.lastY);
-}
-
-// The boxes stand in one column, so the half of a box the pointer is
-// over says which side of it the dragged one goes.
-function _placeDraggedBox(x, y) {
-  const { list, box } = boxDrag;
-  const over = document.elementFromPoint(x, y);
-  const target = over && over.closest('.server-box');
-  if (!target || target === box || target.parentElement !== list) return;
-  if (target.classList.contains('sliding')) return;
-  const r = target.getBoundingClientRect();
-  const ref = y < r.top + r.height / 2 ? target : target.nextSibling;
-  if (ref === box || box.nextSibling === ref) return;
-  _slideCards(list, () => list.insertBefore(box, ref));
-}
-
-function _endBoxDrag(commit) {
-  const drag = boxDrag;
-  if (!drag) return;
-  clearInterval(drag.scrollTimer);
-  boxDrag = null;
-  drag.box.classList.remove('dragging');
-  document.body.classList.remove('port-dragging');
-  if (!drag.active) return;
-  _swallowNextClick();
-  if (!commit) {
-    _slideCards(drag.list,
-      () => drag.before.forEach(b => drag.list.appendChild(b)));
-    return;
-  }
-  drag.onReorder([...drag.list.children]);
-}
-
-window.addEventListener('pointermove', e => {
-  const drag = boxDrag;
-  if (!drag || e.pointerId !== drag.pointerId) return;
-  drag.lastX = e.clientX;
-  drag.lastY = e.clientY;
-  if (!drag.active) {
-    if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD) {
-      return;
-    }
-    _startBoxDrag();
-  }
-  _placeDraggedBox(e.clientX, e.clientY);
-});
-window.addEventListener('pointerup', e => {
-  if (boxDrag && e.pointerId === boxDrag.pointerId) _endBoxDrag(true);
-});
-window.addEventListener('pointercancel', e => {
-  if (boxDrag && e.pointerId === boxDrag.pointerId) _endBoxDrag(false);
-});
-// Captured, and kept from going further: Escape also closes the editor,
-// and a drag given up is not a form given up with everything typed in.
-window.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && boxDrag && boxDrag.active) {
-    e.stopPropagation();
-    _endBoxDrag(false);
-  }
-}, true);
 
 // The token a terminal link needs where this browser has no session to
 // fall back on, so that an endpoint with a token opens from here like
@@ -2287,10 +2244,16 @@ function _buildPortForm(cfg, editId, bundles) {
   root.appendChild(serversDiv);
 
   const serverBoxes = [];
-  // The list the form collects from follows the order on screen: Save
-  // sends the servers in it, and that is the order they are kept in.
-  _enableBoxDrag(serversDiv, boxes => {
-    serverBoxes.sort((a, b) => boxes.indexOf(a.box) - boxes.indexOf(b.box));
+  // Moved by the grip beside each box's delete icon, not by anywhere: a
+  // box is mostly fields, and a click into the gaps between them is part
+  // of filling a form in. Nothing is sent on the drop - the list the form
+  // collects from follows the order on screen, and Save writes it; a save
+  // that only reorders servers rebuilds none of them.
+  makeSortable(serversDiv, {
+    item: '.server-box', handle: '.box-grip',
+    scroller: box => box.closest('.modal-overlay'),
+    onDrop: boxes => serverBoxes.sort(
+      (a, b) => boxes.indexOf(a.box) - boxes.indexOf(b.box)),
   });
   function addServerBox(initSrv) {
     const editorPorts = new Set();
@@ -3302,8 +3265,38 @@ function renderSettingsList() {
   } else {
     const grid = el('div', { class: 'card-grid' });
     servers.forEach((s, i) => grid.appendChild(renderHttpCard(s, i)));
+    // Moved like a port's card. Nothing redraws this list while a card
+    // is in hand, so there is no card to pin and no end to redraw.
+    const movable = () => isAdmin && servers.length > 1;
+    grid.classList.toggle('movable', movable());
+    makeSortable(grid, {
+      item: '.card', hold: true,
+      enabled: movable,
+      onDrop: _dropHttp,
+    });
     root.appendChild(grid);
   }
+}
+
+// Compared with the order the settings were loaded in; unlike the ports,
+// the list is not streamed, so that is also what the server last said.
+function _dropHttp(cards, card) {
+  const order = cards.map(c => c.dataset.httpId);
+  const loaded = currentSettings.http.map(s => s.id);
+  if (order.join('\n') === loaded.join('\n')) return;
+  const id = card.dataset.httpId;
+  _sendMove('/api/settings/http/' + encodeURIComponent(id) + '/move',
+    order, id, _showHttpOrder, loaded);
+}
+
+// A server not in the order - added meanwhile - keeps its place at the
+// end rather than vanishing.
+function _showHttpOrder(order) {
+  const byId = new Map(currentSettings.http.map(s => [s.id, s]));
+  const next = order.filter(id => byId.has(id)).map(id => byId.get(id));
+  currentSettings.http.forEach(s => { if (!next.includes(s)) next.push(s); });
+  currentSettings.http = next;
+  renderSettingsList();
 }
 
 function renderHttpCard(srv, index) {
@@ -3313,6 +3306,7 @@ function renderHttpCard(srv, index) {
   // process that was not serving look exactly like one that was.
   const card = el('div',
     { class: 'card ' + (srv.error ? 'card-error' : 'card-online') });
+  card.dataset.httpId = id;
   const tlsTag = srv.tls ? ' (TLS)' : '';
   const titleText = srv.name
     || `${srv.address || '0.0.0.0'}:${srv.port}${tlsTag}`;
